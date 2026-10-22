@@ -221,3 +221,32 @@ def test_up_table_keeps_url_whole_next_to_a_long_detail(monkeypatch: pytest.Monk
     out = captured.get()
     assert "https://api.main.shop.localhost" in out
     assert "https://main.shop.localhost" in out
+
+
+LONG_URL = "https://api.a-very-long-branch-name-for-width-checks.shop.localhost:18443"
+
+
+def test_non_tty_output_is_never_wrapped_or_cut() -> None:
+    reports = [
+        ServiceReport("api", "ok", "GET /healthz -> HTTP 200 " * 4, url=LONG_URL, kind="compose")
+    ]
+    import io
+
+    from rich.console import Console
+
+    buf = io.StringIO()
+    wide = cli.NoLimitConsole(file=buf, highlight=False)
+    wide.print(cli._report_table(reports))
+    [row] = [ln for ln in buf.getvalue().splitlines() if "https://" in ln]
+    assert LONG_URL in row and "HTTP 200" in row
+    assert isinstance(wide, Console) and not wide.is_terminal
+
+
+def test_ls_piped_keeps_each_row_on_one_line(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    orch()
+    cfg = _cfg(tmp_path)
+    runner.invoke(app, [*cfg, "up", "feat/cart"])
+    listed = runner.invoke(app, [*cfg, "ls", "--no-probe"])
+    lines = [ln for ln in listed.output.splitlines() if "feat/cart" in ln or "https://" in ln]
+    assert len(lines) == 1
+    assert "https://api.feat-cart.shop.localhost" in lines[0]

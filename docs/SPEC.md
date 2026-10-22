@@ -361,6 +361,8 @@ raises `WtError("docker is not reachable ...")`, and `ls` shows `docker unavaila
 Layout, so URLs stay whole at 80 columns: columns `BRANCH STATUS UP SERVICE KIND URL HEALTH`
 (`UP` is `<running>/<total>`, e.g. `2/2`, counting every service of the branch: compose containers plus live `run:` processes; only `UP` and `HEALTH` may wrap, a URL never does); databases are listed in a `databases:` section after the table.
 
+**D13 (width, degraded).** When stdout is not a terminal (piped, redirected, CI), the console does not limit width: no wrapping and no cutting in `ls` or `up`, like `docker ps` piped. A terminal keeps the layout above. `ls` shows STATUS `degraded` instead of the stored `up` when docker is reachable and either not every service is running (`UP` below its total) or a health probe failed; without probing only the `UP` rule applies. Other stored statuses are shown as they are.
+
 **logs.** For a `run:` service, a missing log file raises `WtError("no log yet for <svc> on <branch>")`.
 
 **doctor.** Postgres checks only when `shared.postgres` is configured: the container runs; the

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
+from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
@@ -20,7 +20,23 @@ app = typer.Typer(
     add_completion=False,
     pretty_exceptions_enable=False,
 )
-console = Console(highlight=False)
+
+
+class NoLimitConsole(Console):
+    """Console that does not limit width when output is not a terminal (D13)."""
+
+    @property
+    def size(self) -> ConsoleDimensions:
+        if self._width is None and not self.is_terminal:
+            return ConsoleDimensions(100_000, super().size.height)
+        return super().size
+
+    @size.setter
+    def size(self, new_size: tuple[int, int]) -> None:
+        Console.size.fset(self, new_size)  # type: ignore[attr-defined]
+
+
+console = NoLimitConsole(highlight=False)
 err = Console(stderr=True, highlight=False)
 
 OUTCOME = {"ok": "[green]ok[/]", "fail": "[red]fail[/]", "skipped": "[dim]skipped[/]"}
