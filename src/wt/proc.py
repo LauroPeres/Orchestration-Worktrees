@@ -42,14 +42,21 @@ def run(
             list(args),
             cwd=cwd,
             capture_output=capture,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
     except FileNotFoundError as exc:
-        raise WtError(f"'{args[0]}' was not found on PATH") from exc
+        if cwd is not None and not cwd.is_dir():
+            raise WtError(f"folder does not exist: {cwd}") from exc
+        if exc.filename == args[0]:
+            raise WtError(f"'{args[0]}' was not found on PATH") from exc
+        raise WtError(f"could not run {' '.join(args)}: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise WtError(f"command timed out after {timeout}s: {' '.join(args)}") from exc
+    except OSError as exc:
+        raise WtError(f"could not run {' '.join(args)}: {exc}") from exc
     result = Result(proc.returncode, proc.stdout or "", proc.stderr or "")
     if check and not result.ok:
         raise CommandError(args, result)

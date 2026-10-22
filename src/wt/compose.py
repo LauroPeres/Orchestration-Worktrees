@@ -124,5 +124,12 @@ def logs(project: str, service: str, *, follow: bool, tail: int) -> None:
 
 
 def ensure_network() -> None:
-    if not proc.run(["docker", "network", "inspect", network_name()], check=False).ok:
+    inspect = ["docker", "network", "inspect", network_name()]
+    if proc.run(inspect, check=False).ok:
+        return
+    try:
         proc.run(["docker", "network", "create", network_name()])
+    except proc.CommandError:
+        # Another wt process may have created it between inspect and create.
+        if not proc.run(inspect, check=False).ok:
+            raise
