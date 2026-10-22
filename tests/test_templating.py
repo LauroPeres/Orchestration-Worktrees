@@ -1,3 +1,6 @@
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from wt.errors import WtError
@@ -34,3 +37,24 @@ def test_registered_provider_loses_the_upcoming_hint(monkeypatch: pytest.MonkeyP
     with pytest.raises(WtError) as exc:
         render("{{ postgres.url('shop') }}", {}, "env.A")
     assert "arrives in" not in str(exc.value)
+
+
+HOSTILE = ["x;touch {marker}", "$(touch {marker})", "`touch {marker}`", "a&touch {marker}", "it's"]
+
+
+@pytest.mark.parametrize("branch", HOSTILE)
+def test_run_quoting_keeps_hostile_value_one_literal_argument(branch: str, tmp_path: Path) -> None:
+    marker = tmp_path / "pwned"
+    branch = branch.format(marker=marker)
+    cmd = render("printf %s {{ branch }}", {"branch": branch}, "run", quote=True)
+    out = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, check=True)
+    assert out.stdout == branch
+    assert not marker.exists()
+    assert render("{{ branch }}", {"branch": branch}, "env.A") == branch
+
+
+def test_run_quoting_leaves_safe_values_and_numbers_alone() -> None:
+    ctx = {"port": 8080, "url": "https://a.localhost"}
+    assert render("serve --port {{ port }} {{ url }}", ctx, "run", quote=True) == (
+        "serve --port 8080 https://a.localhost"
+    )

@@ -373,3 +373,9 @@ free. `--fix` starts the server with `ensure_server()`, which also repairs `data
 **Example shop web.** The web page fetches items in the browser from `API_URL`. The API allows CORS
 from `WEB_ORIGIN`. The `feat/cart` change lives in `examples/shop/feat-cart/` as replacement files,
 which `bootstrap.sh` copies onto that branch and commits.
+
+**D15 (run: quoting).** In a `run:` command every `{{ ... }}` value is inserted shell-quoted
+(`shlex.quote`), because the command runs with `sh -c` and git allows `;`, `$()`, backticks and `&`
+in branch names. Safe values such as ports and URLs are unchanged. Only `run:` is quoted: `env`
+values, compose files and URLs are rendered as they are. Users must not add quotes around template
+values in `run:`.
