@@ -120,6 +120,14 @@ def is_running() -> bool:
     return result.ok and result.stdout.strip() == "true"
 
 
+def has_host_gateway() -> bool:
+    """True when the running container maps `host.docker.internal` to the host gateway."""
+    result = proc.run(
+        ["docker", "inspect", "-f", "{{json .HostConfig.ExtraHosts}}", container()], check=False
+    )
+    return result.ok and f"{HOST_GATEWAY_NAME}:host-gateway" in result.stdout
+
+
 @dataclass(frozen=True)
 class Route:
     service: str
