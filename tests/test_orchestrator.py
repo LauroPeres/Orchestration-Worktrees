@@ -598,8 +598,13 @@ def test_auto_port_skips_ports_of_other_branches(run_orch, monkeypatch: pytest.M
     o.up("main")
     o.up("feat/cart")
     branches = o.store.load().branches
-    assert branches["main"].processes["web"].port == base
-    assert branches["feat/cart"].processes["web"].port == base + 1
+    main_port = branches["main"].processes["web"].port
+    cart_port = branches["feat/cart"].processes["web"].port
+    assert main_port is not None and cart_port is not None
+    # Both start from the same derived port; feat/cart must skip main's port and probe upward.
+    # (No exact `base + 1`: on a busy CI host the next port may already be taken.)
+    assert main_port >= base
+    assert cart_port > main_port
 
 
 def test_explicit_port_in_use_fails_before_anything_is_created(
