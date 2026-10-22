@@ -102,7 +102,8 @@ def compose_doc() -> dict[str, Any]:
                 "volumes": [f"{volume()}:/var/lib/postgresql/data"],
                 "networks": [compose.NETWORK],
                 "healthcheck": {
-                    "test": ["CMD", "pg_isready", "-U", USER, "-d", "postgres"],
+                    # -h: the init-time server listens on the socket only; the real one also on TCP.
+                    "test": ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", USER, "-d", "postgres"],
                     "interval": "2s",
                     "timeout": "2s",
                     "retries": 30,
@@ -147,7 +148,18 @@ def wait_ready(timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     while True:
         ready = proc.run(
-            ["docker", "exec", container(), "pg_isready", "-U", USER, "-d", "postgres"],
+            [
+                "docker",
+                "exec",
+                container(),
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                USER,
+                "-d",
+                "postgres",
+            ],
             check=False,
         )
         if ready.ok:

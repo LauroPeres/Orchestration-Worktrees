@@ -471,3 +471,15 @@ def test_templates_render_through_jinja() -> None:
     provider = PostgresProvider(config())
     context = provider.template_vars(ctx(), "compose")
     assert render("{{ postgres.name('shop') }}", context, "env.A") == "shop__feat_cart"
+
+
+def test_readiness_waits_for_the_tcp_server(fake: FakeProc) -> None:
+    # The image's init-time server listens on the socket only, then shuts down; checking
+    # over TCP makes "ready" mean the real server.
+    fake.on("pg_isready", out(""))
+    postgres.wait_ready(5)
+    probe = next(c for c in fake.calls if "pg_isready" in c)
+    assert probe[probe.index("-h") + 1] == "127.0.0.1"
+    health = postgres.compose_doc()["services"]
+    test_cmd = next(iter(health.values()))["healthcheck"]["test"]
+    assert test_cmd[test_cmd.index("-h") + 1] == "127.0.0.1"
