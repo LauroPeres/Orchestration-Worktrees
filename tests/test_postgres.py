@@ -6,7 +6,7 @@ import pytest
 from wt import compose, proc
 from wt.config import Config
 from wt.errors import WtError
-from wt.naming import Names
+from wt.naming import Names, temp_name
 from wt.providers import postgres
 from wt.providers.base import BranchContext
 from wt.providers.postgres import PostgresProvider
@@ -284,11 +284,20 @@ def test_dump_restore_clone(fake: FakeProc) -> None:
     provider = PostgresProvider(config(strategy="dump-restore"))
     provider.create(ctx())
     sql = fake.sql()
-    assert 'CREATE DATABASE "shop__feat_cart"' in sql
     assert not any("ALLOW_CONNECTIONS false" in s for s in sql)  # base is not blocked
     dump = next(c for c in fake.calls if "pg_dump" in " ".join(c))
-    assert dump[-2:] == ["shop__main", "shop__feat_cart"]
+    tmp = temp_name("shop__feat_cart")
+    assert dump[-2:] == ["shop__main", tmp]
     assert "pg_restore" in dump[dump.index("-c") + 1]
+    assert f'CREATE DATABASE "{tmp}"' in sql
+    assert sql[-1] == f'ALTER DATABASE "{tmp}" RENAME TO "shop__feat_cart"'
+    assert 'CREATE DATABASE "shop__feat_cart"' not in sql
+
+
+def test_temp_name_is_a_safe_identifier() -> None:
+    for name in ["shop__feat_cart", "x" * 63]:
+        tmp = temp_name(name)
+        assert postgres.IDENT.match(tmp) and tmp != name
 
 
 def test_dump_restore_failure_drops_the_half_clone(fake: FakeProc) -> None:
@@ -296,7 +305,27 @@ def test_dump_restore_failure_drops_the_half_clone(fake: FakeProc) -> None:
     fake.on("pg_dump", err("pg_restore: error"))
     with pytest.raises(WtError, match="pg_restore"):
         PostgresProvider(config(strategy="dump-restore")).create(ctx())
-    assert fake.sql()[-1] == 'DROP DATABASE IF EXISTS "shop__feat_cart" WITH (FORCE)'
+    tmp = temp_name("shop__feat_cart")
+    assert fake.sql()[-1] == f'DROP DATABASE IF EXISTS "{tmp}" WITH (FORCE)'
+    assert 'CREATE DATABASE "shop__feat_cart"' not in fake.sql()
+
+
+def test_dump_restore_interrupt_drops_the_temp_and_never_creates_the_final(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.on("datname = 'shop__main'", out("1\n"))
+
+    def interrupted(args: Sequence[str], **kwargs: object) -> proc.Result:
+        if "pg_dump" in " ".join(args):
+            raise KeyboardInterrupt
+        return fake(args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(proc, "run", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        PostgresProvider(config(strategy="dump-restore")).create(ctx())
+    tmp = temp_name("shop__feat_cart")
+    assert fake.sql()[-1] == f'DROP DATABASE IF EXISTS "{tmp}" WITH (FORCE)'
+    assert not any("RENAME" in s for s in fake.sql())
 
 
 # ---- verify ---------------------------------------------------------------------------
