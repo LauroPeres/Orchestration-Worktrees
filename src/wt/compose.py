@@ -83,7 +83,7 @@ def list_services(compose_file: Path) -> list[str]:
 
 
 def up(project: str, files: list[Path], *, cwd: Path, build: bool, timeout: int) -> None:
-    args = [*_base(project, files), "up", "-d", "--remove-orphans", "--wait"]
+    args = [*_base(project, files), "up", "-d", "--remove-orphans", "--wait", "--quiet-pull"]
     args += ["--wait-timeout", str(timeout)]
     if build:
         args.append("--build")

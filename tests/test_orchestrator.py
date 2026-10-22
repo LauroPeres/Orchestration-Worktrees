@@ -177,6 +177,19 @@ def test_untrusted_ca_warns(orch, docker: FakeDocker, monkeypatch: pytest.Monkey
     assert any("wt doctor --fix" in m for m in logs)
 
 
+def test_up_announces_traefik_only_when_starting(orch, docker: FakeDocker) -> None:
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/cart")
+    assert any("starting shared Traefik" in m for m in logs)
+
+    docker.traefik_running = True
+    logs.clear()
+    o.up("feat/other")
+    assert not any("starting shared Traefik" in m for m in logs)
+
+
 def test_down_unknown_branch(orch, docker: FakeDocker) -> None:
     o = orch()
     logs: list[str] = []
