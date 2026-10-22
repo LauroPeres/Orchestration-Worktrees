@@ -169,8 +169,8 @@ def check_resolution(domain: str) -> Check:
         "resolver",
         "warn",
         f"*.{domain} {found} for the OS resolver",
-        "browsers and curl resolve *.localhost on their own; for other tools use "
-        "systemd-resolved, dnsmasq, or /etc/hosts entries",
+        "browsers, curl and wt's containers are fine; only other local programs may fail "
+        "(fix with /etc/hosts, dnsmasq or systemd-resolved)",
     )
 
 
