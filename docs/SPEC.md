@@ -266,7 +266,7 @@ it (render or `ensure_server`). It is never printed by `ls`; `doctor` only says 
 Compose override files in `~/.wt/<project>/branches/<slug>/` can hold the rendered env, which may
 contain the password, so they are written with mode `0600`.
 
-**Postgres lock.** `up` and `down` hold `file_lock("postgres")` (same name as `doctor`) around `ensure_server`, `create` (incl. the clone) and `destroy`; order: branch, ports, postgres, state. `password()` is create-once across processes (temp file + `link`).
+**Postgres lock.** `up` and `down` hold `file_lock("postgres")` (same name as `doctor`) around `ensure_server`, `create` (incl. the clone) and `destroy`; order: branch, ports, postgres, state. `password()` is create-once across processes (dedicated `postgres-password` flock).
 
 **Postgres server start.** `ensure_server()` starts the container if needed, the same way Traefik is
 started. It waits up to 60 s for `pg_isready` inside the container. Then it re-enables

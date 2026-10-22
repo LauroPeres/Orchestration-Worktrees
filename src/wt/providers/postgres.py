@@ -1,10 +1,8 @@
 """Shared Postgres server and one set of cloned databases per branch (docs/SPEC.md §14)."""
 
-import contextlib
 import os
 import re
 import secrets
-import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -19,7 +17,7 @@ from wt.errors import WtError
 from wt.naming import Names, fit, temp_name
 from wt.paths import env_port, instance, wt_home
 from wt.providers.base import BranchContext, Check, Kind, Resources
-from wt.state import atomic_write
+from wt.state import atomic_write, file_lock
 
 DEFAULT_IMAGE = "postgres:17-alpine"
 DEFAULT_PORT = 55432
@@ -64,20 +62,15 @@ def password() -> str:
         if existing:
             path.chmod(0o600)
             return existing
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # mkstemp creates the temp file with mode 0600; link() fails if another process won the race
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".password.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(secrets.token_urlsafe(24) + "\n")
-        if path.exists():  # empty file: replace it
-            os.replace(tmp, path)
-        else:
-            with contextlib.suppress(FileExistsError):
-                os.link(tmp, path)
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-    return path.read_text().strip()
+    # Own lock (not "postgres"): ensure_server calls this while holding that one.
+    with file_lock("postgres-password"):
+        existing = path.read_text().strip() if path.exists() else ""
+        if not existing:
+            existing = secrets.token_urlsafe(24)
+            # mkstemp inside atomic_write creates the temp file with mode 0600
+            atomic_write(path, existing + "\n")
+        path.chmod(0o600)
+        return existing
 
 
 def ident(name: str) -> str:

@@ -551,7 +551,9 @@ def _first_password(home: str, out: Any) -> None:
 def test_concurrent_first_password_is_one_value(tmp_path: Path) -> None:
     ctx = multiprocessing.get_context("fork")
     out = ctx.Queue()
-    procs = [ctx.Process(target=_first_password, args=(str(tmp_path / "h"), out)) for _ in range(6)]
+    procs = [
+        ctx.Process(target=_first_password, args=(str(tmp_path / "h"), out)) for _ in range(12)
+    ]
     for p in procs:
         p.start()
     values = {out.get(timeout=30) for _ in procs}
