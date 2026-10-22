@@ -1,0 +1,27 @@
+project: shop
+domain: shop.localhost
+repos: { api: ./shop-api, web: ./shop-web }
+services:
+  api:
+    repo: api
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+    health: /healthz
+    env:
+      DATABASE_URL: "{{ postgres.url('shop') }}"
+      BRANCH: "{{ branch }}"
+      WEB_ORIGIN: "{{ services.web.url }}"   # for CORS
+  web:
+    repo: web
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    env:
+      API_URL: "{{ services.api.url }}"
+      BRANCH: "{{ branch }}"
+shared:
+  postgres:
+    databases: [shop]
+    strategy: template
+    verify: true
