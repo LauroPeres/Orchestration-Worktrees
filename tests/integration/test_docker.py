@@ -4,7 +4,8 @@ import json
 import shutil
 import socket
 import subprocess
-from collections.abc import Iterator
+import sys
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,8 @@ import yaml
 
 from wt import health, router
 from wt.config import load_config
-from wt.orchestrator import Orchestrator
+from wt.errors import WtError
+from wt.orchestrator import Orchestrator, ServiceReport
 
 pytestmark = pytest.mark.docker
 
@@ -37,8 +39,9 @@ def docker(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["docker", *args], capture_output=True, text=True, check=False)
 
 
-@pytest.fixture
-def stack(make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrator]:
+def make_stack(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, services: Mapping[str, object]
+) -> Iterator[Orchestrator]:
     if shutil.which("docker") is None or docker("info").returncode != 0:
         pytest.skip("docker is not available")
     instance = f"wtit{free_port()}"
@@ -51,15 +54,7 @@ def stack(make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterato
         "project": instance,
         "domain": f"{instance}.localhost",
         "repos": {"api": "./api"},
-        "services": {
-            "api": {
-                "repo": "api",
-                "compose": "docker-compose.yml",
-                "port": 8000,
-                "subdomain": "api",
-                "env": {"BRANCH_URL": "{{ url }}"},
-            }
-        },
+        "services": services,
     }
     path = tmp_path / "worktree.yaml"
     path.write_text(yaml.safe_dump(config))
@@ -71,14 +66,57 @@ def stack(make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterato
     docker("network", "rm", instance)
 
 
+@pytest.fixture
+def stack(make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrator]:
+    services = {
+        "api": {
+            "repo": "api",
+            "compose": "docker-compose.yml",
+            "port": 8000,
+            "subdomain": "api",
+            "env": {"BRANCH_URL": "{{ url }}"},
+        }
+    }
+    yield from make_stack(make_repo, tmp_path, monkeypatch, services)
+
+
+@pytest.fixture
+def host_stack(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Orchestrator]:
+    services = {
+        "web": {
+            "repo": "api",
+            "run": f"{sys.executable} -m http.server {{{{ port }}}} --bind 0.0.0.0",
+            "port": "auto",
+            "subdomain": "web",
+        }
+    }
+    yield from make_stack(make_repo, tmp_path, monkeypatch, services)
+
+
+def up_retrying(
+    orch: Orchestrator, branch: str, monkeypatch: pytest.MonkeyPatch
+) -> list[ServiceReport]:
+    """Another test run may grab a port between free_port() and compose up: retry once."""
+    try:
+        return orch.up(branch, timeout=90)
+    except WtError as exc:
+        if "not available" not in str(exc) and "already allocated" not in str(exc):
+            raise
+        monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
+        monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
+        return orch.up(branch, timeout=90)
+
+
 def env_of(container: str) -> list[str]:
     out = docker("inspect", container, "--format", "{{json .Config.Env}}").stdout
     return list(json.loads(out))
 
 
-def test_two_branches_side_by_side(stack: Orchestrator) -> None:
+def test_two_branches_side_by_side(stack: Orchestrator, monkeypatch: pytest.MonkeyPatch) -> None:
     for branch in ("main", "feat/cart"):
-        reports = stack.up(branch, timeout=90)
+        reports = up_retrying(stack, branch, monkeypatch)
         assert [r.outcome for r in reports] == ["ok"], reports
 
     port = router.https_port()
@@ -102,3 +140,21 @@ def test_two_branches_side_by_side(stack: Orchestrator) -> None:
         docker("ps", "-q", "--filter", f"label=com.docker.compose.project={project}").stdout.strip()
         == ""
     )
+
+
+def test_traefik_routes_to_a_host_process(
+    host_stack: Orchestrator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reports = up_retrying(host_stack, "main", monkeypatch)
+    assert [(r.service, r.outcome) for r in reports] == [("web", "ok")], reports
+
+    ps = host_stack.store.load().branches["main"].processes["web"]
+    host = f"web.main.{host_stack.cfg.domain}"
+    assert health.probe(host, "/", router.https_port()).detail == "HTTP 200"
+    extra = docker("inspect", router.container(), "--format", "{{json .HostConfig.ExtraHosts}}")
+    assert "host.docker.internal:host-gateway" in extra.stdout
+
+    host_stack.down("main")
+    assert not health.probe(host, "/", router.https_port()).ok
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", ps.port or 0), timeout=1)

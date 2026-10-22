@@ -1,13 +1,21 @@
+import os
 import shutil
+import socket
+import sys
 import threading
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.conftest import SHARED, FakeDocker, FakeProvider
-from wt import compose, git, router, tls
+from wt import compose, git, host, naming, router, tls
 from wt.errors import WtError
+from wt.orchestrator import Orchestrator
 from wt.providers.base import Check
+from wt.state import ProcessState
 
 
 def test_up_creates_everything(orch, docker: FakeDocker, isolated_home: Path) -> None:
@@ -420,3 +428,251 @@ def test_down_lists_resources_of_unavailable_provider(orch, docker: FakeDocker) 
     o.log = logs.append
     o.down("feat/x")
     assert any("'gone'" in line and "db__feat_x" in line for line in logs)
+
+
+# ---- host processes (run: services) ------------------------------------------------------
+
+SERVER = f"{sys.executable} -m http.server {{{{ port }}}} --bind 0.0.0.0"
+
+
+def run_service(**extra: object) -> dict[str, object]:
+    return {"web": {"repo": "api", "run": SERVER, "port": "auto", **extra}}
+
+
+@pytest.fixture
+def run_orch(orch, docker: FakeDocker) -> Iterator[Callable[..., Orchestrator]]:
+    built: list[Orchestrator] = []
+
+    def build(services: dict[str, object] | None = None, **kwargs: object) -> Orchestrator:
+        o: Orchestrator = orch(extra_services=services or run_service(), **kwargs)
+        built.append(o)
+        return o
+
+    yield build
+    for o in built:
+        for bs in o.store.load().branches.values():
+            for ps in bs.processes.values():
+                host.stop(ps, grace=0.2)
+
+
+def wait_until(check: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_run_service_is_started_and_recorded(run_orch, isolated_home: Path) -> None:
+    o = run_orch()
+    reports = {r.service: r for r in o.up("feat/cart")}
+    assert reports["web"].outcome == "ok"  # unrouted with a port: TCP connect
+    ps = o.store.load().branches["feat/cart"].processes["web"]
+    assert host.alive(ps)
+    assert ps.port is not None and 20000 <= ps.port < 40000
+    assert ps.log == str(isolated_home / "shop" / "branches" / "feat-cart" / "logs" / "web.log")
+    assert Path(ps.log).is_file()
+    assert f"http.server {ps.port} --bind 0.0.0.0" in ps.command
+
+
+def test_run_service_runs_in_worktree_with_rendered_env(run_orch, isolated_home: Path) -> None:
+    services = {
+        "job": {
+            "repo": "api",
+            "run": 'pwd; echo "branch=$B port=$P"; sleep 60',
+            "env": {"B": "{{ branch }}", "P": "{{ services.job.port }}"},
+        }
+    }
+    o = run_orch(services)
+    reports = {r.service: r for r in o.up("feat/cart")}
+    assert reports["job"].outcome == "ok"  # no port: alive
+    ps = o.store.load().branches["feat/cart"].processes["job"]
+    assert ps.port is None
+    worktree = isolated_home / "shop" / "worktrees" / "feat-cart" / "api"
+    assert wait_until(lambda: "branch=" in Path(ps.log).read_text())
+    log = Path(ps.log).read_text()
+    assert str(worktree.resolve()) in log
+    assert "branch=feat/cart port=" in log
+    assert os.environ["PATH"]  # the parent environment is inherited (sh and sleep were found)
+
+
+def test_port_is_rendered_into_env_and_command(run_orch) -> None:
+    services = run_service(env={"SELF": "{{ port }}", "SAME": "{{ services.web.port }}"})
+    o = run_orch(services)
+    o.up("main")
+    port = o.store.load().branches["main"].processes["web"].port
+    assert port is not None
+    cmd = o.store.load().branches["main"].processes["web"].command
+    assert f"http.server {port} " in cmd
+
+
+def test_up_twice_does_not_restart_a_live_process(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    first = o.store.load().branches["main"].processes["web"]
+    o.up("main")
+    assert o.store.load().branches["main"].processes["web"] == first
+    assert host.alive(first)
+
+
+def test_up_restarts_a_dead_process_on_the_same_port(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    first = o.store.load().branches["main"].processes["web"]
+    host.stop(first, grace=0.2)
+    o.up("main")
+    second = o.store.load().branches["main"].processes["web"]
+    assert second.port == first.port
+    assert second.pid != first.pid
+    assert host.alive(second)
+
+
+def test_auto_port_skips_ports_of_other_branches(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    with socket.socket() as s:
+        s.bind(("0.0.0.0", 0))
+        base = int(s.getsockname()[1])
+    monkeypatch.setattr(naming, "auto_port", lambda *a: base)
+    o = run_orch()
+    o.up("main")
+    o.up("feat/cart")
+    branches = o.store.load().branches
+    assert branches["main"].processes["web"].port == base
+    assert branches["feat/cart"].processes["web"].port == base + 1
+
+
+def test_explicit_port_in_use_fails_before_anything_is_created(
+    run_orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    with socket.socket() as s:
+        s.bind(("0.0.0.0", 0))
+        s.listen()
+        port = int(s.getsockname()[1])
+        o = run_orch(run_service(port=port))
+        with pytest.raises(WtError, match="in use"):
+            o.up("main")
+    assert docker.ups == []
+    assert not (isolated_home / "shop" / "worktrees").exists()
+
+
+def test_routed_run_service_goes_through_host_gateway(run_orch, isolated_home: Path) -> None:
+    o = run_orch(run_service(subdomain="web"))
+    reports = {r.service: r for r in o.up("main")}
+    assert reports["web"].url == "https://web.main.shop.localhost"
+    port = o.store.load().branches["main"].processes["web"].port
+    route = (isolated_home / "traefik" / "dynamic" / "shop--main.yml").read_text()
+    assert f"http://host.docker.internal:{port}" in route
+    assert "http://wt-shop-main-api:8000" in route
+
+
+def test_dead_process_is_reported_as_failed(run_orch) -> None:
+    o = run_orch({"web": {"repo": "api", "run": "exit 3", "port": "auto"}})
+    reports = {r.service: r for r in o.up("main", timeout=1)}
+    assert reports["web"].outcome == "fail"
+    assert o.store.load().branches["main"].status == "degraded"
+
+
+def test_up_order_with_processes(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    real_start, real_write = host.start, router.write_routes
+    real_up, real_down, real_stop = compose.up, compose.down, host.stop
+
+    def start(*a: Any, **k: Any) -> ProcessState:
+        events.append("process start")
+        return real_start(*a, **k)
+
+    def write(*a: Any, **k: Any) -> Path:
+        events.append("routes")
+        return real_write(*a, **k)
+
+    monkeypatch.setattr(host, "start", start)
+    monkeypatch.setattr(router, "write_routes", write)
+
+    def up(*a: Any, **k: Any) -> None:
+        events.append("compose up")
+        real_up(*a, **k)
+
+    def down(*a: Any, **k: Any) -> None:
+        events.append("compose down")
+        real_down(*a, **k)
+
+    def stop(*a: Any, **k: Any) -> None:
+        events.append("process stop")
+        real_stop(*a, **k)
+
+    monkeypatch.setattr(compose, "up", up)
+    monkeypatch.setattr(compose, "down", down)
+    monkeypatch.setattr(host, "stop", stop)
+    o = run_orch(run_service(subdomain="web"))
+    o.up("main")
+    assert events == ["compose up", "process start", "routes"]
+    events.clear()
+    o.down("main")
+    assert events == ["process stop", "compose down"]
+
+
+def test_down_stops_the_process_and_clears_state(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    ps = o.store.load().branches["main"].processes["web"]
+    assert o.down("main")
+    assert not host.alive(ps)
+    assert o.store.load().branches == {}
+
+
+def test_down_stops_a_process_of_a_service_removed_from_config(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    ps = o.store.load().branches["main"].processes["web"]
+    del o.cfg.services["web"]
+    o.down("main")
+    assert not host.alive(ps)
+
+
+def test_down_after_the_process_died_is_fine(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    host.stop(o.store.load().branches["main"].processes["web"], grace=0.2)
+    assert o.down("main")
+
+
+def test_concurrent_up_never_picks_the_same_port(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    with socket.socket() as sock:
+        sock.bind(("0.0.0.0", 0))
+        base = int(sock.getsockname()[1])
+    monkeypatch.setattr(naming, "auto_port", lambda *a: base)
+    o = run_orch()
+    errors: list[BaseException] = []
+
+    def up(branch: str) -> None:
+        try:
+            o.up(branch)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=up, args=(b,)) for b in ("main", "feat/cart")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    branches = o.store.load().branches
+    chosen = {b: bs.processes["web"].port for b, bs in branches.items()}
+    assert len(set(chosen.values())) == 2, chosen
+
+
+def test_port_is_recorded_before_the_process_starts(
+    run_orch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = run_orch()
+    seen: list[dict[str, int]] = []
+    real_start = host.start
+
+    def start(*a: Any, **k: Any) -> ProcessState:
+        seen.append(dict(o.store.load().branches["main"].ports))
+        return real_start(*a, **k)
+
+    monkeypatch.setattr(host, "start", start)
+    o.up("main")
+    port = o.store.load().branches["main"].processes["web"].port
+    assert seen == [{"web": port}]

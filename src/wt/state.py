@@ -27,6 +27,17 @@ class RepoState(BaseModel):
     branch_created: bool = False
 
 
+class ProcessState(BaseModel):
+    """A host process started for a `run:` service."""
+
+    pid: int
+    pgid: int
+    port: int | None = None
+    command: str
+    started_at: str = Field(default_factory=now)
+    log: str
+
+
 class BranchState(BaseModel):
     branch: str
     slug: str
@@ -38,6 +49,8 @@ class BranchState(BaseModel):
     route_file: str | None = None
     cert_files: list[str] = Field(default_factory=list)
     providers: dict[str, list[str]] = Field(default_factory=dict)  # provider -> resource names
+    ports: dict[str, int] = Field(default_factory=dict)  # service -> reserved host port
+    processes: dict[str, ProcessState] = Field(default_factory=dict)  # service -> host process
 
 
 STATE_VERSION = 1

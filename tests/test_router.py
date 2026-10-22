@@ -53,3 +53,12 @@ def test_traefik_compose_ports(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_traefik_default_redirect() -> None:
     cmd = router.compose_doc()["services"]["traefik"]["command"]
     assert "--entrypoints.web.http.redirections.entrypoint.to=websecure" in cmd
+
+
+def test_traefik_reaches_host_processes() -> None:
+    svc = router.compose_doc()["services"]["traefik"]
+    assert svc["extra_hosts"] == ["host.docker.internal:host-gateway"]
+
+
+def test_host_upstream() -> None:
+    assert router.host_upstream(23456) == "http://host.docker.internal:23456"

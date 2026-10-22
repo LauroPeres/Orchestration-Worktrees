@@ -316,12 +316,16 @@ worktree directory. Environment = current env + rendered `env`. Started with
 
 **Ports.** `port: auto` → `naming.auto_port(project, branch, service)`. If that port is taken, probe
 upward (max 100 tries), skipping ports that state records for any other (branch, service). The
-chosen port is stored in state and kept for the branch. An explicit integer port is used as is and
+chosen port is stored in `BranchState.ports` before the process starts, under a per-project
+ports lock held while picking and rendering, so two concurrent `up` never pick the same port, and
+it is kept for the branch. An explicit integer port is used as is and
 fails clearly if taken (unless it is our own live process). Ports are resolved before rendering.
 The context vars `port` and `services.<name>.port` show the resolved port.
 
 **Process state.** `ProcessState(pid, pgid, port, command, started_at, log)`. Alive = `os.killpg(pgid, 0)`
-succeeds. `shortcut: pid reuse is not detected, compare start time when it matters`
+succeeds and, while the leader pid exists, it is still in that group and started no later than
+`started_at` (Linux `/proc`, else `ps -o lstart=`); otherwise it is treated as dead and never signalled.
+`shortcut: a start time that cannot be read is trusted`
 
 **Process stop.** SIGTERM to the process group, wait up to 10 s, then SIGKILL. `up` on an
 already-running process is a no-op.
