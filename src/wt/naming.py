@@ -24,6 +24,12 @@ def fit(name: str, limit: int = MAX_LABEL) -> str:
     return f"{name[: limit - len(suffix) - 1].rstrip('-_')}-{suffix}"
 
 
+def temp_name(name: str) -> str:
+    """Scratch name for building `name` before renaming it. Lowercase `[a-z0-9_]`, max 63 chars,
+    deterministic so a leftover from a killed run is found and dropped on the next one."""
+    return f"{name[:50]}_{_short_hash(name)}_tmp"
+
+
 def slugify(branch: str) -> str:
     """`feat/Cart_v2` -> `feat-cart-v2`. Safe for DNS labels and compose project names."""
     slug = re.sub(r"[^a-z0-9]+", "-", branch.lower()).strip("-")

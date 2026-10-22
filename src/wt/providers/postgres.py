@@ -14,7 +14,7 @@ from wt import compose, proc
 from wt.config import Config
 from wt.config import Postgres as PostgresConfig
 from wt.errors import WtError
-from wt.naming import Names, fit
+from wt.naming import Names, fit, temp_name
 from wt.paths import instance, wt_home
 from wt.providers.base import BranchContext, Check, Kind, Resources
 from wt.state import atomic_write
@@ -347,14 +347,17 @@ class PostgresProvider:
     def _clone_dump(self, src: str, dst: str) -> None:
         ident(src)
         ident(dst)
-        psql(f"CREATE DATABASE {ident(dst)}")
+        tmp = temp_name(dst)
+        self._drop(tmp)  # a leftover from a run that was killed hard
+        psql(f"CREATE DATABASE {ident(tmp)}")
         script = (
             f'set -o pipefail; pg_dump -U {USER} -Fc "$1" | pg_restore -U {USER} --no-owner -d "$2"'
         )
         try:
-            proc.run(["docker", "exec", container(), "sh", "-c", script, "sh", src, dst])
-        except WtError:
-            self._drop(dst)
+            proc.run(["docker", "exec", container(), "sh", "-c", script, "sh", src, tmp])
+            psql(f"ALTER DATABASE {ident(tmp)} RENAME TO {ident(dst)}")
+        except BaseException:  # Ctrl-C and SIGTERM too: never leave a half-restored database
+            self._drop(tmp)
             raise
 
     def verify(self, ctx: BranchContext) -> Check:
