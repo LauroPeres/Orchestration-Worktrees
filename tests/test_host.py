@@ -177,3 +177,27 @@ def test_start_time_is_close_to_now(tmp_path: Path, started: list[ProcessState])
     when = host.start_time(ps.pid)
     assert when is not None
     assert abs(when - time.time()) < 30
+
+
+def test_port_free_ignores_time_wait() -> None:
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    client = socket.create_connection(("127.0.0.1", port))
+    conn, _ = server.accept()
+    conn.close()  # closing the accepted side first leaves it in TIME_WAIT
+    client.close()
+    server.close()
+    assert host.port_free(port)
+
+
+def test_port_free_false_when_listening() -> None:
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        assert not host.port_free(server.getsockname()[1])
+    with socket.socket() as server:
+        server.bind(("0.0.0.0", 0))
+        server.listen()
+        assert not host.port_free(server.getsockname()[1])

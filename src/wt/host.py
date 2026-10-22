@@ -19,13 +19,12 @@ MAX_PORT_TRIES = 100
 
 
 def port_free(port: int) -> bool:
-    """True when nothing listens on the port (checked on all interfaces)."""
-    with socket.socket() as sock:
-        try:
-            sock.bind(("0.0.0.0", port))
-        except OSError:
-            return False
-    return True
+    """True when nothing accepts connections on the port.
+
+    Connect-based on purpose: a bind probe reports ports in TIME_WAIT as taken (when the old
+    server did not set SO_REUSEADDR) and succeeds over a listener on BSD with SO_REUSEADDR.
+    """
+    return not tcp_ok(port, timeout=0.5)
 
 
 def tcp_ok(port: int, timeout: float = 1.0) -> bool:
