@@ -607,8 +607,9 @@ class Orchestrator:
             result = BranchStatus(
                 branch=bs.branch,
                 status=bs.status,
-                running=sum(c.state == "running" for c in containers),
-                total=len(containers),
+                running=sum(c.state == "running" for c in containers)
+                + sum(host.alive(ps) for ps in bs.processes.values()),
+                total=len(containers) + len(bs.processes),
                 worktrees={r: s.path for r, s in bs.repos.items()},
                 databases=list(bs.providers.get("postgres", [])),
                 docker_ok=docker_ok,

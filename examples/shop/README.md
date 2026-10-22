@@ -10,6 +10,9 @@ how wt works.
 - [mkcert](https://github.com/FiloSottile/mkcert) is optional. Without it, wt uses a self-signed
   certificate and your browser will warn you.
 - macOS, Linux, or Windows through WSL2.
+- `wt` on your PATH: `uv tool install git+https://github.com/LauroPeres/Orchestration-Worktrees`
+  (see [Install](../../README.md#install)). From a clone of this repo you can use
+  `uv run --project <path-to-clone> wt` instead of `wt` in every step below.
 
 ## 1. Create the example repositories
 

@@ -6,10 +6,11 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.conftest import SHARED, FakeDocker
-from wt import __version__, cli, compose
+from wt import __version__, cli, compose, host
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
+from wt.orchestrator import ServiceReport
 
 runner = CliRunner()
 
@@ -126,6 +127,39 @@ def test_ls_never_breaks_a_url_at_80_columns(
     assert not any(ln.strip().startswith(("lhost", "ost")) for ln in listed.output.splitlines())
 
 
+SERVE = Path(__file__).parent / "serve.py"
+
+
+def _assert_urls_whole(output: str) -> None:
+    urls = [t for ln in output.splitlines() for t in ln.split() if t.startswith("https://")]
+    assert {"https://api.feat-cart.shop.localhost", "https://feat-cart.shop.localhost"} <= set(urls)
+    for ln in output.splitlines():
+        assert len(ln) <= 80 or "https://" not in ln, ln
+
+
+def test_up_and_ls_tables_keep_real_urls_whole_and_count_all_services(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    web = {"repo": "api", "run": f"{sys.executable} {SERVE} {{{{ port }}}}", "port": "auto"}
+    o = orch(extra_services={"web": {**web, "subdomain": ""}})
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli.console, "_width", 80)
+    try:
+        up = runner.invoke(app, [*cfg, "up", "feat/cart"])
+        assert up.exit_code == 0, up.output
+        _assert_urls_whole(up.output)
+        listed = runner.invoke(app, [*cfg, "ls", "--no-probe"])
+        assert listed.exit_code == 0, listed.output
+        _assert_urls_whole(listed.output)
+        # 1 compose container (fake docker) + 1 live run process, no " running" suffix
+        assert "2/2" in listed.output
+        assert "running" not in listed.output
+    finally:
+        for bs in o.store.load().branches.values():
+            for ps in bs.processes.values():
+                host.stop(ps, grace=0.2)
+
+
 def test_up_table_and_ls_show_kind_and_databases(
     orch, fake_provider, docker: FakeDocker, tmp_path: Path
 ) -> None:
@@ -165,3 +199,25 @@ def test_down_unknown_branch_prints_only_not_found(
     assert result.exit_code == 0, result.output
     assert "not found" in result.output
     assert "is down" not in result.output
+
+
+def test_up_table_keeps_url_whole_next_to_a_long_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Real output of the shop example: the health detail is long and used to squeeze the URL.
+    monkeypatch.setattr(cli.console, "_width", 80)
+    reports = [
+        ServiceReport(
+            "api",
+            "ok",
+            "GET /healthz -> HTTP 200",
+            url="https://api.main.shop.localhost",
+            kind="compose",
+        ),
+        ServiceReport(
+            "web", "ok", "GET / -> HTTP 200", url="https://main.shop.localhost", kind="run"
+        ),
+    ]
+    with cli.console.capture() as captured:
+        cli.console.print(cli._report_table(reports))
+    out = captured.get()
+    assert "https://api.main.shop.localhost" in out
+    assert "https://main.shop.localhost" in out

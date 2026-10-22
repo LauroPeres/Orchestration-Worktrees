@@ -100,8 +100,48 @@ def test_fix_starts_traefik_when_ports_free(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(router, "ensure_running", start)
     monkeypatch.setattr(doctor, "_port_in_use", lambda port: False)
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
+    monkeypatch.setattr(router, "has_host_gateway", lambda: True)
     checks = {c.name: c for c in doctor.check_routing(fix=True)}
     assert checks["traefik"].level == "ok"
+
+
+def _stale_traefik(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
+    state = {"gateway": False}
+
+    def recreate(*a: object, **k: object) -> None:
+        state["gateway"] = True
+
+    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "", ""))
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    monkeypatch.setattr(router, "is_running", lambda: True)
+    monkeypatch.setattr(router, "has_host_gateway", lambda: state["gateway"])
+    monkeypatch.setattr(router, "ensure_running", recreate)
+    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
+    return state
+
+
+def test_stale_traefik_warns_without_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _stale_traefik(monkeypatch)
+    check = _by_name(doctor.check_routing(fix=False))["traefik"]
+    assert check.level == "warn"
+    assert "host.docker.internal" in check.detail
+    assert "wt doctor --fix" in check.hint and "wt up" in check.hint
+    assert state["gateway"] is False
+
+
+def test_stale_traefik_is_recreated_by_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _stale_traefik(monkeypatch)
+    assert _by_name(doctor.check_routing(fix=True))["traefik"].level == "ok"
+    assert state["gateway"] is True
+
+
+def test_has_host_gateway_reads_inspect(monkeypatch: pytest.MonkeyPatch) -> None:
+    out = '["host.docker.internal:host-gateway"]'
+    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, out, ""))
+    assert router.has_host_gateway() is True
+    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "null", ""))
+    assert router.has_host_gateway() is False
 
 
 # ---- shared Postgres and recorded ports ------------------------------------------------
