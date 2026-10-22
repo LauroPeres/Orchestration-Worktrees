@@ -37,6 +37,7 @@ class BranchState(BaseModel):
     compose_projects: dict[str, str] = Field(default_factory=dict)  # repo -> compose project
     route_file: str | None = None
     cert_files: list[str] = Field(default_factory=list)
+    providers: dict[str, list[str]] = Field(default_factory=dict)  # provider -> resource names
 
 
 STATE_VERSION = 1

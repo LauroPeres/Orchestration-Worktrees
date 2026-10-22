@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from wt import compose, git, health, router, tls
+from wt import providers as registry
 from wt.config import LoadedConfig, Service
 from wt.errors import WtError
 from wt.naming import Names
 from wt.paths import project_dir
+from wt.providers.base import BranchContext, Kind, Provider
 from wt.state import BranchState, RepoState, StateStore, atomic_write, file_lock, now
 from wt.templating import render
 
@@ -80,6 +82,14 @@ class Orchestrator:
             group.services.append(name)
         return list(groups.values())
 
+    def providers(self) -> list[Provider]:
+        return registry.active(self.cfg)
+
+    def provider_context(self, names: Names) -> BranchContext:
+        pg = self.cfg.shared.postgres
+        base = pg.base_branch if pg is not None else "main"
+        return BranchContext(names, names.branch, base, self.store)
+
     def template_context(self, names: Names, svc: Service) -> dict[str, Any]:
         services = {
             n: {
@@ -89,7 +99,7 @@ class Orchestrator:
             }
             for n, s in self.cfg.services.items()
         }
-        return {
+        context: dict[str, Any] = {
             "project": self.cfg.project,
             "branch": names.branch,
             "slug": names.slug,
@@ -101,6 +111,11 @@ class Orchestrator:
             "host": names.host(svc.subdomain) if svc.subdomain is not None else "",
             "services": services,
         }
+        kind: Kind = "compose" if svc.compose is not None else "run"
+        ctx = self.provider_context(names)
+        for provider in self.providers():
+            context.update(provider.template_vars(ctx, kind))
+        return context
 
     def _branch_lock(self, names: Names) -> Any:
         return file_lock(f"branch-{self.cfg.project}-{names.slug}")
@@ -139,9 +154,12 @@ class Orchestrator:
                 current.status = "creating"
 
             try:
-                if shared := ", ".join(self.cfg.shared.configured()):
+                if ignored := ", ".join(
+                    n for n in self.cfg.shared.configured() if n not in registry.REGISTRY
+                ):
                     self.log(
-                        f"[yellow]note:[/] shared providers ({shared}) are not in v0.1; ignored"
+                        f"[yellow]note:[/] shared providers ({ignored}) are not available "
+                        "yet; ignored"
                     )
 
                 with file_lock("traefik"):
@@ -150,6 +168,7 @@ class Orchestrator:
                     router.ensure_running()
 
                 worktrees = self._up_worktrees(branch, names)
+                self._up_providers(branch, names)
 
                 cert = tls.ensure_cert(names)
                 if cert is None:
@@ -186,6 +205,31 @@ class Orchestrator:
             except Exception:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
+
+    def _up_providers(self, branch: str, names: Names) -> None:
+        ctx = self.provider_context(names)
+        for provider in self.providers():
+            self.log(f"provider [bold]{provider.name}[/]")
+            provider.ensure_server()
+            # Name first, resources after: `down` then cleans a create that died halfway.
+
+            def started(bs: BranchState, n: str = provider.name) -> None:
+                bs.providers.setdefault(n, [])
+
+            self._record(branch, started)
+            created = provider.create(ctx)
+
+            def finished(
+                bs: BranchState, n: str = provider.name, r: list[str] = created.names
+            ) -> None:
+                bs.providers[n] = r
+
+            self._record(branch, finished)
+            check = provider.verify(ctx)
+            for warning in check.warnings:
+                self.log(f"[yellow]warning:[/] {provider.name}: {warning}")
+            if not check.ok:
+                raise WtError(f"{provider.name}: {check.detail}")
 
     def _drop_routes(self, branch: str, names: Names) -> None:
         recorded = self.store.load().branches[branch].route_file
@@ -252,7 +296,9 @@ class Orchestrator:
                         f"(found: {', '.join(available)}); set 'compose_service'"
                     )
                 alias = names.network_alias(name) if svc.subdomain is not None else None
-                patches[target] = compose.ServicePatch(alias=alias, env=envs[name])
+                patches[target] = compose.ServicePatch(
+                    alias=alias, env=envs[name], network=bool(self.providers())
+                )
                 if alias and svc.subdomain is not None:
                     routes.append(
                         router.Route(name, names.host(svc.subdomain), f"http://{alias}:{svc.port}")
@@ -367,6 +413,7 @@ class Orchestrator:
             tls.remove_cert(
                 [*tls.cert_paths(names), *(Path(p) for p in (bs.cert_files if bs else []))]
             )
+            self._down_providers(branch, names, bs)
             shutil.rmtree(self.branch_dir(names), ignore_errors=True)
 
             for source, path in removals:
@@ -379,6 +426,27 @@ class Orchestrator:
             with self.store.edit() as state:
                 state.branches.pop(branch, None)
             return True
+
+    def _down_providers(self, branch: str, names: Names, bs: BranchState | None) -> None:
+        if bs is None or not bs.providers:
+            return
+        ctx = self.provider_context(names)
+        for name in list(bs.providers):
+            factory = registry.REGISTRY.get(name)
+            if factory is None:
+                leftover = ", ".join(bs.providers[name]) or "none recorded"
+                self.log(
+                    f"[yellow]warning:[/] provider {name!r} is not available; remove its "
+                    f"resources by hand: {leftover}"
+                )
+                continue
+            self.log(f"destroying {name} resources")
+            factory(self.cfg).destroy(ctx)
+
+            def cleared(b: BranchState, n: str = name) -> None:
+                b.providers.pop(n, None)
+
+            self._record(branch, cleared)
 
     # ---- ls / logs ------------------------------------------------------------------------
 

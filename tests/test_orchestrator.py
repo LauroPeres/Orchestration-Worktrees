@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import FakeDocker
+from tests.conftest import SHARED, FakeDocker, FakeProvider
 from wt import compose, git, router, tls
 from wt.errors import WtError
+from wt.providers.base import Check
 
 
 def test_up_creates_everything(orch, docker: FakeDocker, isolated_home: Path) -> None:
@@ -278,3 +279,144 @@ def test_concurrent_up_of_two_branches(orch, docker: FakeDocker) -> None:
     assert {b: s.status for b, s in branches.items()} == {"feat/a": "up", "feat/b": "up"}
     assert all(s.repos["api"].created for s in branches.values())
     assert sorted(docker.ups) == ["wt-shop-feat-a-api", "wt-shop-feat-b-api"]
+
+
+# ---- providers ------------------------------------------------------------------------------
+
+
+def test_provider_call_order(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    assert fake_provider.events == ["ensure", "create", "verify", "compose up"]
+    o.down("feat/cart")
+    assert fake_provider.events[4:] == ["compose down", "destroy"]
+
+
+def test_provider_state_is_recorded_and_cleared(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].providers == {"postgres": ["db_feat_cart"]}
+    o.down("feat/cart")
+    assert o.store.load().branches == {}
+
+
+def test_provider_name_is_recorded_before_create(orch, fake_provider: FakeProvider) -> None:
+    fake_provider.fail_create = True
+    o = orch(shared=SHARED)
+    with pytest.raises(WtError, match="create failed"):
+        o.up("feat/cart")
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.status == "failed"
+    assert bs.providers == {"postgres": []}
+    assert "compose up" not in fake_provider.events
+    o.down("feat/cart")
+    assert fake_provider.events[-1] == "destroy"
+    assert o.store.load().branches == {}
+
+
+def test_second_up_is_idempotent(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    o.up("feat/cart")
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.providers == {"postgres": ["db_feat_cart"]}
+    assert bs.status == "up"
+    assert fake_provider.events.count("destroy") == 0
+
+
+def test_failed_verify_fails_up(orch, fake_provider: FakeProvider, docker: FakeDocker) -> None:
+    fake_provider.check = Check(False, "row counts differ", [])
+    o = orch(shared=SHARED)
+    with pytest.raises(WtError, match="row counts differ"):
+        o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "failed"
+    assert docker.ups == []
+
+
+def test_verify_warnings_are_logged(orch, fake_provider: FakeProvider) -> None:
+    fake_provider.check = Check(True, "ok", ["base db was empty"])
+    logs: list[str] = []
+    o = orch(shared=SHARED)
+    o.log = logs.append
+    o.up("feat/cart")
+    assert any("base db was empty" in m for m in logs)
+
+
+def test_template_vars_per_kind(orch, fake_provider: FakeProvider, docker: FakeDocker) -> None:
+    o = orch(
+        env={"DB": "{{ pg.url }}"},
+        shared=SHARED,
+        extra_services={
+            "web": {"repo": "api", "run": "serve", "env": {"DB": "{{ pg.url }}"}},
+        },
+    )
+    o.up("feat/cart")
+    assert set(fake_provider.kinds) == {"compose", "run"}
+    assert "DB: compose://feat_cart@main" in docker.files[0][1].read_text()
+
+
+def test_base_branch_comes_from_config(
+    orch, fake_provider: FakeProvider, docker: FakeDocker
+) -> None:
+    o = orch(
+        env={"DB": "{{ pg.url }}"},
+        shared={"postgres": {"databases": ["shop"], "base_branch": "develop"}},
+    )
+    o.up("feat/cart")
+    assert "@develop" in docker.files[0][1].read_text()
+
+
+def test_provider_template_error_creates_nothing(orch, fake_provider: FakeProvider) -> None:
+    o = orch(env={"DB": "{{ pg.nope }}"}, shared=SHARED)
+    with pytest.raises(WtError, match="nope"):
+        o.up("feat/cart")
+    assert fake_provider.events == []
+    assert o.store.load().branches == {}
+
+
+def test_provider_makes_every_service_join_the_network(
+    orch, fake_provider: FakeProvider, docker: FakeDocker
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    parsed = docker.files[0][1].read_text()
+    assert parsed.count("wt: {}") == 1  # db has no alias but joins; api has an alias
+    assert "name: wt" in parsed
+
+
+def test_no_provider_keeps_unrouted_services_off_the_network(orch, docker: FakeDocker) -> None:
+    orch().up("feat/cart")
+    assert "wt: {}" not in docker.files[0][1].read_text()
+
+
+def test_override_file_is_private(orch, fake_provider: FakeProvider, docker: FakeDocker) -> None:
+    orch(shared=SHARED).up("feat/cart")
+    assert docker.files[0][1].stat().st_mode & 0o777 == 0o600
+
+
+def test_note_only_for_unregistered_providers(orch, fake_provider: FakeProvider) -> None:
+    logs: list[str] = []
+    o = orch(shared={**SHARED, "kafka": {"groups": ["g"]}})
+    o.log = logs.append
+    o.up("feat/cart")
+    notes = [m for m in logs if "not available" in m]
+    assert len(notes) == 1 and "kafka" in notes[0] and "postgres" not in notes[0]
+
+
+def test_no_note_when_all_providers_are_registered(orch, fake_provider: FakeProvider) -> None:
+    logs: list[str] = []
+    o = orch(shared=SHARED)
+    o.log = logs.append
+    o.up("feat/cart")
+    assert not any("not available" in m for m in logs)
+
+
+def test_down_lists_resources_of_unavailable_provider(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/x")
+    with o.store.edit() as state:
+        state.branches["feat/x"].providers["gone"] = ["db__feat_x"]
+    logs: list[str] = []
+    o.log = logs.append
+    o.down("feat/x")
+    assert any("'gone'" in line and "db__feat_x" in line for line in logs)

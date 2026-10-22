@@ -45,6 +45,7 @@ def dump(doc: dict[str, Any]) -> str:
 class ServicePatch:
     alias: str | None = None  # network alias on the shared `wt` network (routed services)
     env: dict[str, str] = field(default_factory=dict)
+    network: bool = False  # join the shared `wt` network even without an alias
 
 
 def build_override(all_services: list[str], patches: dict[str, ServicePatch]) -> dict[str, Any]:
@@ -59,11 +60,12 @@ def build_override(all_services: list[str], patches: dict[str, ServicePatch]) ->
         patch = patches.get(name)
         if patch and patch.env:
             spec["environment"] = dict(patch.env)
-        if patch and patch.alias:
-            spec["networks"] = {"default": {}, NETWORK: {"aliases": [patch.alias]}}
+        if patch and (patch.alias or patch.network):
+            joined: dict[str, Any] = {"aliases": [patch.alias]} if patch.alias else {}
+            spec["networks"] = {"default": {}, NETWORK: joined}
         services[name] = spec
     doc: dict[str, Any] = {"services": services}
-    if any(p.alias for p in patches.values()):
+    if any(p.alias or p.network for p in patches.values()):
         doc["networks"] = {NETWORK: {"external": True, "name": network_name()}}
     return doc
 

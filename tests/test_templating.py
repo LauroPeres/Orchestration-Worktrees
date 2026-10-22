@@ -24,3 +24,13 @@ def test_upcoming_provider_hint() -> None:
 def test_sandbox_blocks_internals() -> None:
     with pytest.raises(WtError):
         render("{{ ''.__class__.__mro__ }}", {}, "env.A")
+
+
+def test_registered_provider_loses_the_upcoming_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.conftest import FakeProvider
+    from wt import providers
+
+    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg: FakeProvider([]))
+    with pytest.raises(WtError) as exc:
+        render("{{ postgres.url('shop') }}", {}, "env.A")
+    assert "arrives in" not in str(exc.value)
