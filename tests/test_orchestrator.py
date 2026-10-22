@@ -841,3 +841,26 @@ def test_up_and_down_hold_the_provider_lock(
     o.down("feat/cart")
     for method in ("ensure_server", "create", "destroy"):
         assert "postgres" in seen[method], method
+
+
+def _git_branches(root: Path) -> str:
+    return proc.run(["git", "branch", "--list"], cwd=root).stdout
+
+
+def test_refused_base_alias_has_no_side_effects(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    o = orch(shared=SHARED)
+    with pytest.raises(WtError, match="same databases"):
+        o.up("Main")
+    assert o.store.load().branches == {}
+    assert "Main" not in _git_branches(tmp_path / "shop-api")
+
+
+def test_refused_up_leaves_the_slug_free(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    fake_provider.refuse = True
+    with pytest.raises(WtError, match="refused"):
+        o.up("Main")
+    assert o.store.load().branches == {}
+    fake_provider.refuse = False
+    o.up("main")
+    assert "main" in o.store.load().branches

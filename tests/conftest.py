@@ -170,11 +170,16 @@ class FakeProvider:
     events: list[str]
     name: str = "postgres"
     fail_create: bool = False
+    refuse: bool = False
     check: Check = field(default_factory=lambda: Check(True, "fine", []))
     kinds: list[str] = field(default_factory=list)
 
     def ensure_server(self) -> None:
         self.events.append("ensure")
+
+    def preflight(self, ctx: BranchContext) -> None:
+        if self.refuse:
+            raise WtError("refused")
 
     def create(self, ctx: BranchContext) -> Resources:
         self.events.append("create")
