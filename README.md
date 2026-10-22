@@ -23,7 +23,9 @@ wt ships no services of its own: you describe your stack (any repos, any languag
 
 - Python 3.11+ and [uv](https://docs.astral.sh/uv/)
 - git, Docker with Compose 2.24+
-- [mkcert](https://github.com/FiloSottile/mkcert) for trusted certificates (optional)
+- [mkcert](https://github.com/FiloSottile/mkcert) for trusted certificates (optional; without it
+  branches get a self-signed certificate). On Debian/Ubuntu:
+  `sudo apt install -y mkcert libnss3-tools`
 - macOS, Linux, or Windows through WSL2
 
 ## Install
@@ -31,8 +33,11 @@ wt ships no services of its own: you describe your stack (any repos, any languag
 ```bash
 uv tool install git+https://github.com/LauroPeres/Orchestration-Worktrees
 wt doctor          # checks docker, git, ports, certificates, name resolution
-wt doctor --fix    # creates the local CA, the docker network, and starts Traefik
+wt doctor --fix    # installs the local CA, creates the docker network, starts Traefik
 ```
+
+`wt doctor --fix` creates the Docker network `wt` and starts the `wt-traefik` container on
+`127.0.0.1:80/443`. `mkcert -install` may ask for your sudo password.
 
 ## Quick start
 
@@ -41,8 +46,14 @@ In your repo:
 ```bash
 wt init            # writes a starter worktree.yaml
 $EDITOR worktree.yaml
-wt up my-branch
+wt up my-branch    # prints a SERVICE / URL / CHECK table
+wt ls              # branches, URLs, health (--no-probe skips HTTP checks, --paths shows folders)
+wt logs my-branch api   # follows one service's logs (--no-follow, --tail N)
+wt down my-branch       # --force also removes worktrees with uncommitted changes
 ```
+
+Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
+your main checkout.
 
 ## `worktree.yaml`
 
@@ -109,9 +120,27 @@ Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`),
 
 ## WSL2
 
-Browsers on Windows reach the stack through WSL's localhost forwarding, but they do not trust
-the CA that mkcert creates inside Linux. Import the file printed by `wt doctor`
-(`$(mkcert -CAROOT)/rootCA.pem`) into Windows' "Trusted Root Certification Authorities".
+Tested on WSL2 with Docker Desktop. Inside WSL, `*.localhost` resolves for curl and browsers
+and HTTPS works with the mkcert CA. Docker Desktop's WSL integration must be turned on for
+your distro, otherwise `docker` is not found (see Troubleshooting).
+
+Browsers on Windows reach the stack through Docker Desktop's ports on `127.0.0.1`, but they do
+not trust the CA that mkcert creates inside Linux. To trust it:
+
+1. Copy `$(mkcert -CAROOT)/rootCA.pem` to a Windows path, for example
+   `C:\Users\Public\wt-rootCA.crt`.
+2. Double-click it, choose Install Certificate, then Current User.
+3. Place it in "Trusted Root Certification Authorities".
+4. Restart the browser.
+
+## Troubleshooting
+
+- **`docker` says it "could not be found in this WSL 2 distro"**: turn on Docker Desktop's
+  WSL integration for that distro (Settings, Resources, WSL integration).
+- **Windows `curl.exe` fails with `CRYPT_E_NO_REVOCATION_CHECK` on mkcert certificates**: use
+  `curl.exe --ssl-no-revoke`. Browsers are not affected.
+- **`wt doctor` warns that the OS resolver does not resolve `*.<domain>`**: expected. Browsers
+  and curl resolve `*.localhost` themselves.
 
 ## Development
 
