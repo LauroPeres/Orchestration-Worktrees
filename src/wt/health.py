@@ -48,4 +48,4 @@ def wait_healthy(host: str, path: str, port: int, timeout: float) -> Check:
         check = probe(host, path, port)
         if check.ok or time.monotonic() >= deadline:
             return check
-        time.sleep(1.0)
+        time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))

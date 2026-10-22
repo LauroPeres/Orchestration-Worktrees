@@ -66,14 +66,14 @@ def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
     - neither: create the branch from the repo's HEAD
     """
     check_repo(repo)
+    _git(repo, "worktree", "prune")
     for tree in list_worktrees(repo):
         if tree.branch == branch:
             owned = tree.path.resolve() == target.resolve()
             return EnsureResult(tree.path, created=owned, branch_created=False)
-    if target.exists() and any(target.iterdir()):
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise WtError(f"{target} exists and is not a worktree of {branch!r}; remove it first")
     target.parent.mkdir(parents=True, exist_ok=True)
-    _git(repo, "worktree", "prune")
     if _has_ref(repo, f"refs/heads/{branch}"):
         _git(repo, "worktree", "add", str(target), branch)
         return EnsureResult(target, created=True, branch_created=False)

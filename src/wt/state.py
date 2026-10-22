@@ -1,6 +1,7 @@
 """~/.wt/<project>/state.json: what exists for each branch, so teardown is exact."""
 
 import fcntl
+import json
 import os
 import tempfile
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from wt.errors import WtError
 from wt.paths import locks_dir, project_dir
 
 
@@ -37,7 +39,11 @@ class BranchState(BaseModel):
     cert_files: list[str] = Field(default_factory=list)
 
 
+STATE_VERSION = 1
+
+
 class State(BaseModel):
+    version: int = STATE_VERSION
     project: str
     config_path: str | None = None
     branches: dict[str, BranchState] = Field(default_factory=dict)
@@ -76,7 +82,21 @@ class StateStore:
     def load(self) -> State:
         if not self.path.exists():
             return State(project=self.project)
-        return State.model_validate_json(self.path.read_text())
+        try:
+            raw = json.loads(self.path.read_text())
+            version = raw.get("version", 1) if isinstance(raw, dict) else 1
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise ValueError(f"state version must be an integer, got {version!r}")
+            if version > STATE_VERSION:
+                raise WtError(
+                    f"{self.path} was written by a newer wt (state version {version}); upgrade wt."
+                )
+            return State.model_validate(raw)
+        except (ValueError, OSError) as exc:  # JSONDecodeError, ValidationError, read errors
+            raise WtError(
+                f"State file {self.path} is corrupt or unreadable ({exc.__class__.__name__}). "
+                "Fix it by hand or delete it."
+            ) from exc
 
     def _save(self, state: State) -> None:
         atomic_write(self.path, state.model_dump_json(indent=2) + "\n")

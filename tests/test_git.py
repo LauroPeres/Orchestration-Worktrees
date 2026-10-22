@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import pytest
@@ -86,3 +87,21 @@ def test_branch_name_validation() -> None:
     git.check_branch_name("feat/ok")
     with pytest.raises(WtError):
         git.check_branch_name("bad..name")
+
+
+def test_recreates_worktree_deleted_by_hand(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    target = tmp_path / "t"
+    git.ensure_worktree(repo, "feat/x", target)
+    shutil.rmtree(target)
+    res = git.ensure_worktree(repo, "feat/x", target)
+    assert res.created and target.is_dir()
+    assert any(t.path == target for t in git.list_worktrees(repo))
+
+
+def test_target_that_is_a_file_is_refused(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    target = tmp_path / "t"
+    target.write_text("x")
+    with pytest.raises(WtError, match="not a worktree"):
+        git.ensure_worktree(repo, "feat/x", target)
