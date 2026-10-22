@@ -375,3 +375,9 @@ from `WEB_ORIGIN`. The `feat/cart` change lives in `examples/shop/feat-cart/` as
 which `bootstrap.sh` copies onto that branch and commits.
 
 **Base alias.** A non-base branch whose database names equal the base branch's (`Main`, `main_`, `release-1.0` vs `release/1.0`) is refused by `up`, and `down` never drops those databases.
+
+**D15 (run: quoting).** In a `run:` command every `{{ ... }}` value is inserted shell-quoted
+(`shlex.quote`), because the command runs with `sh -c` and git allows `;`, `$()`, backticks and `&`
+in branch names. Safe values such as ports and URLs are unchanged. Only `run:` is quoted: `env`
+values, compose files and URLs are rendered as they are. Users must not add quotes around template
+values in `run:`.
