@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from tests.conftest import SHARED, FakeDocker, FakeProvider
-from wt import compose, git, host, naming, proc, router, tls
+from wt import compose, git, health, host, naming, proc, router, tls
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import Check
@@ -763,3 +763,27 @@ def test_port_is_recorded_before_the_process_starts(
     o.up("main")
     port = o.store.load().branches["main"].processes["web"].port
     assert seen == [{"web": port}]
+
+
+def test_ls_status_is_degraded_when_a_check_fails(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    assert [r.status for r in o.ls()] == ["up"]
+    monkeypatch.setattr(health, "probe", lambda *a, **k: health.Check(False, "HTTP 502"))
+    [row] = o.ls()
+    assert row.status == "degraded"
+    # without probing there is no evidence of a failure
+    assert [r.status for r in o.ls(probe=False)] == ["up"]
+
+
+def test_ls_status_is_degraded_when_not_all_services_run(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    monkeypatch.setattr(compose, "ps", lambda p: [compose.Container("api", "exited", "")])
+    [row] = o.ls(probe=False)
+    assert row.running == 0 and row.total == 1
+    assert row.status == "degraded"
