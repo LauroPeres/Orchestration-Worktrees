@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from wt import router
+from wt.errors import WtError
 from wt.naming import Names
 
 NAMES = Names("shop", "feat/cart", "shop.localhost")
@@ -62,3 +63,15 @@ def test_traefik_reaches_host_processes() -> None:
 
 def test_host_upstream() -> None:
     assert router.host_upstream(23456) == "http://host.docker.internal:23456"
+
+
+@pytest.mark.parametrize(
+    ("var", "fn"), [("WT_HTTP_PORT", router.http_port), ("WT_HTTPS_PORT", router.https_port)]
+)
+@pytest.mark.parametrize("bad", ["abc", "", "0", "70000", "-1"])
+def test_invalid_port_variable(
+    monkeypatch: pytest.MonkeyPatch, var: str, fn: object, bad: str
+) -> None:
+    monkeypatch.setenv(var, bad)
+    with pytest.raises(WtError, match=var):
+        fn()  # type: ignore[operator]

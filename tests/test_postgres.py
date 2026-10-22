@@ -501,3 +501,10 @@ def test_branch_aliasing_the_base_databases_is_refused_and_never_dropped(
     PostgresProvider(config(), log=logs.append).destroy(ctx(branch, base))
     assert fake.calls == []
     assert logs and "base branch" in logs[0]
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "0", "70000"])
+def test_invalid_postgres_port(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    monkeypatch.setenv("WT_POSTGRES_PORT", bad)
+    with pytest.raises(WtError, match="WT_POSTGRES_PORT"):
+        postgres.host_port()
