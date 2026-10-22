@@ -267,7 +267,8 @@ contain the password, so they are written with mode `0600`.
 
 **Postgres server start.** `ensure_server()` starts the container if needed, the same way Traefik is
 started. It waits up to 60 s for `pg_isready` inside the container. Then it re-enables
-`datallowconn` on any wt-managed database (`<db>__*`) that has it off. `doctor --fix` runs the same
+`datallowconn` on the wt-managed databases (`<db>__*` for each configured `<db>`, `_` escaped in
+`LIKE`) that have it off. A user's own database such as `a__b` is never touched. `doctor --fix` runs the same
 repair.
 
 **Postgres access.** wt talks to Postgres with `docker exec <container> psql -v ON_ERROR_STOP=1 -U wt ...`
@@ -303,7 +304,13 @@ clone, only for databases cloned in this run. `template`: a mismatch drops the c
 `shortcut: exact counts are slow on big tables, move to sampled checksums when someone hits it`
 
 **Destroy.** `down <branch>` runs `DROP DATABASE IF EXISTS ... WITH (FORCE)` for that branch's
-databases. On `base_branch` it never drops the base databases, and it says so.
+databases. At `create` time the provider records the base branch in state
+(`BranchState.provider_base`, optional field, state stays version 1). `destroy` trusts that record
+over the current config, so changing `base_branch` or removing `shared.postgres` after `up` cannot
+make it drop the clone source. It never drops the databases of the recorded base branch; when
+neither state nor config says which branch is the base, it drops nothing. Either way it logs that
+it keeps them. If reopening the source after a template clone fails, the original clone error is
+still the one reported.
 
 **Postgres template vars.** `postgres.url('shop')` and `postgres.name('shop')`. Compose services get
 `postgresql://wt:<pw>@<container>:5432/<db>`. Host processes get

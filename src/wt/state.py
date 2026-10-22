@@ -38,6 +38,7 @@ class BranchState(BaseModel):
     route_file: str | None = None
     cert_files: list[str] = Field(default_factory=list)
     providers: dict[str, list[str]] = Field(default_factory=dict)  # provider -> resource names
+    provider_base: dict[str, str] = Field(default_factory=dict)  # provider -> base branch at create
 
 
 STATE_VERSION = 1

@@ -83,7 +83,7 @@ class Orchestrator:
         return list(groups.values())
 
     def providers(self) -> list[Provider]:
-        return registry.active(self.cfg)
+        return registry.active(self.cfg, self.log)
 
     def provider_context(self, names: Names) -> BranchContext:
         pg = self.cfg.shared.postgres
@@ -441,7 +441,7 @@ class Orchestrator:
                 )
                 continue
             self.log(f"destroying {name} resources")
-            factory(self.cfg).destroy(ctx)
+            factory(self.cfg, self.log).destroy(ctx)
 
             def cleared(b: BranchState, n: str = name) -> None:
                 b.providers.pop(n, None)

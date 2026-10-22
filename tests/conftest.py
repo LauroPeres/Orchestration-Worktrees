@@ -168,7 +168,7 @@ def fake_provider(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> FakePr
     """Registers a fake `postgres` provider; compose up/down are logged in the same event list."""
     events: list[str] = []
     fake = FakeProvider(events)
-    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg: fake)
+    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg, log: fake)
     real_up, real_down = docker.up, compose.down
 
     def up(project: str, files: list[Path], **kwargs: object) -> None:
