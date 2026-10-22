@@ -129,14 +129,29 @@ def check_routing(fix: bool) -> list[Check]:
         with file_lock("traefik"):
             router.ensure_running()
         running = router.is_running()
-    checks.append(
-        Check(
-            "traefik",
-            "ok" if running else "warn",
-            f"{router.container()} ({router.image()})" if running else "not running",
-            "" if running else "started on first `wt up` (or `wt doctor --fix`)",
+    stale = running and not router.has_host_gateway()
+    if stale and fix:
+        with file_lock("traefik"):
+            router.ensure_running()
+        stale = not router.has_host_gateway()
+    if stale:
+        checks.append(
+            Check(
+                "traefik",
+                "warn",
+                f"{router.container()} lacks {router.HOST_GATEWAY_NAME} (older wt container)",
+                "recreated by `wt doctor --fix` or the next `wt up`",
+            )
         )
-    )
+    else:
+        checks.append(
+            Check(
+                "traefik",
+                "ok" if running else "warn",
+                f"{router.container()} ({router.image()})" if running else "not running",
+                "" if running else "started on first `wt up` (or `wt doctor --fix`)",
+            )
+        )
     mapped = _traefik_ports() if running else ""
     for label, port, env in [
         ("http port", router.http_port(), "WT_HTTP_PORT"),
