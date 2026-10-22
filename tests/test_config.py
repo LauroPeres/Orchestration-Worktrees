@@ -57,6 +57,27 @@ def test_starter_is_valid(tmp_path: Path) -> None:
     assert load_config(path).config.services["app"].env["PUBLIC_URL"] == "{{ url }}"
 
 
+def test_starter_examples_validate_when_uncommented(tmp_path: Path) -> None:
+    text = STARTER.format(project="demo")
+    base, marker, rest = text.partition("# --- examples")
+    assert marker
+    examples = rest.splitlines()[1:]  # drop the rest of the marker line
+    assert all(line.startswith("# ") for line in examples)
+    assert "#   web:" in examples
+    assert "#   postgres:" in examples
+    uncommented = "\n".join(line.removeprefix("# ") for line in examples)
+    path = tmp_path / "worktree.yaml"
+    path.write_text(base + uncommented + "\n")
+    cfg = load_config(path).config
+    web = cfg.services["web"]
+    assert web.run == "npm run dev -- --host 0.0.0.0 --port {{ port }}"
+    assert web.port == "auto"
+    assert web.env["DATABASE_URL"] == "{{ postgres.url('app') }}"
+    assert cfg.shared.postgres is not None
+    assert cfg.shared.postgres.databases == ["app"]
+    assert cfg.shared.postgres.base_branch == "main"
+
+
 @pytest.mark.parametrize(
     ("data", "message"),
     [
