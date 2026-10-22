@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from wt import compose, git, health, host, router, tls
+from wt import compose, git, health, host, proc, router, tls
 from wt import providers as registry
 from wt.config import LoadedConfig, Service
 from wt.errors import WtError
@@ -39,6 +39,7 @@ class ServiceReport:
     outcome: Outcome
     detail: str
     url: str | None = None
+    kind: Literal["compose", "run"] = "compose"
 
 
 @dataclass
@@ -49,6 +50,12 @@ class BranchStatus:
     total: int
     services: list[ServiceReport] = field(default_factory=list)
     worktrees: dict[str, str] = field(default_factory=dict)
+    databases: list[str] = field(default_factory=list)
+    docker_ok: bool = True
+
+
+def _kind(svc: Service) -> Literal["compose", "run"]:
+    return "run" if svc.run is not None else "compose"
 
 
 @dataclass(frozen=True)
@@ -439,7 +446,11 @@ class Orchestrator:
                     names.host(svc.subdomain), svc.health, router.https_port(), timeout
                 )
                 return ServiceReport(
-                    name, "ok" if result.ok else "fail", f"GET {svc.health} -> {result.detail}", url
+                    name,
+                    "ok" if result.ok else "fail",
+                    f"GET {svc.health} -> {result.detail}",
+                    url,
+                    _kind(svc),
                 )
             if svc.run is not None:
                 return self._check_process(name, processes.get(name), timeout)
@@ -457,19 +468,19 @@ class Orchestrator:
     def _check_process(self, name: str, ps: ProcessState | None, timeout: float) -> ServiceReport:
         """Unrouted host process: TCP connect when it has a port, otherwise just alive."""
         if ps is None:
-            return ServiceReport(name, "fail", "not started")
+            return ServiceReport(name, "fail", "not started", kind="run")
         deadline = time.monotonic() + timeout
         while ps.port is not None:
             if not host.alive(ps):
                 break
             if host.tcp_ok(ps.port):
-                return ServiceReport(name, "ok", f"port {ps.port} accepts connections")
+                return ServiceReport(name, "ok", f"port {ps.port} accepts connections", kind="run")
             if time.monotonic() >= deadline:
-                return ServiceReport(name, "fail", f"nothing listens on port {ps.port}")
+                return ServiceReport(name, "fail", f"nothing listens on port {ps.port}", kind="run")
             time.sleep(0.2)
         if host.alive(ps):
-            return ServiceReport(name, "ok", f"running (pid {ps.pid})")
-        return ServiceReport(name, "fail", f"exited; see {ps.log}")
+            return ServiceReport(name, "ok", f"running (pid {ps.pid})", kind="run")
+        return ServiceReport(name, "fail", f"exited; see {ps.log}", kind="run")
 
     # ---- down -----------------------------------------------------------------------------
 
@@ -587,26 +598,33 @@ class Orchestrator:
 
         def status(bs: BranchState) -> BranchStatus:
             names = self.names(bs.branch)
-            containers = [c for p in bs.compose_projects.values() for c in compose.ps(p)]
+            containers: list[compose.Container] = []
+            docker_ok = True
+            try:
+                containers = [c for p in bs.compose_projects.values() for c in compose.ps(p)]
+            except WtError:
+                docker_ok = False
             result = BranchStatus(
                 branch=bs.branch,
                 status=bs.status,
                 running=sum(c.state == "running" for c in containers),
                 total=len(containers),
                 worktrees={r: s.path for r, s in bs.repos.items()},
+                databases=list(bs.providers.get("postgres", [])),
+                docker_ok=docker_ok,
             )
             for name, svc in self.cfg.services.items():
                 url = self.service_url(names, svc)
                 if url is None or svc.subdomain is None:
                     continue
                 if not probe:
-                    result.services.append(ServiceReport(name, "skipped", "", url))
+                    result.services.append(ServiceReport(name, "skipped", "", url, _kind(svc)))
                     continue
                 check = health.probe(
                     names.host(svc.subdomain), svc.health, router.https_port(), timeout=2.0
                 )
                 result.services.append(
-                    ServiceReport(name, "ok" if check.ok else "fail", check.detail, url)
+                    ServiceReport(name, "ok" if check.ok else "fail", check.detail, url, _kind(svc))
                 )
             return result
 
@@ -617,11 +635,16 @@ class Orchestrator:
         svc = self.cfg.services.get(service)
         if svc is None:
             raise WtError(f"unknown service {service!r} (known: {', '.join(self.cfg.services)})")
-        if svc.compose is None:
-            raise WtError(f"{service!r} is a host process; logs for those arrive in v0.2")
         if branch not in self.store.load().branches:
             raise WtError(f"branch {branch!r} is not up (see `wt ls`)")
         names = self.names(branch)
+        if svc.run is not None:
+            path = self.log_path(names, service)
+            if not path.is_file():
+                raise WtError(f"no log yet for {service} on {branch}")
+            args = ["tail", "-n", str(tail), *(["-f"] if follow else []), str(path)]
+            proc.run(args, capture=False, check=False)
+            return
         compose.logs(
             names.compose_project(svc.repo),
             svc.compose_service or service,

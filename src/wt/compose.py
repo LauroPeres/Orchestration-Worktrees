@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from wt import proc
+from wt.errors import WtError
 from wt.paths import instance
 
 NETWORK = "wt"  # key of the shared network inside compose files
@@ -105,9 +106,13 @@ class Container:
 
 
 def ps(project: str) -> list[Container]:
-    out = proc.run(
+    result = proc.run(
         ["docker", "compose", "-p", project, "ps", "-a", "--format", "json"], check=False
-    ).stdout.strip()
+    )
+    if not result.ok:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise WtError(f"docker is not reachable: {detail[-1] if detail else 'compose ps failed'}")
+    out = result.stdout.strip()
     if not out:
         return []
     rows: list[dict[str, Any]]

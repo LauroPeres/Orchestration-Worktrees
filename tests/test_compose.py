@@ -5,6 +5,7 @@ import pytest
 import yaml
 
 from wt import compose, proc
+from wt.errors import WtError
 
 
 class _Loader(yaml.SafeLoader):
@@ -53,6 +54,12 @@ def test_ps_parses_both_json_formats(monkeypatch: pytest.MonkeyPatch, as_array: 
 def test_ps_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(proc, "run", lambda *a, **k: proc.Result(0, "", ""))
     assert compose.ps("p") == []
+
+
+def test_ps_raises_when_docker_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proc, "run", lambda *a, **k: proc.Result(1, "", "Cannot connect"))
+    with pytest.raises(WtError, match="docker is not reachable"):
+        compose.ps("p")
 
 
 def _record(
