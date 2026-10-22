@@ -96,7 +96,8 @@ def init(
 def _report_table(reports: list[ServiceReport]) -> Table:
     table = Table(box=None, pad_edge=False)
     for col in ("SERVICE", "KIND", "URL", "CHECK", "DETAIL"):
-        table.add_column(col, overflow="fold")
+        # only DETAIL wraps; a URL is never broken mid-word
+        table.add_column(col, overflow="fold", no_wrap=col != "DETAIL")
     for r in reports:
         table.add_row(r.service, r.kind, r.url or "-", OUTCOME[r.outcome], escape(r.detail))
     return table
@@ -162,9 +163,7 @@ def ls_(
                 if no_probe or svc.service == "-"
                 else (f"{OUTCOME[svc.outcome]} [dim]{escape(svc.detail)}[/]")
             )
-            containers = (
-                f"{row.running}/{row.total} running" if row.docker_ok else "docker unavailable"
-            )
+            containers = f"{row.running}/{row.total}" if row.docker_ok else "docker unavailable"
             table.add_row(
                 row.branch if first else "",
                 row.status if first else "",
