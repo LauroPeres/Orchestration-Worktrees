@@ -483,3 +483,10 @@ def test_readiness_waits_for_the_tcp_server(fake: FakeProc) -> None:
     health = postgres.compose_doc()["services"]
     test_cmd = next(iter(health.values()))["healthcheck"]["test"]
     assert test_cmd[test_cmd.index("-h") + 1] == "127.0.0.1"
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "0", "70000"])
+def test_invalid_postgres_port(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    monkeypatch.setenv("WT_POSTGRES_PORT", bad)
+    with pytest.raises(WtError, match="WT_POSTGRES_PORT"):
+        postgres.host_port()
