@@ -144,8 +144,9 @@ class Orchestrator:
                         f"[yellow]note:[/] shared providers ({shared}) are not in v0.1; ignored"
                     )
 
-                self.log("starting shared Traefik")
                 with file_lock("traefik"):
+                    if not router.is_running():
+                        self.log("starting shared Traefik")
                     router.ensure_running()
 
                 worktrees = self._up_worktrees(branch, names)
