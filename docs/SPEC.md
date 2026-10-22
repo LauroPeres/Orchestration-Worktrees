@@ -210,3 +210,10 @@ Decisions taken while building v0.1. Change them here first if they need to chan
 - **Platforms.** Locks use `fcntl.flock`, so native Windows is not supported; use WSL2.
 - **State.** `state.json` has a `version` (1). A wt that finds a newer version refuses to touch
   the file. A corrupt file is reported with its path.
+- **Failed up.** If `up` stops on an error, the branch is marked `failed` in state and shown by
+  `wt ls`; `wt down` cleans it.
+- **Untrusted CA.** If mkcert is installed but its CA is not, `up` warns and points to
+  `wt doctor --fix`.
+- **Unknown branch.** `down` of a branch wt does not know says so and exits 0.
+- **Repo lock.** `git worktree add` runs under a per-repo lock, so concurrent `up` of
+  different branches in the same repo do not race on git's own files.

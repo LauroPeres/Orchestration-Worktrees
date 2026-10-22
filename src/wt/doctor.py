@@ -122,7 +122,8 @@ def check_routing(fix: bool) -> list[Check]:
         )
     )
     running = router.is_running()
-    if not running and fix:
+    ports_taken = _port_in_use(router.http_port()) or _port_in_use(router.https_port())
+    if not running and fix and not ports_taken:
         with file_lock("traefik"):
             router.ensure_running()
         running = router.is_running()

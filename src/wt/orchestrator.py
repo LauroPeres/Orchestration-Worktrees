@@ -1,6 +1,7 @@
 """Brings a branch up and down. Each step is recorded in state as soon as it exists, so
 `down` can clean a half-created branch, and every step is verified before `up` reports success."""
 
+import hashlib
 import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -137,40 +138,68 @@ class Orchestrator:
                 )
                 current.status = "creating"
 
-            if shared := ", ".join(self.cfg.shared.configured()):
-                self.log(f"[yellow]note:[/] shared providers ({shared}) are not in v0.1; ignored")
+            try:
+                if shared := ", ".join(self.cfg.shared.configured()):
+                    self.log(
+                        f"[yellow]note:[/] shared providers ({shared}) are not in v0.1; ignored"
+                    )
 
-            self.log("starting shared Traefik")
-            with file_lock("traefik"):
-                router.ensure_running()
+                self.log("starting shared Traefik")
+                with file_lock("traefik"):
+                    router.ensure_running()
 
-            worktrees = self._up_worktrees(branch, names)
+                worktrees = self._up_worktrees(branch, names)
 
-            cert = tls.ensure_cert(names)
-            if cert is None:
-                self.log(
-                    "[yellow]warning:[/] mkcert not found; Traefik serves its default "
-                    "self-signed certificate (see `wt doctor`)"
+                cert = tls.ensure_cert(names)
+                if cert is None:
+                    self.log(
+                        "[yellow]warning:[/] mkcert not found; Traefik serves its default "
+                        "self-signed certificate (see `wt doctor`)"
+                    )
+                else:
+                    if not tls.ca_ready():
+                        self.log(
+                            "[yellow]warning:[/] the mkcert CA is not trusted yet; browsers will "
+                            "warn about the certificates; run `wt doctor --fix`"
+                        )
+                    self._record(
+                        branch, lambda bs: setattr(bs, "cert_files", [str(p) for p in cert])
+                    )
+
+                routes = self._up_compose(
+                    branch, names, worktrees, envs, build=build, timeout=timeout
                 )
-            else:
-                self._record(branch, lambda bs: setattr(bs, "cert_files", [str(p) for p in cert]))
 
-            routes = self._up_compose(branch, names, worktrees, envs, build=build, timeout=timeout)
+                if routes:
+                    path = router.write_routes(names, routes, cert)
+                    self._record(branch, lambda bs: setattr(bs, "route_file", str(path)))
+                else:
+                    self._drop_routes(branch, names)
 
-            if routes:
-                path = router.write_routes(names, routes, cert)
-                self._record(branch, lambda bs: setattr(bs, "route_file", str(path)))
+                reports = self._verify(names, timeout=timeout)
+                failed = any(r.outcome == "fail" for r in reports)
+                self._record(
+                    branch, lambda bs: setattr(bs, "status", "degraded" if failed else "up")
+                )
+                return reports
+            except Exception:
+                self._record(branch, lambda bs: setattr(bs, "status", "failed"))
+                raise
 
-            reports = self._verify(names, timeout=timeout)
-            failed = any(r.outcome == "fail" for r in reports)
-            self._record(branch, lambda bs: setattr(bs, "status", "degraded" if failed else "up"))
-            return reports
+    def _drop_routes(self, branch: str, names: Names) -> None:
+        recorded = self.store.load().branches[branch].route_file
+        router.remove_routes(router.route_file(names))
+        if recorded:
+            router.remove_routes(Path(recorded))
+        self._record(branch, lambda bs: setattr(bs, "route_file", None))
 
     def _up_worktrees(self, branch: str, names: Names) -> dict[str, Path]:
         worktrees: dict[str, Path] = {}
         for repo in self.cfg.repos:
             source = self.loaded.repo_path(repo)
-            res = git.ensure_worktree(source, branch, self.worktree_target(names, repo))
+            key = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+            with file_lock(f"repo-{key}"):
+                res = git.ensure_worktree(source, branch, self.worktree_target(names, repo))
             worktrees[repo] = res.path
             if res.branch_created:
                 self.log(f"created branch {branch!r} in repo {repo!r} from its current HEAD")
@@ -280,7 +309,14 @@ class Orchestrator:
     def down(self, branch: str, *, force: bool = False) -> None:
         names = self.names(branch)
         with self._branch_lock(names):
-            bs = self.store.load().branches.get(branch)
+            state = self.store.load()
+            for other, other_bs in state.branches.items():
+                if other != branch and other_bs.slug == names.slug:
+                    raise WtError(
+                        f"branch {branch!r} and the running branch {other!r} map to "
+                        f"the same name {names.slug!r}; run `wt down {other}` instead"
+                    )
+            bs = state.branches.get(branch)
 
             # (main repo, worktree) pairs that wt created and must remove
             removals: list[tuple[Path, Path]] = []
@@ -293,6 +329,16 @@ class Orchestrator:
                     removals.append(
                         (self.loaded.repo_path(repo), self.worktree_target(names, repo))
                     )
+
+            leftovers = [router.route_file(names), *tls.cert_paths(names)]
+            if (
+                bs is None
+                and not removals
+                and not self.branch_dir(names).exists()
+                and not any(p.exists() for p in leftovers)
+            ):
+                self.log(f"branch {branch} not found; nothing to remove")
+                return
 
             if not force:
                 dirty = [str(p) for _, p in removals if p.exists() and git.is_dirty(p)]

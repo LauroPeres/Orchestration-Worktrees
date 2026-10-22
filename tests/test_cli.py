@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from wt import __version__
+from tests.conftest import FakeDocker
+from wt import __version__, compose
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
@@ -44,3 +45,65 @@ def test_errors_print_without_traceback(tmp_path: Path) -> None:
     assert proc.returncode == 1
     assert proc.stderr.startswith("error:")
     assert "Traceback" not in proc.stderr
+
+
+def _cfg(tmp_path: Path) -> list[str]:
+    return ["--config", str(tmp_path / "worktree.yaml")]
+
+
+def test_lifecycle_healthy(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    orch()
+    cfg = _cfg(tmp_path)
+    up = runner.invoke(app, [*cfg, "up", "feat/cart"])
+    assert up.exit_code == 0, up.output
+    assert "feat/cart is up" in up.output
+    assert docker.ups == ["wt-shop-feat-cart-api"]
+
+    listed = runner.invoke(app, [*cfg, "ls"])
+    assert listed.exit_code == 0, listed.output
+    assert "feat/cart" in listed.output
+    assert "1/1 running" in listed.output
+
+    down = runner.invoke(app, [*cfg, "down", "feat/cart"])
+    assert down.exit_code == 0, down.output
+    assert docker.downs == ["wt-shop-feat-cart-api"]
+    empty = runner.invoke(app, [*cfg, "ls"])
+    assert "no branches are up" in empty.output
+
+
+def test_up_degraded_exits_1(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker.healthy = False
+    docker.install(monkeypatch)
+    orch()
+    result = runner.invoke(app, [*_cfg(tmp_path), "up", "feat/cart"])
+    assert result.exit_code == 1
+    assert "not healthy" in result.output
+    listed = runner.invoke(app, [*_cfg(tmp_path), "ls", "--no-probe"])
+    assert "degraded" in listed.output
+
+
+def test_logs_passes_options(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, bool, int]] = []
+
+    def fake_logs(project: str, service: str, *, follow: bool, tail: int) -> None:
+        calls.append((project, service, follow, tail))
+
+    monkeypatch.setattr(compose, "logs", fake_logs)
+    orch()
+    runner.invoke(app, [*_cfg(tmp_path), "up", "feat/cart"])
+    result = runner.invoke(
+        app, [*_cfg(tmp_path), "logs", "feat/cart", "api", "--no-follow", "--tail", "5"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [("wt-shop-feat-cart-api", "api", False, 5)]
+
+
+def test_logs_of_branch_not_up_fails(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    orch()
+    result = runner.invoke(app, [*_cfg(tmp_path), "logs", "feat/cart", "api"])
+    assert isinstance(result.exception, WtError)
+    assert "not up" in str(result.exception)

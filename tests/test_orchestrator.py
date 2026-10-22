@@ -1,80 +1,12 @@
-from dataclasses import dataclass, field
+import shutil
+import threading
 from pathlib import Path
 
 import pytest
-import yaml
 
-from wt import compose, health, router, tls
-from wt.config import load_config
+from tests.conftest import FakeDocker
+from wt import compose, git, router, tls
 from wt.errors import WtError
-from wt.orchestrator import Orchestrator
-
-COMPOSE = "services:\n  api:\n    image: x\n  db:\n    image: y\n"
-
-
-@dataclass
-class FakeDocker:
-    """Records what the orchestrator asks Docker to do."""
-
-    healthy: bool = True
-    fail_up: bool = False
-    ups: list[str] = field(default_factory=list)
-    downs: list[str] = field(default_factory=list)
-    files: list[list[Path]] = field(default_factory=list)
-
-    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(router, "ensure_running", lambda timeout=60: None)
-        monkeypatch.setattr(tls, "available", lambda: False)
-        monkeypatch.setattr(compose, "list_services", lambda f: ["api", "db"])
-        monkeypatch.setattr(compose, "up", self.up)
-        monkeypatch.setattr(compose, "down", self.downs.append)
-        monkeypatch.setattr(
-            compose,
-            "ps",
-            lambda p: [compose.Container("db", "running", "")] if p in self.ups else [],
-        )
-        check = health.Check(self.healthy, "HTTP 200" if self.healthy else "HTTP 502")
-        monkeypatch.setattr(health, "wait_healthy", lambda *a, **k: check)
-        monkeypatch.setattr(health, "probe", lambda *a, **k: check)
-
-    def up(self, project: str, files: list[Path], **kwargs: object) -> None:
-        if self.fail_up:
-            raise WtError("compose up failed")
-        self.ups.append(project)
-        self.files.append(files)
-
-
-@pytest.fixture
-def docker(monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
-    fake = FakeDocker()
-    fake.install(monkeypatch)
-    return fake
-
-
-@pytest.fixture
-def orch(make_repo, tmp_path: Path):
-    def build(env: dict[str, str] | None = None) -> Orchestrator:
-        make_repo("shop-api", {"docker-compose.yml": COMPOSE})
-        config = {
-            "project": "shop",
-            "domain": "shop.localhost",
-            "repos": {"api": "./shop-api"},
-            "services": {
-                "api": {
-                    "repo": "api",
-                    "compose": "docker-compose.yml",
-                    "port": 8000,
-                    "subdomain": "api",
-                    "env": env or {"URL": "{{ url }}"},
-                },
-                "db": {"repo": "api", "compose": "docker-compose.yml"},
-            },
-        }
-        path = tmp_path / "worktree.yaml"
-        path.write_text(yaml.safe_dump(config))
-        return Orchestrator(load_config(path), log=lambda m: None)
-
-    return build
 
 
 def test_up_creates_everything(orch, docker: FakeDocker, isolated_home: Path) -> None:
@@ -178,7 +110,7 @@ def test_down_after_failed_up(orch, docker: FakeDocker, monkeypatch: pytest.Monk
     with pytest.raises(WtError, match="compose up failed"):
         o.up("feat/cart")
     bs = o.store.load().branches["feat/cart"]
-    assert bs.status == "creating"
+    assert bs.status == "failed"
     assert bs.compose_projects == {"api": "wt-shop-feat-cart-api"}
     o.down("feat/cart")
     assert docker.downs == ["wt-shop-feat-cart-api"]
@@ -211,3 +143,125 @@ def test_logs_errors(orch, docker: FakeDocker) -> None:
         o.logs("feat/cart", "nope")
     with pytest.raises(WtError, match="not up"):
         o.logs("feat/cart", "api")
+
+
+def test_failed_up_shows_in_ls(orch, docker: FakeDocker) -> None:
+    docker.fail_up = True
+    o = orch()
+    with pytest.raises(WtError):
+        o.up("feat/cart")
+    assert [r.status for r in o.ls(probe=False)] == ["failed"]
+
+
+def test_up_without_routes_removes_old_route_file(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    route = isolated_home / "traefik" / "dynamic" / "shop--feat-cart.yml"
+    assert route.exists()
+    o.cfg.services["api"].subdomain = None
+    o.up("feat/cart")
+    assert not route.exists()
+    assert o.store.load().branches["feat/cart"].route_file is None
+
+
+def test_untrusted_ca_warns(orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    cert = (Path("c.pem"), Path("k.pem"))
+    monkeypatch.setattr(tls, "ensure_cert", lambda names: cert)
+    monkeypatch.setattr(tls, "ca_ready", lambda: False)
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/cart")
+    assert any("wt doctor --fix" in m for m in logs)
+
+
+def test_down_unknown_branch(orch, docker: FakeDocker) -> None:
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.down("feat/nope")
+    assert logs == ["branch feat/nope not found; nothing to remove"]
+    assert docker.downs == []
+
+
+def test_down_cleans_leftovers_when_state_was_lost(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/x")
+    route = router.route_file(o.names("feat/x"))
+    assert route.exists()
+    o.store.path.unlink()  # state lost, route file still on disk
+    names = o.names("feat/x")
+    for repo in o.cfg.repos:
+        shutil.rmtree(o.worktree_target(names, repo), ignore_errors=True)
+    shutil.rmtree(o.branch_dir(names), ignore_errors=True)
+    o.down("feat/x", force=True)
+    assert not route.exists()
+
+
+def test_down_refuses_slug_owned_by_another_branch(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/x")
+    with pytest.raises(WtError, match="same name"):
+        o.down("feat-x")
+    assert docker.downs == []
+    assert "feat/x" in o.store.load().branches
+
+
+def test_down_interrupted_after_compose_down_can_be_rerun(
+    orch, docker: FakeDocker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    real = git.remove_worktree
+    calls: list[int] = []
+
+    def flaky(repo: Path, path: Path, *, force: bool) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise WtError("interrupted")
+        real(repo, path, force=force)
+
+    monkeypatch.setattr(git, "remove_worktree", flaky)
+    with pytest.raises(WtError, match="interrupted"):
+        o.down("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "removing"
+    o.down("feat/cart")
+    assert o.store.load().branches == {}
+    assert not (isolated_home / "shop" / "worktrees" / "feat-cart").exists()
+
+
+def test_down_force_after_worktree_deleted_by_hand(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    worktree = isolated_home / "shop" / "worktrees" / "feat-cart" / "api"
+    shutil.rmtree(worktree)
+    o.down("feat/cart", force=True)
+    assert o.store.load().branches == {}
+    assert not worktree.exists()
+    assert docker.downs == ["wt-shop-feat-cart-api"]
+
+
+def test_concurrent_up_of_two_branches(orch, docker: FakeDocker) -> None:
+    o = orch()
+    errors: list[BaseException] = []
+
+    def run(branch: str) -> None:
+        try:
+            o.up(branch)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(b,)) for b in ("feat/a", "feat/b")]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert errors == []
+    branches = o.store.load().branches
+    assert {b: s.status for b, s in branches.items()} == {"feat/a": "up", "feat/b": "up"}
+    assert all(s.repos["api"].created for s in branches.values())
+    assert sorted(docker.ups) == ["wt-shop-feat-a-api", "wt-shop-feat-b-api"]
