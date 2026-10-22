@@ -420,6 +420,7 @@ def test_template_vars_per_kind(orch, fake_provider: FakeProvider, docker: FakeD
     o.up("feat/cart")
     assert set(fake_provider.kinds) == {"compose", "run"}
     assert "DB: compose://feat_cart@main" in docker.files[0][1].read_text()
+    o.down("feat/cart")  # stop the run service it started
 
 
 def test_base_branch_comes_from_config(

@@ -6,11 +6,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, health, providers, router, tls
+from wt import compose, health, host, providers, router, tls
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import BranchContext, Check, Resources
+from wt.state import ProcessState
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "wt-test",
@@ -30,6 +31,39 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key, value in GIT_ENV.items():
         monkeypatch.setenv(key, value)
     return home
+
+
+_LEAKED: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+def host_process_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """Stop every host process this test started through host.start, even when it failed.
+
+    Anything still alive after the test's own fixtures ran is killed and reported at the end
+    of the session (see pytest_terminal_summary), so a leaking test shows up by name.
+    """
+    started: list[ProcessState] = []
+    real_start, real_alive, real_stop = host.start, host.alive, host.stop
+
+    def tracking_start(*args, **kwargs) -> ProcessState:
+        ps = real_start(*args, **kwargs)
+        started.append(ps)
+        return ps
+
+    monkeypatch.setattr(host, "start", tracking_start)
+    yield
+    for ps in started:
+        if real_alive(ps):  # not host.alive: a test may have stubbed it
+            _LEAKED.append(f"{request.node.nodeid}: pgid {ps.pgid} ({ps.command})")
+            real_stop(ps, grace=0.2)
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    if _LEAKED:
+        terminalreporter.section("leaked host processes (killed)")
+        for line in _LEAKED:
+            terminalreporter.write_line(line)
 
 
 def git(repo: Path, *args: str) -> str:
