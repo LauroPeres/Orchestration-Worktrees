@@ -30,7 +30,7 @@ class RepoState(BaseModel):
 class BranchState(BaseModel):
     branch: str
     slug: str
-    status: Literal["creating", "up", "degraded", "removing"] = "creating"
+    status: Literal["creating", "up", "degraded", "removing", "failed"] = "creating"
     created_at: str = Field(default_factory=now)
     updated_at: str = Field(default_factory=now)
     repos: dict[str, RepoState] = Field(default_factory=dict)
