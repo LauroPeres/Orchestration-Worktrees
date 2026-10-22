@@ -1,3 +1,4 @@
+import socket
 from collections.abc import Callable
 
 import pytest
@@ -45,6 +46,19 @@ def test_compose_missing_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(proc, "run", _fake_docker(None))
     compose = next(c for c in doctor.check_docker() if c.name == "compose")
     assert compose.level == "fail"
+
+
+def test_resolver_warns_with_scoped_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_getaddrinfo(*a: object, **k: object) -> list[tuple[object, ...]]:
+        return [(0, 0, 0, "", ("192.168.1.9", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    check = doctor.check_resolution("test.localhost")
+    assert check.level == "warn"
+    assert check.hint == (
+        "browsers, curl and wt's containers are fine; only other local programs may fail "
+        "(fix with /etc/hosts, dnsmasq or systemd-resolved)"
+    )
 
 
 def test_port_taken_fails_with_env_hint(monkeypatch: pytest.MonkeyPatch) -> None:
