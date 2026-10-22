@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.2.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.2.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, and a Postgres provider that gives every branch its own cloned
 > databases. A complete two-branch example is in [examples/shop](examples/shop/README.md).
 > Kafka and Redis come in v0.3.
@@ -120,6 +120,8 @@ branch's worktree:
   stays one literal argument. Do not add quotes around template values in `run:`.
 - `port: auto` picks a stable free port per (project, branch, service); an explicit number is
   used as is and `up` fails if something else holds it.
+- Running `wt up` again keeps a live process as is. If its rendered command, port or `env`
+  changed in `worktree.yaml`, `up` stops it and starts the new one.
 - Output goes to `~/.wt/<project>/branches/<slug>/logs/<service>.log`; read it with
   `wt logs <branch> <service>`.
 - Traefik reaches the process through `host.docker.internal`. **Bind to `0.0.0.0`** (not only
@@ -171,12 +173,14 @@ gets the database `shop__feat_cart`.
   between branches) and attaches routed services to a shared `wt` Docker network.
 - **One shared Traefik** bound to `127.0.0.1`, with one route file per branch in
   `~/.wt/traefik/dynamic/`.
-- **One mkcert certificate per branch** for `<branch>.<domain>` and `*.<branch>.<domain>`.
+- **One mkcert certificate per branch** for `<branch>.<domain>` and `*.<branch>.<domain>`,
+  made again by `up` when `domain` changes.
 - **Worktrees** live in `~/.wt/<project>/worktrees/<branch>/<repo>`. A branch that is already
   checked out (for example `main` in your repo) is used where it is and never removed.
 - **`down` keeps your work**: it refuses when a worktree has uncommitted or untracked files
   (unless `--force`) and never deletes branches or commits. It does remove the branch's
-  containers and volumes.
+  containers and volumes. A folder at a worktree path that is not a git worktree is left in
+  place with a warning.
 
 ## Settings
 
