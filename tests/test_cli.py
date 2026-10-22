@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.conftest import FakeDocker
-from wt import __version__, compose
+from wt import __version__, cli, compose
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
@@ -107,3 +107,30 @@ def test_logs_of_branch_not_up_fails(orch, docker: FakeDocker, tmp_path: Path) -
     result = runner.invoke(app, [*_cfg(tmp_path), "logs", "feat/cart", "api"])
     assert isinstance(result.exception, WtError)
     assert "not up" in str(result.exception)
+
+
+def test_ls_never_breaks_a_url_at_80_columns(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    cfg = _cfg(tmp_path)
+    runner.invoke(app, [*cfg, "up", "feat/cart"])
+    monkeypatch.setattr(cli.console, "_width", 80)
+    listed = runner.invoke(app, [*cfg, "ls", "--no-probe"])
+    assert listed.exit_code == 0, listed.output
+    lines = [ln for ln in listed.output.splitlines() if "https://" in ln]
+    assert lines
+    # the URL is whole on its line: it ends in the host (or host:port) and no tail is orphaned
+    url = next(t for t in lines[0].split() if t.startswith("https://"))
+    assert url.rstrip("/").endswith(".localhost") or ".localhost:" in url
+    assert not any(ln.strip().startswith(("lhost", "ost")) for ln in listed.output.splitlines())
+
+
+def test_down_unknown_branch_prints_only_not_found(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    orch()
+    result = runner.invoke(app, [*_cfg(tmp_path), "down", "feat/nope"])
+    assert result.exit_code == 0, result.output
+    assert "not found" in result.output
+    assert "is down" not in result.output

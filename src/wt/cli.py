@@ -129,8 +129,8 @@ def down(
     ] = False,
 ) -> None:
     """Stop and remove everything wt created for BRANCH. Branch commits are kept."""
-    Orchestrator(_load(ctx), log=_log).down(branch, force=force)
-    console.print(f"[green]{branch} is down.[/]")
+    if Orchestrator(_load(ctx), log=_log).down(branch, force=force):
+        console.print(f"[green]{branch} is down.[/]")
 
 
 @app.command("ls")
@@ -146,7 +146,8 @@ def ls_(
         return
     table = Table(box=None, pad_edge=False)
     for col in ("BRANCH", "STATUS", "CONTAINERS", "SERVICE", "URL", "HEALTH"):
-        table.add_column(col, overflow="fold")
+        # only HEALTH wraps; a URL (or branch, service) is never broken mid-word
+        table.add_column(col, overflow="fold", no_wrap=col != "HEALTH")
     for row in sorted(rows, key=lambda r: r.branch):
         services = row.services or [ServiceReport("-", "skipped", "")]
         for i, svc in enumerate(services):

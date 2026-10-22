@@ -194,7 +194,7 @@ def test_down_unknown_branch(orch, docker: FakeDocker) -> None:
     o = orch()
     logs: list[str] = []
     o.log = logs.append
-    o.down("feat/nope")
+    assert o.down("feat/nope") is False
     assert logs == ["branch feat/nope not found; nothing to remove"]
     assert docker.downs == []
 
