@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -787,3 +788,37 @@ def test_ls_status_is_degraded_when_not_all_services_run(
     [row] = o.ls(probe=False)
     assert row.running == 0 and row.total == 1
     assert row.status == "degraded"
+
+
+def test_up_and_down_hold_the_provider_lock(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wt import orchestrator
+
+    held: list[str] = []
+    seen: dict[str, list[str]] = {}
+    real = orchestrator.file_lock  # type: ignore[attr-defined]
+
+    @contextmanager
+    def spy(name: str) -> Iterator[None]:
+        held.append(name)
+        try:
+            with real(name):
+                yield
+        finally:
+            held.remove(name)
+
+    monkeypatch.setattr(orchestrator, "file_lock", spy)
+    for method in ("ensure_server", "create", "destroy"):
+        original = getattr(fake_provider, method)
+
+        def wrapped(*a, _m=method, _o=original, **k):
+            seen[_m] = list(held)
+            return _o(*a, **k)
+
+        monkeypatch.setattr(fake_provider, method, wrapped)
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    o.down("feat/cart")
+    for method in ("ensure_server", "create", "destroy"):
+        assert "postgres" in seen[method], method

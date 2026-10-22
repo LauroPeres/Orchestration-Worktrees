@@ -1,8 +1,10 @@
 """Shared Postgres server and one set of cloned databases per branch (docs/SPEC.md §14)."""
 
+import contextlib
 import os
 import re
 import secrets
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -62,10 +64,20 @@ def password() -> str:
         if existing:
             path.chmod(0o600)
             return existing
-    value = secrets.token_urlsafe(24)
-    # mkstemp inside atomic_write creates the temp file with mode 0600
-    atomic_write(path, value + "\n")
-    return value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp creates the temp file with mode 0600; link() fails if another process won the race
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".password.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(secrets.token_urlsafe(24) + "\n")
+        if path.exists():  # empty file: replace it
+            os.replace(tmp, path)
+        else:
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    return path.read_text().strip()
 
 
 def ident(name: str) -> str:
