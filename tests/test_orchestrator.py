@@ -282,6 +282,20 @@ def test_down_cleans_leftovers_when_state_was_lost(orch, docker: FakeDocker) -> 
     assert not route.exists()
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_down_leaves_a_folder_that_is_not_a_worktree(orch, docker: FakeDocker, force: bool) -> None:
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    names = o.names("feat/x")
+    folder = o.worktree_target(names, "api")
+    folder.mkdir(parents=True)
+    (folder / "notes.txt").write_text("mine")  # not made by wt, not a git worktree
+    o.down("feat/x", force=force)  # nothing of wt to remove: no error
+    assert (folder / "notes.txt").read_text() == "mine"
+    assert any("not a worktree" in m for m in logs)
+
+
 def test_down_refuses_slug_owned_by_another_branch(orch, docker: FakeDocker) -> None:
     o = orch()
     o.up("feat/x")

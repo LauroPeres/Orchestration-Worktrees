@@ -355,7 +355,9 @@ to the port. No port: the process is alive.
 create, verify) → TLS → compose services → host processes → routes → health → URL table.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
-worktrees. Each step skips what state says was never created.
+worktrees. Each step skips what state says was never created. Without a state entry, a folder
+at the worktree path is removed only if git lists it as a worktree of that repo; any other folder
+is left in place with a warning, also with `--force` (D18).
 
 **ls.** A `kind` column (compose or run) on each service row, and the Postgres databases of each
 branch. Run services get health and URL like compose services. If the docker CLI fails, `compose.ps`

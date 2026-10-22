@@ -509,9 +509,14 @@ class Orchestrator:
                     if recorded.created:
                         removals.append((Path(recorded.source), Path(recorded.path)))
                 elif repo in self.cfg.repos and self.worktree_target(names, repo).exists():
-                    removals.append(
-                        (self.loaded.repo_path(repo), self.worktree_target(names, repo))
-                    )
+                    source, target = self.loaded.repo_path(repo), self.worktree_target(names, repo)
+                    if _is_worktree_of(source, target):
+                        removals.append((source, target))
+                    else:
+                        self.log(
+                            f"[yellow]warning:[/] {target} is not a worktree of repo {repo!r}; "
+                            "left in place, remove it by hand"
+                        )
 
             leftovers = [router.route_file(names), *tls.cert_paths(names)]
             if (
@@ -674,3 +679,12 @@ class Orchestrator:
             follow=follow,
             tail=tail,
         )
+
+
+def _is_worktree_of(repo: Path, path: Path) -> bool:
+    """True when git lists `path` as a worktree of `repo`."""
+    try:
+        trees = git.list_worktrees(repo)
+    except WtError:
+        return False
+    return any(tree.path.resolve() == path.resolve() for tree in trees)
