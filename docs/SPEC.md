@@ -243,8 +243,9 @@ before `create`, and the resource names after it. `destroy` drops by determinist
 `IF EXISTS`, so it is safe whatever got created.
 
 **State.** `state.json` stays `version: 1`. New fields are optional with defaults, so v0.1 files
-still load: `BranchState.providers: dict[str, list[str]]` (provider → resource names) and
-`BranchState.processes: dict[str, ProcessState]`.
+still load: `BranchState.providers: dict[str, list[str]]` (provider → resource names),
+`BranchState.processes: dict[str, ProcessState]`, `BranchState.ports: dict[str, int]` (service →
+reserved port) and `BranchState.provider_base` (see Destroy).
 
 **Render order.** Rendering stays first in `up`, before anything is created, so a template typo
 fails early. This works because provider template vars are deterministic (names, password file,
@@ -337,8 +338,8 @@ succeeds and, while the leader pid exists, it is still in that group and started
 **Process stop.** SIGTERM to the process group, wait up to 10 s, then SIGKILL. `up` on an
 already-running process is a no-op.
 
-**Routing to host processes.** Traefik is started with
-`--add-host host.docker.internal:host-gateway`, and the route of a `run:` service points at
+**Routing to host processes.** The Traefik container gets
+`extra_hosts: [host.docker.internal:host-gateway]` (the same as `--add-host`), and the route of a `run:` service points at
 `http://host.docker.internal:<port>`. Verified on WSL2 + Docker Desktop with the process bound to
 `0.0.0.0` or `127.0.0.1`; macOS Docker Desktop resolves the name natively. On Docker Engine (native
 Linux, CI) the name only exists through that `--add-host`, and `host-gateway` is the bridge
@@ -348,8 +349,8 @@ commands. `shortcut: bind address is not verified, only documented`.
 **Run health.** Routed: same Traefik probe as compose services. Unrouted with a port: TCP connect
 to the port. No port: the process is alive.
 
-**Up order.** render env → worktrees → providers (ensure, create, verify) → compose
-services → host processes → routes → TLS → health → URL table.
+**Up order.** resolve ports and render env → shared Traefik → worktrees → providers (ensure,
+create, verify) → TLS → compose services → host processes → routes → health → URL table.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
 worktrees. Each step skips what state says was never created.
@@ -357,8 +358,8 @@ worktrees. Each step skips what state says was never created.
 **ls.** A `kind` column (compose or run) on each service row, and the Postgres databases of each
 branch. Run services get health and URL like compose services. If the docker CLI fails, `compose.ps`
 raises `WtError("docker is not reachable ...")`, and `ls` shows `docker unavailable` instead of `0/0`.
-Layout, so URLs stay whole at 80 columns: columns `BRANCH STATUS UP KIND SERVICE URL HEALTH`
-(`UP` is `running/total`); databases are listed in a `databases:` section after the table.
+Layout, so URLs stay whole at 80 columns: columns `BRANCH STATUS UP SERVICE KIND URL HEALTH`
+(`UP` is `<running>/<total> running`, counting compose containers only); databases are listed in a `databases:` section after the table.
 
 **logs.** For a `run:` service, a missing log file raises `WtError("no log yet for <svc> on <branch>")`.
 
