@@ -3,10 +3,26 @@
 import os
 from pathlib import Path
 
+from wt.errors import WtError
+
 
 def instance() -> str:
     """Prefix of the shared Docker objects (network, Traefik). WT_INSTANCE isolates test runs."""
     return os.environ.get("WT_INSTANCE", "wt")
+
+
+def env_port(name: str, default: int) -> int:
+    """Read a TCP port from the environment; a bad value is a WtError naming the variable."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise WtError(f"{name} must be a port number between 1 and 65535, got {raw!r}")
+    return port
 
 
 def wt_home() -> Path:
