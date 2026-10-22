@@ -51,6 +51,7 @@ class BranchState(BaseModel):
     providers: dict[str, list[str]] = Field(default_factory=dict)  # provider -> resource names
     ports: dict[str, int] = Field(default_factory=dict)  # service -> reserved host port
     processes: dict[str, ProcessState] = Field(default_factory=dict)  # service -> host process
+    provider_base: dict[str, str] = Field(default_factory=dict)  # provider -> base branch at create
 
 
 STATE_VERSION = 1
