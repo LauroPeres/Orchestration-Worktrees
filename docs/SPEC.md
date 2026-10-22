@@ -192,7 +192,9 @@ Decisions taken while building v0.1. Change them here first if they need to chan
   flags, file provider on `~/.wt/traefik/dynamic/`. Route files are written atomically.
   Ports: `WT_HTTP_PORT` / `WT_HTTPS_PORT` (default 80/443). Image: `WT_TRAEFIK_IMAGE`.
 - **TLS.** One mkcert certificate per branch for `<slug>.<domain>` and `*.<slug>.<domain>` (a
-  wildcard on `<domain>` cannot cover `api.<slug>.<domain>`). Without mkcert, Traefik's default
+  wildcard on `<domain>` cannot cover `api.<slug>.<domain>`). A `<key>.hosts` file next to it
+  lists the names it was made for; `up` makes a new one when they differ (e.g. after a `domain`
+  change) or the file is missing (D17). Without mkcert, Traefik's default
   self-signed certificate is used and `up` warns.
 - **Health.** A routed service is healthy when `GET <health>` through Traefik returns 2xx, 3xx,
   401 or 403 (404 is not healthy: Traefik answers 404 when a route is missing). The probe
