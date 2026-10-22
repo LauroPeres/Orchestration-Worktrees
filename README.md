@@ -16,8 +16,10 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.1.** Git worktrees, Docker Compose services, Traefik routes and local TLS.
-> Host processes (`run:`) and the Postgres provider come in v0.2; Kafka and Redis in v0.3.
+> **Status: v0.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> routes and local TLS, and a Postgres provider that gives every branch its own cloned
+> databases. A complete two-branch example is in [examples/shop](examples/shop/README.md).
+> Kafka and Redis come in v0.3.
 
 ## Requirements
 
@@ -47,8 +49,8 @@ In your repo:
 wt init            # writes a starter worktree.yaml
 $EDITOR worktree.yaml
 wt up my-branch    # prints a SERVICE / URL / CHECK table
-wt ls              # branches, URLs, health (--no-probe skips HTTP checks, --paths shows folders)
-wt logs my-branch api   # follows one service's logs (--no-follow, --tail N)
+wt ls              # branches, URLs, health, databases (--no-probe skips HTTP checks, --paths shows folders)
+wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
 wt down my-branch       # --force also removes worktrees with uncommitted changes
 ```
 
@@ -82,9 +84,10 @@ services:
 
 | Field | Meaning |
 |---|---|
-| `compose` | Compose file relative to the repo root. One per repo in v0.1. |
+| `compose` | Compose file relative to the repo root. Set exactly one of `compose` or `run`. |
+| `run` | Command for a host process (see below). Templates allowed. |
 | `compose_service` | Service name in the compose file, if it differs from the key. |
-| `port` | Container port Traefik routes to. Required when `subdomain` is set. |
+| `port` | Container port Traefik routes to (compose), or the host port of a `run:` service, or `auto`. Required when `subdomain` is set. |
 | `subdomain` | `""` = branch root (`https://<branch>.<domain>`); unset = not routed. |
 | `health` | Path probed through Traefik after `up` (default `/`). |
 | `env` | Extra environment for the container. Values can use templates. |
@@ -92,6 +95,62 @@ services:
 Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`), `ident`
 (`feat_cart`), `domain`, `branch_domain`, `port`, `url`, `host`, and
 `services.<name>.url|host|port`.
+
+## Host processes (`run:`)
+
+A service with `run:` instead of `compose:` is a plain process on your machine, started in that
+branch's worktree:
+
+```yaml
+  web:
+    repo: web
+    run: npm run dev -- --host 0.0.0.0 --port {{ port }}
+    port: auto                  # a free port per branch, kept for that branch
+    subdomain: ""               # https://<branch>.shop.localhost
+```
+
+- The command runs with `sh -c`, with your environment plus the rendered `env`. `{{ port }}` and
+  `services.<name>.port` hold the resolved port.
+- `port: auto` picks a stable free port per (project, branch, service); an explicit number is
+  used as is and `up` fails if something else holds it.
+- Output goes to `~/.wt/<project>/branches/<slug>/logs/<service>.log`; read it with
+  `wt logs <branch> <service>`.
+- Traefik reaches the process through `host.docker.internal`. **Bind to `0.0.0.0`** (not only
+  `127.0.0.1`): on native Linux the name resolves to the Docker bridge gateway, so a process
+  listening only on loopback is unreachable. Docker Desktop (macOS, WSL2) also works with
+  `127.0.0.1`, but `0.0.0.0` is the portable choice.
+- `down` stops the whole process group (SIGTERM, then SIGKILL after 10 s).
+
+## Postgres per branch (`shared.postgres`)
+
+```yaml
+shared:
+  postgres:
+    databases: [shop]       # each one is cloned per branch
+    strategy: template      # template | dump-restore
+    verify: true            # compare tables and row counts after the clone
+    base_branch: main       # whose databases are the clone source (default main)
+```
+
+wt runs one shared `wt-postgres` container (`postgres:17-alpine`, superuser `wt`, password
+generated into `~/.wt/postgres/password`, published on `127.0.0.1:55432`). Branch `feat/cart`
+gets the database `shop__feat_cart`.
+
+- On `base_branch` the databases are created empty; your migrations and seed fill them. Any
+  other branch is cloned from the base databases the first time, and an existing clone is never
+  re-cloned. If the base database does not exist yet, the clone is created empty with a
+  warning: run `wt up <base_branch>` first.
+- `template` clones with `CREATE DATABASE ... TEMPLATE`: fast, but base connections are
+  dropped for about a second. `dump-restore` uses `pg_dump | pg_restore` and does not block the
+  base branch.
+- `verify` compares the table list and row counts of source and clone. With `template` a
+  mismatch fails `up`; with `dump-restore` count differences only warn.
+- Use it in templates: `{{ postgres.url('shop') }}` is a connection URL and
+  `{{ postgres.name('shop') }}` the database name. Compose services get the address on the
+  shared `wt` network; host processes get `127.0.0.1:55432`. Every compose service listed in
+  `services:` joins the `wt` network when Postgres is configured.
+- `down` drops that branch's databases and never the `base_branch` ones.
+- Kafka, Redis and Keycloak under `shared:` are validated but ignored until later versions.
 
 ## How isolation works
 
@@ -117,12 +176,19 @@ Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`),
 | `WT_HOME` | `~/.wt` | where wt keeps state, worktrees and Traefik files |
 | `WT_HTTP_PORT` / `WT_HTTPS_PORT` | `80` / `443` | host ports for Traefik |
 | `WT_TRAEFIK_IMAGE` | `traefik:v3.5` | Traefik image |
+| `WT_POSTGRES_IMAGE` | `postgres:17-alpine` | Postgres image |
+| `WT_POSTGRES_PORT` | `55432` | host port of the shared Postgres |
+| `WT_INSTANCE` | `wt` | prefix of the shared Docker objects (isolates test runs) |
 
 ## WSL2
 
 Tested on WSL2 with Docker Desktop. Inside WSL, `*.localhost` resolves for curl and browsers
 and HTTPS works with the mkcert CA. Docker Desktop's WSL integration must be turned on for
 your distro, otherwise `docker` is not found (see Troubleshooting).
+
+Host processes (`run:`) are reached through `host.docker.internal`, which Docker Desktop
+resolves for the Traefik container; the process may listen on `0.0.0.0` or `127.0.0.1`. On
+native Linux Docker Engine only `0.0.0.0` works.
 
 Browsers on Windows reach the stack through Docker Desktop's ports on `127.0.0.1`, but they do
 not trust the CA that mkcert creates inside Linux. To trust it:
