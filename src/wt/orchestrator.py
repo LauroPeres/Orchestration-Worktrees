@@ -2,6 +2,7 @@
 `down` can clean a half-created branch, and every step is verified before `up` reports success."""
 
 import hashlib
+import json
 import os
 import shutil
 import time
@@ -322,17 +323,27 @@ class Orchestrator:
         for name, command in commands.items():
             svc = self.cfg.services[name]
             recorded = self.store.load().branches[branch].processes.get(name)
-            if recorded is not None and host.alive(recorded):
+            env_hash = _env_hash(envs[name])
+            live = recorded is not None and host.alive(recorded)
+            if (
+                live
+                and recorded is not None
+                and _same_process(recorded, command, ports.get(name), env_hash)
+            ):
                 self.log(f"process [bold]{name}[/] already running (pid {recorded.pid})")
             else:
-                self.log(f"starting process [bold]{name}[/]")
+                if live and recorded is not None:
+                    self.log(f"restarting process [bold]{name}[/] (command, port or env changed)")
+                    host.stop(recorded)
+                else:
+                    self.log(f"starting process [bold]{name}[/]")
                 ps = host.start(
                     command,
                     worktrees[svc.repo],
                     {**os.environ, **envs[name]},
                     self.log_path(names, name),
                     ports.get(name),
-                )
+                ).model_copy(update={"env_hash": env_hash})
 
                 def record(bs: BranchState, n: str = name, ps: ProcessState = ps) -> None:
                     bs.processes[n] = ps
@@ -674,3 +685,13 @@ class Orchestrator:
             follow=follow,
             tail=tail,
         )
+
+
+def _env_hash(env: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()
+
+
+def _same_process(ps: ProcessState, command: str, port: int | None, env_hash: str) -> bool:
+    """A live process can be kept: same command, port and env as this `up` would start."""
+    same_env = ps.env_hash is None or ps.env_hash == env_hash
+    return ps.command == command and ps.port == port and same_env

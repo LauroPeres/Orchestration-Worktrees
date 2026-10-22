@@ -36,6 +36,7 @@ class ProcessState(BaseModel):
     command: str
     started_at: str = Field(default_factory=now)
     log: str
+    env_hash: str | None = None  # sha256 of the rendered env; None in older state files
 
 
 class BranchState(BaseModel):
