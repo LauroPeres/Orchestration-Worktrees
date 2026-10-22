@@ -185,4 +185,17 @@ services:
     health: /                    # path probed after `up`
     env:
       PUBLIC_URL: "{{{{ url }}}}"
+# --- examples: uncomment to try (host process and shared Postgres) ---
+#   web:
+#     repo: app
+#     run: npm run dev -- --host 0.0.0.0 --port {{{{ port }}}}  # 0.0.0.0 so Traefik reaches it
+#     port: auto                  # a free port per branch, kept for that branch
+#     env:
+#       DATABASE_URL: "{{{{ postgres.url('app') }}}}"
+# shared:
+#   postgres:
+#     databases: [app]
+#     strategy: template          # template | dump-restore
+#     verify: true                # compare row counts after clone
+#     base_branch: main
 """
