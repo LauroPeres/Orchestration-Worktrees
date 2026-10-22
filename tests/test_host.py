@@ -55,7 +55,7 @@ def test_start_alive_stop(tmp_path: Path, started: list[ProcessState]) -> None:
     assert ps.log == str(tmp_path / "logs" / "web.log")
     host.stop(ps)
     assert not host.alive(ps)
-    assert not host.tcp_ok(ps.port or 0)
+    assert wait_for(lambda: not host.tcp_ok(ps.port or 0))  # the kernel closes it a moment later
 
 
 def test_start_appends_output_to_log(tmp_path: Path, started: list[ProcessState]) -> None:
