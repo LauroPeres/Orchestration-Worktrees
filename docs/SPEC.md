@@ -373,3 +373,5 @@ free. `--fix` starts the server with `ensure_server()`, which also repairs `data
 **Example shop web.** The web page fetches items in the browser from `API_URL`. The API allows CORS
 from `WEB_ORIGIN`. The `feat/cart` change lives in `examples/shop/feat-cart/` as replacement files,
 which `bootstrap.sh` copies onto that branch and commits.
+
+**Base alias.** A non-base branch whose database names equal the base branch's (`Main`, `main_`, `release-1.0` vs `release/1.0`) is refused by `up`, and `down` never drops those databases.

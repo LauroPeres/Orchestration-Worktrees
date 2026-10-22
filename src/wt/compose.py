@@ -60,7 +60,8 @@ def build_override(all_services: list[str], patches: dict[str, ServicePatch]) ->
         spec: dict[str, Any] = {"ports": Reset([]), "container_name": Reset(None)}
         patch = patches.get(name)
         if patch and patch.env:
-            spec["environment"] = dict(patch.env)
+            # Compose interpolates `$` in values; `$$` makes it pass them literally.
+            spec["environment"] = {k: v.replace("$", "$$") for k, v in patch.env.items()}
         if patch and (patch.alias or patch.network):
             joined: dict[str, Any] = {"aliases": [patch.alias]} if patch.alias else {}
             spec["networks"] = {"default": {}, NETWORK: joined}
