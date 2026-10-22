@@ -38,16 +38,19 @@ def cfg(**shared: object) -> Config:
     )
 
 
-def test_registry_is_empty_by_default() -> None:
-    assert providers.REGISTRY == {}
-    assert providers.active(cfg(postgres={"databases": ["shop"]})) == []
+def test_registry_has_only_postgres_so_far() -> None:
+    assert set(providers.REGISTRY) == {"postgres"}
+    assert [p.name for p in providers.active(cfg(postgres={"databases": ["shop"]}), print)] == [
+        "postgres"
+    ]
+    assert providers.active(cfg(), print) == []
 
 
 def test_active_returns_only_registered_and_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda c: Dummy())
-    assert providers.active(cfg()) == []
-    assert providers.active(cfg(kafka={"groups": ["g"]})) == []
-    found = providers.active(cfg(postgres={"databases": ["shop"]}, kafka={"groups": ["g"]}))
+    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda c, log: Dummy())
+    assert providers.active(cfg(), print) == []
+    assert providers.active(cfg(kafka={"groups": ["g"]}), print) == []
+    found = providers.active(cfg(postgres={"databases": ["shop"]}, kafka={"groups": ["g"]}), print)
     assert [p.name for p in found] == ["postgres"]
 
 

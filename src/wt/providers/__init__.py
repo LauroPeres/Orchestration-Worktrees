@@ -4,10 +4,12 @@ from collections.abc import Callable
 
 from wt.config import Config
 from wt.providers.base import Provider
+from wt.providers.postgres import PostgresProvider
 
-REGISTRY: dict[str, Callable[[Config], Provider]] = {}
+Log = Callable[[str], None]
+REGISTRY: dict[str, Callable[[Config, Log], Provider]] = {"postgres": PostgresProvider}
 
 
-def active(cfg: Config) -> list[Provider]:
+def active(cfg: Config, log: Log) -> list[Provider]:
     """Registered providers that are configured under `shared:`."""
-    return [REGISTRY[name](cfg) for name in cfg.shared.configured() if name in REGISTRY]
+    return [REGISTRY[name](cfg, log) for name in cfg.shared.configured() if name in REGISTRY]

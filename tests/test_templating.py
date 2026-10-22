@@ -17,8 +17,8 @@ def test_unknown_name_is_an_error() -> None:
 
 
 def test_upcoming_provider_hint() -> None:
-    with pytest.raises(WtError, match=r"postgres provider arrives in v0\.2"):
-        render("{{ postgres.url('shop') }}", {}, "env.DATABASE_URL")
+    with pytest.raises(WtError, match=r"kafka provider arrives in v0\.3"):
+        render("{{ kafka.topic('orders') }}", {}, "env.TOPIC")
 
 
 def test_sandbox_blocks_internals() -> None:
@@ -30,7 +30,7 @@ def test_registered_provider_loses_the_upcoming_hint(monkeypatch: pytest.MonkeyP
     from tests.conftest import FakeProvider
     from wt import providers
 
-    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg: FakeProvider([]))
+    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg, log: FakeProvider([]))
     with pytest.raises(WtError) as exc:
         render("{{ postgres.url('shop') }}", {}, "env.A")
     assert "arrives in" not in str(exc.value)
