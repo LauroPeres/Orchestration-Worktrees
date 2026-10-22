@@ -150,11 +150,12 @@ def test_recycled_pid_in_another_group_is_not_ours(
 ) -> None:
     ps = start_server(tmp_path, started)
     assert host.alive(ps)
-    monkeypatch.setattr(os, "getpgid", lambda pid: ps.pgid + 1)
-    assert not host.alive(ps)
     signalled: list[int] = []
-    monkeypatch.setattr(os, "killpg", lambda pg, sig: signalled.append(sig))
-    host.stop(ps)
+    with monkeypatch.context() as m:  # undone before the `started` finalizer stops the server
+        m.setattr(os, "getpgid", lambda pid: ps.pgid + 1)
+        assert not host.alive(ps)
+        m.setattr(os, "killpg", lambda pg, sig: signalled.append(sig))
+        host.stop(ps)
     assert [s for s in signalled if s != 0] == []  # only the existence probe
 
 
@@ -162,11 +163,12 @@ def test_process_started_after_the_record_is_not_ours(
     tmp_path: Path, started: list[ProcessState], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ps = start_server(tmp_path, started)
-    monkeypatch.setattr(host, "start_time", lambda pid: time.time() + 3600)
-    assert not host.alive(ps)
     signalled: list[int] = []
-    monkeypatch.setattr(os, "killpg", lambda pg, sig: signalled.append(sig))
-    host.stop(ps)
+    with monkeypatch.context() as m:
+        m.setattr(host, "start_time", lambda pid: time.time() + 3600)
+        assert not host.alive(ps)
+        m.setattr(os, "killpg", lambda pg, sig: signalled.append(sig))
+        host.stop(ps)
     assert [s for s in signalled if s != 0] == []  # only the existence probe
 
 
