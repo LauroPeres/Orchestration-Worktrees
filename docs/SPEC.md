@@ -192,7 +192,9 @@ Decisions taken while building v0.1. Change them here first if they need to chan
   flags, file provider on `~/.wt/traefik/dynamic/`. Route files are written atomically.
   Ports: `WT_HTTP_PORT` / `WT_HTTPS_PORT` (default 80/443). Image: `WT_TRAEFIK_IMAGE`.
 - **TLS.** One mkcert certificate per branch for `<slug>.<domain>` and `*.<slug>.<domain>` (a
-  wildcard on `<domain>` cannot cover `api.<slug>.<domain>`). Without mkcert, Traefik's default
+  wildcard on `<domain>` cannot cover `api.<slug>.<domain>`). A `<key>.hosts` file next to it
+  lists the names it was made for; `up` makes a new one when they differ (e.g. after a `domain`
+  change) or the file is missing (D17). Without mkcert, Traefik's default
   self-signed certificate is used and `up` warns.
 - **Health.** A routed service is healthy when `GET <health>` through Traefik returns 2xx, 3xx,
   401 or 403 (404 is not healthy: Traefik answers 404 when a route is missing). The probe
@@ -332,13 +334,16 @@ it is kept for the branch. An explicit integer port is used as is and
 fails clearly if taken (unless it is our own live process). Ports are resolved before rendering.
 The context vars `port` and `services.<name>.port` show the resolved port.
 
-**Process state.** `ProcessState(pid, pgid, port, command, started_at, log)`. Alive = `os.killpg(pgid, 0)`
+**Process state.** `ProcessState(pid, pgid, port, command, started_at, log, env_hash)`. Alive = `os.killpg(pgid, 0)`
 succeeds and, while the leader pid exists, it is still in that group and started no later than
 `started_at` (Linux `/proc`, else `ps -o lstart=`); otherwise it is treated as dead and never signalled.
 `shortcut: a start time that cannot be read is trusted`
 
 **Process stop.** SIGTERM to the process group, wait up to 10 s, then SIGKILL. `up` on an
-already-running process is a no-op.
+already-running process is a no-op while its rendered command, port and the sha256 of its
+rendered `env` (`env_hash`) match what state recorded. If any of them changed, `up` stops the old
+process and starts the new one (D16). A state written before `env_hash` existed counts as unchanged
+env.
 
 **Routing to host processes.** The Traefik container gets
 `extra_hosts: [host.docker.internal:host-gateway]` (the same as `--add-host`), and the route of a `run:` service points at

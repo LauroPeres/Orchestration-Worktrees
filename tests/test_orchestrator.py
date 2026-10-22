@@ -644,6 +644,43 @@ def test_up_restarts_a_dead_process_on_the_same_port(
     assert host.alive(second)
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        run_service(env={"MODE": "two"}),  # env changed
+        {"web": {"repo": "api", "run": SERVER + " --x", "port": "auto", "env": {"MODE": "one"}}},
+    ],
+    ids=["env", "command"],
+)
+def test_up_restarts_a_live_process_whose_run_or_env_changed(
+    run_orch, monkeypatch: pytest.MonkeyPatch, changed: dict[str, object]
+) -> None:
+    private_auto_port(monkeypatch)
+    o = run_orch(run_service(env={"MODE": "one"}))
+    o.up("main")
+    first = o.store.load().branches["main"].processes["web"]
+    o2 = run_orch(changed)
+    o2.up("main")
+    second = o2.store.load().branches["main"].processes["web"]
+    assert second.pid != first.pid
+    assert not host.alive(first)
+    assert host.alive(second)
+    assert second.port == first.port
+
+
+def test_process_from_older_state_without_env_hash_is_kept(
+    run_orch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_auto_port(monkeypatch)
+    o = run_orch()
+    o.up("main")
+    with o.store.edit() as state:
+        state.branches["main"].processes["web"].env_hash = None
+    first = o.store.load().branches["main"].processes["web"]
+    o.up("main")
+    assert o.store.load().branches["main"].processes["web"].pid == first.pid
+
+
 def test_auto_port_skips_ports_of_other_branches(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
     with socket.socket() as s:
         s.bind(("0.0.0.0", 0))
