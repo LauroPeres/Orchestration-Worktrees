@@ -1,6 +1,6 @@
 # Orchestration-Worktrees — Specification
 
-Status: draft v0.1 · 2026-10-18 · Author: Lauro Peres
+Status: draft v0.2 · 2026-10-22 · Author: Lauro Peres
 
 ## 1. Problem
 
@@ -156,7 +156,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 
 | Version | Scope |
 |---|---|
-| v0.1 | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
+| v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
 | v0.2 | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
 | v0.4 | Keycloak provider (SSO across branch subdomains) |
@@ -198,8 +198,8 @@ Decisions taken while building v0.1. Change them here first if they need to chan
   401 or 403 (404 is not healthy: Traefik answers 404 when a route is missing). The probe
   connects to `127.0.0.1` with the real host as SNI, so it does not depend on the OS resolver.
   Unrouted services are healthy when their containers run and are not `unhealthy`.
-- **Not in v0.1.** `run:` services are accepted by the config but skipped (v0.2). `shared:` is
-  validated but ignored, and provider template names (`postgres`, ...) fail with a clear error.
+- **Not in v0.1.** `run:` services are accepted by the config but skipped, and `shared:` is
+  validated but ignored. Both are built in v0.2, see §14.
 - **Concurrency.** `flock` locks per branch, per project state file, and for Traefik, so several
   `wt up` can run at once for different branches.
 - **Tests.** `WT_INSTANCE` renames the shared network and Traefik container so integration tests
@@ -217,3 +217,143 @@ Decisions taken while building v0.1. Change them here first if they need to chan
 - **Unknown branch.** `down` of a branch wt does not know says so and exits 0.
 - **Repo lock.** `git worktree add` runs under a per-repo lock, so concurrent `up` of
   different branches in the same repo do not race on git's own files.
+
+## 14. v0.2 implementation notes
+
+Decisions taken while planning v0.2. Change them here first if they need to change.
+
+**Providers.** Package `src/wt/providers/`: `base.py` (the `Provider` Protocol, `BranchContext`,
+`Resources`, `Check`), `postgres.py`, and `__init__.py` with a plain dict registry of built-in
+providers. No entry points yet (§10 "later"). `BranchContext` carries the names, the branch, the
+base branch and the state handle. `Provider.template_vars` takes a second argument,
+`kind: "compose" | "run"`, so a provider can give a different address per service kind. Every
+other method keeps the §6 signature.
+
+**Active providers.** Only `postgres` runs. `kafka`, `redis` and `keycloak` under `shared:` stay
+as in v0.1: validated, ignored with a note in `up`, and their template names (`{{ kafka... }}`)
+fail with the "arrives in v0.3/v0.4" message.
+
+**Provider hooks.** Per provider, `up` runs `ensure_server()` → `create(ctx)` → `verify(ctx)`
+before any service starts. `down` runs `destroy(ctx)` for each provider recorded for the branch,
+after compose and routes are removed. A failed `verify` fails `up` with its detail and marks the
+branch `failed`. Warnings from `verify` are logged.
+
+**Half-created branches.** The orchestrator writes the provider name into `providers` in state
+before `create`, and the resource names after it. `destroy` drops by deterministic names with
+`IF EXISTS`, so it is safe whatever got created.
+
+**State.** `state.json` stays `version: 1`. New fields are optional with defaults, so v0.1 files
+still load: `BranchState.providers: dict[str, list[str]]` (provider → resource names) and
+`BranchState.processes: dict[str, ProcessState]`.
+
+**Render order.** Rendering stays first in `up`, before anything is created, so a template typo
+fails early. This works because provider template vars are deterministic (names, password file,
+ports).
+
+**Network.** When any provider is configured, every compose service listed in `services:` joins
+the shared `wt` network (routed or not), so it can reach `wt-postgres`.
+
+**Postgres server.** One shared container `wt-postgres`, renamed by `WT_INSTANCE` like Traefik.
+Image `WT_POSTGRES_IMAGE` (default `postgres:17-alpine`). Named volume `wt-postgres-data`, with the
+same instance suffix. It runs on the shared `wt` network, published on
+`127.0.0.1:${WT_POSTGRES_PORT:-55432}` (not 5432, to avoid clashing with a local Postgres). Superuser
+`wt`.
+
+**Postgres password.** Generated once with `secrets.token_urlsafe` and stored at
+`$WT_HOME/postgres/password` with mode `0600`. The file is created the first time something needs
+it (render or `ensure_server`). It is never printed by `ls`; `doctor` only says whether it exists.
+Compose override files in `~/.wt/<project>/branches/<slug>/` can hold the rendered env, which may
+contain the password, so they are written with mode `0600`.
+
+**Postgres server start.** `ensure_server()` starts the container if needed, the same way Traefik is
+started. It waits up to 60 s for `pg_isready` inside the container. Then it re-enables
+`datallowconn` on any wt-managed database (`<db>__*`) that has it off. `doctor --fix` runs the same
+repair.
+
+**Postgres access.** wt talks to Postgres with `docker exec <container> psql -v ON_ERROR_STOP=1 -U wt ...`
+through `wt.proc`. No new Python dependency. Identifiers are built only by `naming` (`[a-z0-9_]`),
+checked with the regex `^[a-z0-9_]{1,63}$`, then double-quoted in SQL. Raw user input is never
+interpolated.
+
+**Postgres config.** `shared.postgres.base_branch` (default `"main"`) is the branch whose databases
+are the clone source. Keys `databases`, `strategy` and `verify` work as in §4.
+
+**Database names.** `<db>__<ident>` passed through `naming.fit(..., 63)`, e.g. `shop__feat_cart`.
+The base branch's databases are created empty if missing; the app's own migrations and seed fill
+them.
+
+**Create.** For a branch other than `base_branch`: keep `<db>__<ident>` if it exists (never
+re-clone). Otherwise clone it from the base database. If the base database does not exist yet,
+create it empty and warn `run wt up <base_branch> first to clone real data`.
+
+**Template strategy.** Steps:
+1. `ALTER DATABASE src WITH ALLOW_CONNECTIONS false`
+2. terminate other backends on `src` (`pg_terminate_backend`)
+3. `CREATE DATABASE dst TEMPLATE src`, retried 3 times, 1 s apart, on "being accessed by other users"
+4. in `finally`: `ALTER DATABASE src WITH ALLOW_CONNECTIONS true`
+
+The base branch's app sees its connections dropped for about a second and must reconnect.
+
+**Dump-restore strategy.** `pg_dump -Fc src | pg_restore -d dst` inside the container. The base
+branch is not blocked.
+
+**Verify.** Compares the list of user tables and the exact `count(*)` per table between source and
+clone, only for databases cloned in this run. `template`: a mismatch drops the clone and fails
+`up`. `dump-restore`: the table list must match; count differences only warn (the source is live).
+`shortcut: exact counts are slow on big tables, move to sampled checksums when someone hits it`
+
+**Destroy.** `down <branch>` runs `DROP DATABASE IF EXISTS ... WITH (FORCE)` for that branch's
+databases. On `base_branch` it never drops the base databases, and it says so.
+
+**Postgres template vars.** `postgres.url('shop')` and `postgres.name('shop')`. Compose services get
+`postgresql://wt:<pw>@<container>:5432/<db>`. Host processes get
+`postgresql://wt:<pw>@127.0.0.1:<WT_POSTGRES_PORT>/<db>`. An unknown database raises `WtError`.
+
+**Run services.** The command is rendered with templates and run with `sh -c` in the service's
+worktree directory. Environment = current env + rendered `env`. Started with
+`start_new_session=True`. Output is appended to `~/.wt/<project>/branches/<slug>/logs/<service>.log`.
+`wt logs` runs `tail -n <tail> [-f] <log>`, so wt has no follow code of its own.
+
+**Ports.** `port: auto` → `naming.auto_port(project, branch, service)`. If that port is taken, probe
+upward (max 100 tries), skipping ports that state records for any other (branch, service). The
+chosen port is stored in state and kept for the branch. An explicit integer port is used as is and
+fails clearly if taken (unless it is our own live process). Ports are resolved before rendering.
+The context vars `port` and `services.<name>.port` show the resolved port.
+
+**Process state.** `ProcessState(pid, pgid, port, command, started_at, log)`. Alive = `os.killpg(pgid, 0)`
+succeeds. `shortcut: pid reuse is not detected, compare start time when it matters`
+
+**Process stop.** SIGTERM to the process group, wait up to 10 s, then SIGKILL. `up` on an
+already-running process is a no-op.
+
+**Routing to host processes.** Traefik is started with
+`--add-host host.docker.internal:host-gateway`, and the route of a `run:` service points at
+`http://host.docker.internal:<port>`. Verified on WSL2 + Docker Desktop with the process bound to
+`0.0.0.0` or `127.0.0.1`; macOS Docker Desktop resolves the name natively. On Docker Engine (native
+Linux, CI) the name only exists through that `--add-host`, and `host-gateway` is the bridge
+gateway, so the process must listen on `0.0.0.0`. Requirement for users: bind `0.0.0.0` in `run:`
+commands. `shortcut: bind address is not verified, only documented`.
+
+**Run health.** Routed: same Traefik probe as compose services. Unrouted with a port: TCP connect
+to the port. No port: the process is alive.
+
+**Up order.** render env → worktrees → providers (ensure, create, verify) → compose
+services → host processes → routes → TLS → health → URL table.
+
+**Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
+worktrees. Each step skips what state says was never created.
+
+**ls.** A `kind` column (compose or run) on each service row, and the Postgres databases of each
+branch. Run services get health and URL like compose services. If the docker CLI fails, `compose.ps`
+raises `WtError("docker is not reachable ...")`, and `ls` shows `docker unavailable` instead of `0/0`.
+
+**logs.** For a `run:` service, a missing log file raises `WtError("no log yet for <svc> on <branch>")`.
+
+**doctor.** Postgres checks only when `shared.postgres` is configured: the container runs; the
+password file exists with mode `0600` (its content is never printed); no wt database has
+`datallowconn = false`. For `run:` services in state with a dead process, the recorded port is
+free. `--fix` starts the server with `ensure_server()`, which also repairs `datallowconn`.
+
+**Example shop web.** The web page fetches items in the browser from `API_URL`. The API allows CORS
+from `WEB_ORIGIN`. The `feat/cart` change lives in `examples/shop/feat-cart/` as replacement files,
+which `bootstrap.sh` copies onto that branch and commits.
