@@ -590,7 +590,23 @@ def test_port_is_rendered_into_env_and_command(run_orch) -> None:
     assert f"serve.py {port}" in cmd
 
 
-def test_up_twice_does_not_restart_a_live_process(run_orch) -> None:
+def private_auto_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Derive the auto port from a currently free one instead of the fixed hash of the names.
+
+    The hash is the same in every test run on the machine, so concurrent runs (CI shards, other
+    worktrees) fight over one port: the server then fails to bind and `up` restarts it on
+    another port, which these tests read as a bug.
+    """
+    with socket.socket() as s:
+        s.bind(("0.0.0.0", 0))
+        base = int(s.getsockname()[1])
+    monkeypatch.setattr(naming, "auto_port", lambda *a: base)
+
+
+def test_up_twice_does_not_restart_a_live_process(
+    run_orch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_auto_port(monkeypatch)
     o = run_orch()
     o.up("main")
     first = o.store.load().branches["main"].processes["web"]
@@ -599,7 +615,10 @@ def test_up_twice_does_not_restart_a_live_process(run_orch) -> None:
     assert host.alive(first)
 
 
-def test_up_restarts_a_dead_process_on_the_same_port(run_orch) -> None:
+def test_up_restarts_a_dead_process_on_the_same_port(
+    run_orch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_auto_port(monkeypatch)
     o = run_orch()
     o.up("main")
     first = o.store.load().branches["main"].processes["web"]

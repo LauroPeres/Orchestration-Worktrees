@@ -274,7 +274,7 @@ class Orchestrator:
             for name, svc in self.cfg.services.items()
         }
         commands = {
-            name: render(svc.run, contexts[name], f"services.{name}.run")
+            name: render(svc.run, contexts[name], f"services.{name}.run", quote=True)
             for name, svc in self.cfg.services.items()
             if svc.run is not None
         }

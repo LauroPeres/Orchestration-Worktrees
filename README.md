@@ -111,6 +111,8 @@ branch's worktree:
 
 - The command runs with `sh -c`, with your environment plus the rendered `env`. `{{ port }}` and
   `services.<name>.port` hold the resolved port.
+- Every `{{ ... }}` value in `run:` is shell-quoted for you, so a branch name like `x;rm -rf ~`
+  stays one literal argument. Do not add quotes around template values in `run:`.
 - `port: auto` picks a stable free port per (project, branch, service); an explicit number is
   used as is and `up` fails if something else holds it.
 - Output goes to `~/.wt/<project>/branches/<slug>/logs/<service>.log`; read it with
