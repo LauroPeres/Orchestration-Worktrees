@@ -204,3 +204,9 @@ Decisions taken while building v0.1. Change them here first if they need to chan
   `wt up` can run at once for different branches.
 - **Tests.** `WT_INSTANCE` renames the shared network and Traefik container so integration tests
   never touch a real setup.
+- **Slugs.** Different branches can map to the same slug (`feat/x`, `feat-x`). `up` and `down`
+  refuse a slug that another branch owns in state, and name that branch. URLs stay readable; no
+  hash is added.
+- **Platforms.** Locks use `fcntl.flock`, so native Windows is not supported; use WSL2.
+- **State.** `state.json` has a `version` (1). A wt that finds a newer version refuses to touch
+  the file. A corrupt file is reported with its path.
