@@ -237,14 +237,16 @@ class Orchestrator:
         ctx = self.provider_context(names)
         for provider in self.providers():
             self.log(f"provider [bold]{provider.name}[/]")
-            provider.ensure_server()
-            # Name first, resources after: `down` then cleans a create that died halfway.
+            # One server, shared by all branches: serialize ensure/create (incl. the clone).
+            with file_lock(provider.name):
+                provider.ensure_server()
+                # Name first, resources after: `down` then cleans a create that died halfway.
 
-            def started(bs: BranchState, n: str = provider.name) -> None:
-                bs.providers.setdefault(n, [])
+                def started(bs: BranchState, n: str = provider.name) -> None:
+                    bs.providers.setdefault(n, [])
 
-            self._record(branch, started)
-            created = provider.create(ctx)
+                self._record(branch, started)
+                created = provider.create(ctx)
 
             def finished(
                 bs: BranchState, n: str = provider.name, r: list[str] = created.names
@@ -584,15 +586,16 @@ class Orchestrator:
                 )
                 continue
             provider = factory(self.cfg, self.log)
-            try:
-                provider.ensure_server()
-            except WtError as exc:
-                raise WtError(
-                    f"cannot start the {name} server to remove this branch's resources: {exc}. "
-                    f"Try `wt doctor --fix`, then run `wt down {branch}` again"
-                ) from exc
-            self.log(f"destroying {name} resources")
-            provider.destroy(ctx)
+            with file_lock(name):
+                try:
+                    provider.ensure_server()
+                except WtError as exc:
+                    raise WtError(
+                        f"cannot start the {name} server to remove this branch's resources: "
+                        f"{exc}. Try `wt doctor --fix`, then run `wt down {branch}` again"
+                    ) from exc
+                self.log(f"destroying {name} resources")
+                provider.destroy(ctx)
 
             def cleared(b: BranchState, n: str = name) -> None:
                 b.providers.pop(n, None)

@@ -1,5 +1,9 @@
+import multiprocessing
+import os
 import stat
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -537,3 +541,22 @@ def test_invalid_postgres_port(monkeypatch: pytest.MonkeyPatch, bad: str) -> Non
     monkeypatch.setenv("WT_POSTGRES_PORT", bad)
     with pytest.raises(WtError, match="WT_POSTGRES_PORT"):
         postgres.host_port()
+
+
+def _first_password(home: str, out: Any) -> None:
+    os.environ["WT_HOME"] = home
+    out.put(postgres.password())
+
+
+def test_concurrent_first_password_is_one_value(tmp_path: Path) -> None:
+    ctx = multiprocessing.get_context("fork")
+    out = ctx.Queue()
+    procs = [
+        ctx.Process(target=_first_password, args=(str(tmp_path / "h"), out)) for _ in range(12)
+    ]
+    for p in procs:
+        p.start()
+    values = {out.get(timeout=30) for _ in procs}
+    for p in procs:
+        p.join(timeout=30)
+    assert len(values) == 1

@@ -17,7 +17,7 @@ from wt.errors import WtError
 from wt.naming import Names, fit, temp_name
 from wt.paths import env_port, instance, wt_home
 from wt.providers.base import BranchContext, Check, Kind, Resources
-from wt.state import atomic_write
+from wt.state import atomic_write, file_lock
 
 DEFAULT_IMAGE = "postgres:17-alpine"
 DEFAULT_PORT = 55432
@@ -62,10 +62,15 @@ def password() -> str:
         if existing:
             path.chmod(0o600)
             return existing
-    value = secrets.token_urlsafe(24)
-    # mkstemp inside atomic_write creates the temp file with mode 0600
-    atomic_write(path, value + "\n")
-    return value
+    # Own lock (not "postgres"): ensure_server calls this while holding that one.
+    with file_lock("postgres-password"):
+        existing = path.read_text().strip() if path.exists() else ""
+        if not existing:
+            existing = secrets.token_urlsafe(24)
+            # mkstemp inside atomic_write creates the temp file with mode 0600
+            atomic_write(path, existing + "\n")
+        path.chmod(0o600)
+        return existing
 
 
 def ident(name: str) -> str:
