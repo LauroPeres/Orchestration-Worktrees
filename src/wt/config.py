@@ -1,0 +1,187 @@
+"""Load and validate worktree.yaml."""
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, Self
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from wt.errors import WtError
+
+CONFIG_NAME = "worktree.yaml"
+
+NAME = r"^[a-z0-9][a-z0-9_-]{0,30}$"
+PROJECT = r"^[a-z][a-z0-9-]{0,30}$"
+LABEL = r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$"  # one DNS label, or "" for the root
+DOMAIN = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Service(Strict):
+    repo: str
+    compose: str | None = Field(None, description="compose file, relative to the repo root")
+    compose_service: str | None = Field(None, description="name in the compose file, if different")
+    run: str | None = Field(None, description="host process command (v0.2)")
+    port: int | Literal["auto"] | None = None
+    subdomain: str | None = Field(
+        None, pattern=LABEL, description='"" = branch root; unset = no route'
+    )
+    health: str = "/"
+    env: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if (self.compose is None) == (self.run is None):
+            raise ValueError("set exactly one of 'compose' or 'run'")
+        if self.compose is not None and self.port == "auto":
+            raise ValueError(
+                "'port: auto' is only for 'run' services; compose services need the "
+                "container's internal port"
+            )
+        if self.subdomain is not None and self.port is None:
+            raise ValueError("a routed service (with 'subdomain') needs a 'port'")
+        if isinstance(self.port, int) and not 1 <= self.port <= 65535:
+            raise ValueError("'port' must be between 1 and 65535")
+        if not self.health.startswith("/"):
+            raise ValueError("'health' must be a path starting with '/'")
+        return self
+
+
+class Postgres(Strict):
+    databases: list[str]
+    strategy: Literal["template", "dump-restore"] = "template"
+    verify: bool = True
+
+
+class Kafka(Strict):
+    groups: list[str]
+    topic_prefix: bool = False
+
+
+class Redis(Strict):
+    prefix: bool = True
+
+
+class Keycloak(Strict):
+    realm: str
+    client: str
+
+
+class Shared(Strict):
+    postgres: Postgres | None = None
+    kafka: Kafka | None = None
+    redis: Redis | None = None
+    keycloak: Keycloak | None = None
+
+    def configured(self) -> list[str]:
+        return [name for name in type(self).model_fields if getattr(self, name) is not None]
+
+
+class Config(Strict):
+    project: str = Field(pattern=PROJECT)
+    domain: str = Field(pattern=DOMAIN)
+    repos: dict[str, str] = Field(min_length=1)
+    services: dict[str, Service] = Field(min_length=1)
+    shared: Shared = Field(default_factory=Shared)
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        for name in [*self.repos, *self.services]:
+            if not re.match(NAME, name):
+                raise ValueError(f"name {name!r} must match {NAME}")
+        for name, svc in self.services.items():
+            if svc.repo not in self.repos:
+                raise ValueError(f"service {name!r} uses unknown repo {svc.repo!r}")
+        compose_files: dict[str, str] = {}
+        for svc in self.services.values():
+            if svc.compose is None:
+                continue
+            seen = compose_files.setdefault(svc.repo, svc.compose)
+            if seen != svc.compose:
+                raise ValueError(
+                    f"repo {svc.repo!r} uses two compose files ({seen}, "
+                    f"{svc.compose}); v0.1 supports one compose file per repo"
+                )
+        hosts: dict[str, str] = {}
+        for name, svc in self.services.items():
+            if svc.subdomain is None:
+                continue
+            if svc.subdomain in hosts:
+                raise ValueError(
+                    f"services {hosts[svc.subdomain]!r} and {name!r} use the same "
+                    f"subdomain {svc.subdomain!r}"
+                )
+            hosts[svc.subdomain] = name
+        return self
+
+
+@dataclass(frozen=True)
+class LoadedConfig:
+    config: Config
+    path: Path
+
+    @property
+    def root(self) -> Path:
+        return self.path.parent
+
+    def repo_path(self, repo: str) -> Path:
+        return (self.root / self.config.repos[repo]).resolve()
+
+
+def find_config(start: Path) -> Path | None:
+    for folder in [start, *start.parents]:
+        candidate = folder / CONFIG_NAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _format_errors(exc: ValidationError) -> str:
+    lines = []
+    for err in exc.errors():
+        where = ".".join(str(p) for p in err["loc"]) or "(root)"
+        msg = err["msg"].removeprefix("Value error, ")
+        lines.append(f"  {where}: {msg}")
+    return "\n".join(lines)
+
+
+def load_config(path: Path) -> LoadedConfig:
+    path = path.resolve()
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except FileNotFoundError as exc:
+        raise WtError(f"config not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise WtError(f"{path} is not valid YAML:\n{exc}") from exc
+    if not isinstance(raw, dict):
+        raise WtError(f"{path} must contain a YAML mapping")
+    try:
+        config = Config.model_validate(raw)
+    except ValidationError as exc:
+        raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
+    return LoadedConfig(config=config, path=path)
+
+
+STARTER = """\
+# worktree.yaml - describe your stack once; `wt up <branch>` runs a copy of it per branch.
+project: {project}
+domain: {project}.localhost      # *.localhost resolves to 127.0.0.1 in browsers
+
+repos:                           # one or many repos; each gets a git worktree per branch
+  app: .
+
+services:
+  app:
+    repo: app
+    compose: docker-compose.yml  # compose file inside the repo
+    port: 8000                   # port the container listens on (routed by Traefik)
+    subdomain: ""                # "" = https://<branch>.{project}.localhost
+    health: /                    # path probed after `up`
+    env:
+      PUBLIC_URL: "{{{{ url }}}}"
+"""

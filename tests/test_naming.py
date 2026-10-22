@@ -1,0 +1,81 @@
+import pytest
+
+from wt.errors import WtError
+from wt.naming import AUTO_PORT_RANGE, MAX_SLUG, Names, auto_port, fit, slugify
+
+
+@pytest.mark.parametrize(
+    ("branch", "slug"),
+    [
+        ("main", "main"),
+        ("feat/cart", "feat-cart"),
+        ("Feat/Cart_V2", "feat-cart-v2"),
+        ("fix//double--dash", "fix-double-dash"),
+        ("-weird-", "weird"),
+        ("release/1.2.3", "release-1-2-3"),
+    ],
+)
+def test_slugify(branch: str, slug: str) -> None:
+    assert slugify(branch) == slug
+
+
+def test_slugify_rejects_empty() -> None:
+    with pytest.raises(WtError):
+        slugify("///")
+
+
+def test_long_slugs_are_cut_and_stay_unique() -> None:
+    a = slugify("feature/" + "a" * 80)
+    b = slugify("feature/" + "a" * 79 + "b")
+    assert len(a) <= MAX_SLUG and len(b) <= MAX_SLUG
+    assert a != b
+    assert slugify("feature/" + "a" * 80) == a  # deterministic
+
+
+def test_fit_keeps_short_names() -> None:
+    assert fit("short") == "short"
+    assert len(fit("x" * 100)) == 63
+
+
+def test_names() -> None:
+    n = Names("shop", "feat/cart", "shop.localhost")
+    assert n.slug == "feat-cart"
+    assert n.ident == "feat_cart"
+    assert n.branch_domain == "feat-cart.shop.localhost"
+    assert n.host("") == "feat-cart.shop.localhost"
+    assert n.host("api") == "api.feat-cart.shop.localhost"
+    assert n.compose_project("api") == "wt-shop-feat-cart-api"
+    assert n.network_alias("api") == "wt-shop-feat-cart-api"
+    assert n.router("api") == "shop--feat-cart--api"
+
+
+def test_auto_port_is_stable_and_in_range() -> None:
+    port = auto_port("shop", "feat/cart", "web")
+    assert port == auto_port("shop", "feat/cart", "web")
+    assert AUTO_PORT_RANGE[0] <= port < AUTO_PORT_RANGE[1]
+    assert port != auto_port("shop", "feat/other", "web")
+
+
+@pytest.mark.parametrize("branch", ["feat/x", "feat-x", "Feat_X"])
+def test_branches_that_differ_only_in_separators_share_a_slug(branch: str) -> None:
+    assert slugify(branch) == "feat-x"
+
+
+def test_fit_long_name_has_hash_suffix() -> None:
+    result = fit("a" * 100)
+    assert len(result) == 63
+    prefix, sep, suffix = result.rpartition("-")
+    assert sep == "-"
+    assert len(suffix) == 6
+    assert all(c in "0123456789abcdef" for c in suffix)
+    assert prefix == "a" * 56
+    assert fit("a" * 100) == result  # stable across calls
+
+
+def test_fit_differs_for_long_names_that_differ_at_the_end() -> None:
+    assert fit("a" * 99 + "b") != fit("a" * 100)
+
+
+def test_slugify_cuts_a_60_char_branch_to_max_slug() -> None:
+    slug = slugify("feat/" + "b" * 55)
+    assert len(slug) <= MAX_SLUG
