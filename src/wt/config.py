@@ -56,6 +56,7 @@ class Postgres(Strict):
     databases: list[str]
     strategy: Literal["template", "dump-restore"] = "template"
     verify: bool = True
+    base_branch: str = "main"
 
 
 class Kafka(Strict):

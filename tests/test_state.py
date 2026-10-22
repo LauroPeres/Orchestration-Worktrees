@@ -120,3 +120,22 @@ def test_concurrent_edits_are_not_lost(isolated_home: Path) -> None:
     assert not hung, "edit() deadlocked"
     assert all(p.exitcode == 0 for p in procs)
     assert len(StateStore("shop").load().branches["x"].cert_files) == 100
+
+
+def test_v01_state_file_still_loads(isolated_home: Path) -> None:
+    store = StateStore("shop")
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text(
+        '{"version": 1, "project": "shop", "branches": {"feat/x": '
+        '{"branch": "feat/x", "slug": "feat-x", "status": "up", "repos": {}, '
+        '"compose_projects": {}, "route_file": null, "cert_files": []}}}'
+    )
+    bs = store.load().branches["feat/x"]
+    assert bs.providers == {}
+
+
+def test_providers_roundtrip(isolated_home: Path) -> None:
+    store = StateStore("shop")
+    with store.edit() as state:
+        state.branches["b"] = BranchState(branch="b", slug="b", providers={"postgres": ["shop__b"]})
+    assert store.load().branches["b"].providers == {"postgres": ["shop__b"]}

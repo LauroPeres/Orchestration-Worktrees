@@ -97,3 +97,19 @@ def test_find_config_walks_up(tmp_path: Path) -> None:
     deep = tmp_path / "a" / "b"
     deep.mkdir(parents=True)
     assert find_config(deep) == path
+
+
+def test_postgres_base_branch_default_and_override(tmp_path: Path) -> None:
+    pg = load_config(write(tmp_path, BASE)).config.shared.postgres
+    assert pg is not None and pg.base_branch == "main"
+    data = yaml.safe_load(yaml.safe_dump(BASE))
+    data["shared"]["postgres"]["base_branch"] = "develop"
+    pg = load_config(write(tmp_path, data)).config.shared.postgres
+    assert pg is not None and pg.base_branch == "develop"
+
+
+def test_postgres_base_branch_must_be_a_string(tmp_path: Path) -> None:
+    data = yaml.safe_load(yaml.safe_dump(BASE))
+    data["shared"]["postgres"]["base_branch"] = ["main"]
+    with pytest.raises(WtError, match="base_branch"):
+        load_config(write(tmp_path, data))

@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, health, router, tls
+from wt import compose, health, providers, router, tls
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
+from wt.providers.base import BranchContext, Check, Resources
 
 GIT_ENV = {
     "GIT_AUTHOR_NAME": "wt-test",
@@ -98,7 +99,11 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
 
 @pytest.fixture
 def orch(make_repo, tmp_path: Path):
-    def build(env: dict[str, str] | None = None) -> Orchestrator:
+    def build(
+        env: dict[str, str] | None = None,
+        shared: dict[str, object] | None = None,
+        extra_services: dict[str, object] | None = None,
+    ) -> Orchestrator:
         make_repo("shop-api", {"docker-compose.yml": COMPOSE})
         config = {
             "project": "shop",
@@ -113,10 +118,67 @@ def orch(make_repo, tmp_path: Path):
                     "env": env or {"URL": "{{ url }}"},
                 },
                 "db": {"repo": "api", "compose": "docker-compose.yml"},
+                **(extra_services or {}),
             },
+            **({"shared": shared} if shared else {}),
         }
         path = tmp_path / "worktree.yaml"
         path.write_text(yaml.safe_dump(config))
         return Orchestrator(load_config(path), log=lambda m: None)
 
     return build
+
+
+@dataclass
+class FakeProvider:
+    """A provider that records calls into a shared event list."""
+
+    events: list[str]
+    name: str = "postgres"
+    fail_create: bool = False
+    check: Check = field(default_factory=lambda: Check(True, "fine", []))
+    kinds: list[str] = field(default_factory=list)
+
+    def ensure_server(self) -> None:
+        self.events.append("ensure")
+
+    def create(self, ctx: BranchContext) -> Resources:
+        self.events.append("create")
+        if self.fail_create:
+            raise WtError("create failed")
+        return Resources([f"db_{ctx.names.ident}"])
+
+    def verify(self, ctx: BranchContext) -> Check:
+        self.events.append("verify")
+        return self.check
+
+    def destroy(self, ctx: BranchContext) -> None:
+        self.events.append("destroy")
+
+    def template_vars(self, ctx: BranchContext, kind: str) -> dict[str, object]:
+        self.kinds.append(kind)
+        return {"pg": {"url": f"{kind}://{ctx.names.ident}@{ctx.base_branch}"}}
+
+
+SHARED = {"postgres": {"databases": ["shop"]}}
+
+
+@pytest.fixture
+def fake_provider(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> FakeProvider:
+    """Registers a fake `postgres` provider; compose up/down are logged in the same event list."""
+    events: list[str] = []
+    fake = FakeProvider(events)
+    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg: fake)
+    real_up, real_down = docker.up, compose.down
+
+    def up(project: str, files: list[Path], **kwargs: object) -> None:
+        events.append("compose up")
+        real_up(project, files, **kwargs)
+
+    def down(project: str) -> None:
+        events.append("compose down")
+        real_down(project)
+
+    monkeypatch.setattr(compose, "up", up)
+    monkeypatch.setattr(compose, "down", down)
+    return fake

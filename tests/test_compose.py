@@ -130,3 +130,9 @@ def test_ensure_network_reraises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(proc, "run", fake)
     with pytest.raises(proc.CommandError):
         compose.ensure_network()
+
+
+def test_override_network_without_alias_joins_the_shared_network() -> None:
+    doc = compose.build_override(["db"], {"db": compose.ServicePatch(network=True)})
+    assert doc["services"]["db"]["networks"] == {"default": {}, "wt": {}}
+    assert doc["networks"]["wt"] == {"external": True, "name": "wt"}
