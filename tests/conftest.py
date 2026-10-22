@@ -138,7 +138,8 @@ def orch(make_repo, tmp_path: Path):
         shared: dict[str, object] | None = None,
         extra_services: dict[str, object] | None = None,
     ) -> Orchestrator:
-        make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+        if not (tmp_path / "shop-api").exists():  # a test may build a second config
+            make_repo("shop-api", {"docker-compose.yml": COMPOSE})
         config = {
             "project": "shop",
             "domain": "shop.localhost",
