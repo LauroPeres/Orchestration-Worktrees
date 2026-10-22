@@ -359,7 +359,7 @@ worktrees. Each step skips what state says was never created.
 branch. Run services get health and URL like compose services. If the docker CLI fails, `compose.ps`
 raises `WtError("docker is not reachable ...")`, and `ls` shows `docker unavailable` instead of `0/0`.
 Layout, so URLs stay whole at 80 columns: columns `BRANCH STATUS UP SERVICE KIND URL HEALTH`
-(`UP` is `<running>/<total> running`, counting compose containers only); databases are listed in a `databases:` section after the table.
+(`UP` is `<running>/<total>`, e.g. `2/2`, counting every service of the branch: compose containers plus live `run:` processes; only `UP` and `HEALTH` may wrap, a URL never does); databases are listed in a `databases:` section after the table.
 
 **logs.** For a `run:` service, a missing log file raises `WtError("no log yet for <svc> on <branch>")`.
 
