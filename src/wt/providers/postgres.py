@@ -15,7 +15,7 @@ from wt.config import Config
 from wt.config import Postgres as PostgresConfig
 from wt.errors import WtError
 from wt.naming import Names, fit
-from wt.paths import instance, wt_home
+from wt.paths import env_port, instance, wt_home
 from wt.providers.base import BranchContext, Check, Kind, Resources
 from wt.state import atomic_write
 
@@ -43,7 +43,7 @@ def image() -> str:
 
 
 def host_port() -> int:
-    return int(os.environ.get("WT_POSTGRES_PORT", str(DEFAULT_PORT)))
+    return env_port("WT_POSTGRES_PORT", DEFAULT_PORT)
 
 
 def server_dir() -> Path:

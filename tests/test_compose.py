@@ -143,3 +143,14 @@ def test_override_network_without_alias_joins_the_shared_network() -> None:
     doc = compose.build_override(["db"], {"db": compose.ServicePatch(network=True)})
     assert doc["services"]["db"]["networks"] == {"default": {}, "wt": {}}
     assert doc["networks"]["wt"] == {"external": True, "name": "wt"}
+
+
+def test_env_dollar_is_escaped_for_compose() -> None:
+    env = {"A": "ab$cd", "HASH": "$2b$12$abcdefghij", "PLAIN": "x"}
+    doc = compose.build_override(["api"], {"api": compose.ServicePatch(env=env)})
+    assert doc["services"]["api"]["environment"] == {
+        "A": "ab$$cd",
+        "HASH": "$$2b$$12$$abcdefghij",
+        "PLAIN": "x",
+    }
+    assert env["A"] == "ab$cd"  # the patch itself is not mutated

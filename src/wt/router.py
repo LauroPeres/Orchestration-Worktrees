@@ -9,7 +9,7 @@ import yaml
 
 from wt import compose, proc
 from wt.naming import Names
-from wt.paths import instance, wt_home
+from wt.paths import env_port, instance, wt_home
 from wt.state import atomic_write
 
 DEFAULT_IMAGE = "traefik:v3.5"
@@ -35,11 +35,11 @@ def certs_dir() -> Path:
 
 
 def http_port() -> int:
-    return int(os.environ.get("WT_HTTP_PORT", "80"))
+    return env_port("WT_HTTP_PORT", 80)
 
 
 def https_port() -> int:
-    return int(os.environ.get("WT_HTTPS_PORT", "443"))
+    return env_port("WT_HTTPS_PORT", 443)
 
 
 def image() -> str:
