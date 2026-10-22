@@ -485,6 +485,24 @@ def test_readiness_waits_for_the_tcp_server(fake: FakeProc) -> None:
     assert test_cmd[test_cmd.index("-h") + 1] == "127.0.0.1"
 
 
+@pytest.mark.parametrize(
+    ("branch", "base"),
+    [("Main", "main"), ("MAIN", "main"), ("main_", "main"), ("release-1.0", "release/1.0")],
+)
+def test_branch_aliasing_the_base_databases_is_refused_and_never_dropped(
+    fake: FakeProc, branch: str, base: str
+) -> None:
+    provider = PostgresProvider(config())
+    with pytest.raises(WtError, match=base):
+        provider.create(ctx(branch, base))
+    assert fake.calls == []
+    record(branch, base, [db for _, db in provider._names(ctx(branch, base))])
+    logs: list[str] = []
+    PostgresProvider(config(), log=logs.append).destroy(ctx(branch, base))
+    assert fake.calls == []
+    assert logs and "base branch" in logs[0]
+
+
 @pytest.mark.parametrize("bad", ["abc", "", "0", "70000"])
 def test_invalid_postgres_port(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
     monkeypatch.setenv("WT_POSTGRES_PORT", bad)

@@ -282,6 +282,7 @@ class PostgresProvider:
     def create(self, ctx: BranchContext) -> Resources:
         self._cloned = []
         self._warnings = []
+        self._guard_base_alias(ctx)
         self._record_base(ctx)
         created: list[str] = []
         for src, dst in self._names(ctx):
@@ -299,6 +300,14 @@ class PostgresProvider:
             self._clone(src, dst)
             self._cloned.append((src, dst))
         return Resources(created)
+
+    def _guard_base_alias(self, ctx: BranchContext) -> None:
+        """Refuse a non-base branch whose database names equal the base branch's."""
+        if ctx.branch != ctx.base_branch and any(src == dst for src, dst in self._names(ctx)):
+            raise WtError(
+                f"branch {ctx.branch!r} maps to the same databases as the base branch "
+                f"{ctx.base_branch!r}; rename the branch"
+            )
 
     def _record_base(self, ctx: BranchContext) -> None:
         """Remember which branch was the base when this slice was made (`destroy` relies on it)."""
@@ -388,7 +397,13 @@ class PostgresProvider:
         if base is None or ctx.branch == base:
             self.log(f"keeping the base branch databases: {', '.join(wanted) or 'none'}")
             return
+        protected = {
+            db_name(d, Names(ctx.names.project, base, ctx.names.domain)) for d in self.databases
+        }
         for db in wanted:
+            if db in protected:
+                self.log(f"keeping {db}: it belongs to the base branch {base}")
+                continue
             self._drop(db)
 
     def template_vars(self, ctx: BranchContext, kind: Kind) -> dict[str, Any]:
