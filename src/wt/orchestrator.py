@@ -306,7 +306,8 @@ class Orchestrator:
 
     # ---- down -----------------------------------------------------------------------------
 
-    def down(self, branch: str, *, force: bool = False) -> None:
+    def down(self, branch: str, *, force: bool = False) -> bool:
+        """Remove everything for a branch. False when there was nothing to remove."""
         names = self.names(branch)
         with self._branch_lock(names):
             state = self.store.load()
@@ -338,7 +339,7 @@ class Orchestrator:
                 and not any(p.exists() for p in leftovers)
             ):
                 self.log(f"branch {branch} not found; nothing to remove")
-                return
+                return False
 
             if not force:
                 dirty = [str(p) for _, p in removals if p.exists() and git.is_dirty(p)]
@@ -376,6 +377,7 @@ class Orchestrator:
 
             with self.store.edit() as state:
                 state.branches.pop(branch, None)
+            return True
 
     # ---- ls / logs ------------------------------------------------------------------------
 
