@@ -18,6 +18,7 @@ from wt.orchestrator import Orchestrator, ServiceReport
 
 pytestmark = pytest.mark.docker
 
+SERVE = Path(__file__).parent.parent / "serve.py"
 IMAGE = "traefik/whoami:v1.10"
 COMPOSE = f"""\
 services:
@@ -87,7 +88,7 @@ def host_stack(
     services = {
         "web": {
             "repo": "api",
-            "run": f"{sys.executable} -m http.server {{{{ port }}}} --bind 0.0.0.0",
+            "run": f"{sys.executable} {SERVE} {{{{ port }}}}",
             "port": "auto",
             "subdomain": "web",
         }

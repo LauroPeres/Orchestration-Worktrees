@@ -11,7 +11,8 @@ from wt import host, naming
 from wt.errors import WtError
 from wt.state import ProcessState
 
-SERVER = f"{sys.executable} -m http.server {{port}} --bind 0.0.0.0"
+SERVE = Path(__file__).parent / "serve.py"
+SERVER = f"{sys.executable} {SERVE} {{port}}"
 
 
 def free_port() -> int:

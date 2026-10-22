@@ -432,7 +432,8 @@ def test_down_lists_resources_of_unavailable_provider(orch, docker: FakeDocker) 
 
 # ---- host processes (run: services) ------------------------------------------------------
 
-SERVER = f"{sys.executable} -m http.server {{{{ port }}}} --bind 0.0.0.0"
+SERVE = Path(__file__).parent / "serve.py"
+SERVER = f"{sys.executable} {SERVE} {{{{ port }}}}"
 
 
 def run_service(**extra: object) -> dict[str, object]:
@@ -473,7 +474,7 @@ def test_run_service_is_started_and_recorded(run_orch, isolated_home: Path) -> N
     assert ps.port is not None and 20000 <= ps.port < 40000
     assert ps.log == str(isolated_home / "shop" / "branches" / "feat-cart" / "logs" / "web.log")
     assert Path(ps.log).is_file()
-    assert f"http.server {ps.port} --bind 0.0.0.0" in ps.command
+    assert f"serve.py {ps.port}" in ps.command
 
 
 def test_run_service_runs_in_worktree_with_rendered_env(run_orch, isolated_home: Path) -> None:
@@ -504,7 +505,7 @@ def test_port_is_rendered_into_env_and_command(run_orch) -> None:
     port = o.store.load().branches["main"].processes["web"].port
     assert port is not None
     cmd = o.store.load().branches["main"].processes["web"].command
-    assert f"http.server {port} " in cmd
+    assert f"serve.py {port}" in cmd
 
 
 def test_up_twice_does_not_restart_a_live_process(run_orch) -> None:
