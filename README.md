@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.2.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, and a Postgres provider that gives every branch its own cloned
 > databases. A complete two-branch example is in [examples/shop](examples/shop/README.md).
 > Kafka and Redis come in v0.3.
@@ -57,6 +57,11 @@ wt down my-branch       # --force also removes worktrees with uncommitted change
 Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
 your main checkout.
 
+`wt ls` counts `UP` as running/total over every service of a branch (compose containers and live
+`run:` processes, e.g. `2/2`). STATUS shows `degraded` when docker is reachable and a service is
+not running or a health check fails. Piped or redirected output is never wrapped or cut; only a
+terminal gets the fixed-width layout.
+
 ## `worktree.yaml`
 
 ```yaml
@@ -90,7 +95,7 @@ services:
 | `port` | Container port Traefik routes to (compose), or the host port of a `run:` service, or `auto`. Required when `subdomain` is set. |
 | `subdomain` | `""` = branch root (`https://<branch>.<domain>`); unset = not routed. |
 | `health` | Path probed through Traefik after `up` (default `/`). |
-| `env` | Extra environment for the container. Values can use templates. |
+| `env` | Extra environment for the container. Values can use templates; a `$` in a value is literal. |
 
 Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`), `ident`
 (`feat_cart`), `domain`, `branch_domain`, `port`, `url`, `host`, and
@@ -151,7 +156,10 @@ gets the database `shop__feat_cart`.
   `{{ postgres.name('shop') }}` the database name. Compose services get the address on the
   shared `wt` network; host processes get `127.0.0.1:55432`. Every compose service listed in
   `services:` joins the `wt` network when Postgres is configured.
-- `down` drops that branch's databases and never the `base_branch` ones.
+- `down` drops that branch's databases and never the `base_branch` ones. It starts the shared
+  Postgres container first if it is stopped.
+- A branch whose database names equal the base branch's (for example `Main` with the base
+  `main`) is refused by `up` before anything is created. Rename the branch.
 - Kafka, Redis and Keycloak under `shared:` are validated but ignored until later versions.
 
 ## How isolation works
@@ -181,6 +189,9 @@ gets the database `shop__feat_cart`.
 | `WT_POSTGRES_IMAGE` | `postgres:17-alpine` | Postgres image |
 | `WT_POSTGRES_PORT` | `55432` | host port of the shared Postgres |
 | `WT_INSTANCE` | `wt` | prefix of the shared Docker objects (isolates test runs) |
+
+A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`) that is not a number from 1
+to 65535 makes wt stop with an error that names the variable.
 
 ## WSL2
 
