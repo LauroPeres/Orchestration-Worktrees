@@ -54,3 +54,28 @@ def test_auto_port_is_stable_and_in_range() -> None:
     assert port == auto_port("shop", "feat/cart", "web")
     assert AUTO_PORT_RANGE[0] <= port < AUTO_PORT_RANGE[1]
     assert port != auto_port("shop", "feat/other", "web")
+
+
+@pytest.mark.parametrize("branch", ["feat/x", "feat-x", "Feat_X"])
+def test_branches_that_differ_only_in_separators_share_a_slug(branch: str) -> None:
+    assert slugify(branch) == "feat-x"
+
+
+def test_fit_long_name_has_hash_suffix() -> None:
+    result = fit("a" * 100)
+    assert len(result) == 63
+    prefix, sep, suffix = result.rpartition("-")
+    assert sep == "-"
+    assert len(suffix) == 6
+    assert all(c in "0123456789abcdef" for c in suffix)
+    assert prefix == "a" * 56
+    assert fit("a" * 100) == result  # stable across calls
+
+
+def test_fit_differs_for_long_names_that_differ_at_the_end() -> None:
+    assert fit("a" * 99 + "b") != fit("a" * 100)
+
+
+def test_slugify_cuts_a_60_char_branch_to_max_slug() -> None:
+    slug = slugify("feat/" + "b" * 55)
+    assert len(slug) <= MAX_SLUG
