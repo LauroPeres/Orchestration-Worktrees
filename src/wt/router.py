@@ -14,6 +14,7 @@ from wt.state import atomic_write
 
 DEFAULT_IMAGE = "traefik:v3.5"
 CERTS_IN_CONTAINER = "/etc/traefik/certs"
+HOST_GATEWAY_NAME = "host.docker.internal"  # how the Traefik container reaches host processes
 
 
 def container() -> str:
@@ -70,6 +71,7 @@ def compose_doc() -> dict[str, Any]:
                     "./dynamic:/etc/traefik/dynamic:ro",
                     f"./certs:{CERTS_IN_CONTAINER}:ro",
                 ],
+                "extra_hosts": [f"{HOST_GATEWAY_NAME}:host-gateway"],
                 "networks": [compose.NETWORK],
                 "healthcheck": {
                     "test": ["CMD", "traefik", "healthcheck", "--ping"],
@@ -81,6 +83,10 @@ def compose_doc() -> dict[str, Any]:
         },
         "networks": {compose.NETWORK: {"external": True, "name": compose.network_name()}},
     }
+
+
+def host_upstream(port: int) -> str:
+    return f"http://{HOST_GATEWAY_NAME}:{port}"
 
 
 def ensure_running(timeout: int = 60) -> None:
