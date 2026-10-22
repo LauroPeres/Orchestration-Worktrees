@@ -368,13 +368,14 @@ def test_down_cannot_start_server_keeps_state_for_rerun(
     def broken() -> None:
         raise WtError("command failed (1): docker compose up")
 
+    working = fake_provider.ensure_server
     monkeypatch.setattr(fake_provider, "ensure_server", broken)
     with pytest.raises(WtError, match="wt doctor --fix") as info:
         o.down("feat/cart")
     assert "wt down feat/cart" in str(info.value)
     assert "destroy" not in fake_provider.events
     assert o.store.load().branches["feat/cart"].providers == {"postgres": ["db_feat_cart"]}
-    monkeypatch.undo()
+    monkeypatch.setattr(fake_provider, "ensure_server", working)
     o.down("feat/cart")
     assert o.store.load().branches == {}
 
