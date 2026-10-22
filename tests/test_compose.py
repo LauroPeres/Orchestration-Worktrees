@@ -81,6 +81,12 @@ def test_up_args(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, build: bool) -
     assert kwargs["cwd"] == tmp_path
 
 
+def test_up_pulls_quietly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls = _record(monkeypatch)
+    compose.up("proj", [tmp_path / "c.yaml"], cwd=tmp_path, build=False, timeout=90)
+    assert "--quiet-pull" in calls[0][0]
+
+
 def test_down_args(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _record(monkeypatch)
     compose.down("proj")

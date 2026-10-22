@@ -61,12 +61,14 @@ class FakeDocker:
 
     healthy: bool = True
     fail_up: bool = False
+    traefik_running: bool = False
     ups: list[str] = field(default_factory=list)
     downs: list[str] = field(default_factory=list)
     files: list[list[Path]] = field(default_factory=list)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(router, "ensure_running", lambda timeout=60: None)
+        monkeypatch.setattr(router, "is_running", lambda: self.traefik_running)
         monkeypatch.setattr(tls, "available", lambda: False)
         monkeypatch.setattr(compose, "list_services", lambda f: ["api", "db"])
         monkeypatch.setattr(compose, "up", self.up)
