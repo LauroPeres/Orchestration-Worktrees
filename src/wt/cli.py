@@ -203,7 +203,12 @@ def logs(
 def doctor_(
     ctx: typer.Context,
     fix: Annotated[
-        bool, typer.Option("--fix", help="Install the local CA, create the network, start Traefik.")
+        bool,
+        typer.Option(
+            "--fix",
+            help="Install the local CA, create the network, start Traefik "
+            "(and Postgres when configured).",
+        ),
     ] = False,
 ) -> None:
     """Check docker, git, ports, certificates and name resolution."""
