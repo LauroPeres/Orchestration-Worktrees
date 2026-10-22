@@ -95,10 +95,10 @@ def init(
 
 def _report_table(reports: list[ServiceReport]) -> Table:
     table = Table(box=None, pad_edge=False)
-    for col in ("SERVICE", "URL", "CHECK", "DETAIL"):
+    for col in ("SERVICE", "KIND", "URL", "CHECK", "DETAIL"):
         table.add_column(col, overflow="fold")
     for r in reports:
-        table.add_row(r.service, r.url or "-", OUTCOME[r.outcome], escape(r.detail))
+        table.add_row(r.service, r.kind, r.url or "-", OUTCOME[r.outcome], escape(r.detail))
     return table
 
 
@@ -145,9 +145,14 @@ def ls_(
         console.print("no branches are up. Start one with [bold]wt up <branch>[/].")
         return
     table = Table(box=None, pad_edge=False)
-    for col in ("BRANCH", "STATUS", "CONTAINERS", "SERVICE", "URL", "HEALTH"):
-        # only HEALTH wraps; a URL (or branch, service) is never broken mid-word
-        table.add_column(col, overflow="fold", no_wrap=col != "HEALTH")
+    for col in ("BRANCH", "STATUS", "UP", "SERVICE", "KIND", "URL", "HEALTH"):
+        # only HEALTH and UP wrap; a URL (or branch, service) is never broken mid-word
+        table.add_column(
+            col,
+            overflow="fold",
+            no_wrap=col not in ("HEALTH", "UP"),
+            min_width=3 if col == "UP" else None,
+        )
     for row in sorted(rows, key=lambda r: r.branch):
         services = row.services or [ServiceReport("-", "skipped", "")]
         for i, svc in enumerate(services):
@@ -157,15 +162,24 @@ def ls_(
                 if no_probe or svc.service == "-"
                 else (f"{OUTCOME[svc.outcome]} [dim]{escape(svc.detail)}[/]")
             )
+            containers = (
+                f"{row.running}/{row.total} running" if row.docker_ok else "docker unavailable"
+            )
             table.add_row(
                 row.branch if first else "",
                 row.status if first else "",
-                f"{row.running}/{row.total} running" if first else "",
+                containers if first else "",
                 svc.service,
+                svc.kind if svc.service != "-" else "-",
                 svc.url or "-",
                 health,
             )
     console.print(table)
+    with_databases = [row for row in sorted(rows, key=lambda r: r.branch) if row.databases]
+    if with_databases:
+        console.print("\ndatabases:")
+        for row in with_databases:
+            console.print(f"  {row.branch}  {escape(', '.join(row.databases))}", soft_wrap=True)
     if paths:
         console.print("\nworktrees:")
         for row in sorted(rows, key=lambda r: r.branch):

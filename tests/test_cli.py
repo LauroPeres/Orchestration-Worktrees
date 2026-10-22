@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from tests.conftest import FakeDocker
+from tests.conftest import SHARED, FakeDocker
 from wt import __version__, cli, compose
 from wt.cli import app
 from wt.config import load_config
@@ -62,7 +62,7 @@ def test_lifecycle_healthy(orch, docker: FakeDocker, tmp_path: Path) -> None:
     listed = runner.invoke(app, [*cfg, "ls"])
     assert listed.exit_code == 0, listed.output
     assert "feat/cart" in listed.output
-    assert "1/1 running" in listed.output
+    assert "1/1" in listed.output
 
     down = runner.invoke(app, [*cfg, "down", "feat/cart"])
     assert down.exit_code == 0, down.output
@@ -124,6 +124,37 @@ def test_ls_never_breaks_a_url_at_80_columns(
     url = next(t for t in lines[0].split() if t.startswith("https://"))
     assert url.rstrip("/").endswith(".localhost") or ".localhost:" in url
     assert not any(ln.strip().startswith(("lhost", "ost")) for ln in listed.output.splitlines())
+
+
+def test_up_table_and_ls_show_kind_and_databases(
+    orch, fake_provider, docker: FakeDocker, tmp_path: Path
+) -> None:
+    orch(shared=SHARED)
+    cfg = _cfg(tmp_path)
+    up = runner.invoke(app, [*cfg, "up", "feat/cart"])
+    assert up.exit_code == 0, up.output
+    assert "KIND" in up.output and "compose" in up.output
+    listed = runner.invoke(app, [*cfg, "ls", "--no-probe"])
+    assert "KIND" in listed.output and "compose" in listed.output
+    assert "databases:" in listed.output and "db_feat_cart" in listed.output
+
+
+def test_ls_shows_docker_unavailable(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    cfg = _cfg(tmp_path)
+    runner.invoke(app, [*cfg, "up", "feat/cart"])
+
+    def broken(project: str) -> list[compose.Container]:
+        raise WtError("docker is not reachable")
+
+    monkeypatch.setattr(compose, "ps", broken)
+    monkeypatch.setattr(cli.console, "_width", 120)
+    listed = runner.invoke(app, [*cfg, "ls", "--no-probe"])
+    assert listed.exit_code == 0, listed.output
+    assert "docker unavailable" in listed.output
+    assert "0/0" not in listed.output
 
 
 def test_down_unknown_branch_prints_only_not_found(

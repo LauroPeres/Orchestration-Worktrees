@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from tests.conftest import SHARED, FakeDocker, FakeProvider
-from wt import compose, git, host, naming, router, tls
+from wt import compose, git, host, naming, proc, router, tls
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import Check
@@ -137,6 +137,39 @@ def test_ls(orch, docker: FakeDocker) -> None:
     ]
 
 
+def test_ls_reports_kind_and_databases(orch, fake_provider, docker: FakeDocker) -> None:
+    o = orch(shared=SHARED)
+    reports = o.up("feat/cart")
+    assert {r.service: r.kind for r in reports} == {"api": "compose", "db": "compose"}
+    [row] = o.ls()
+    assert [s.kind for s in row.services] == ["compose"]
+    assert row.databases == ["db_feat_cart"]
+    assert row.docker_ok
+
+
+def test_ls_marks_docker_unavailable(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+
+    def broken(project: str) -> list[compose.Container]:
+        raise WtError("docker is not reachable")
+
+    monkeypatch.setattr(compose, "ps", broken)
+    [row] = o.ls(probe=False)
+    assert not row.docker_ok and row.total == 0
+    assert [s.service for s in row.services] == ["api"]
+
+
+def test_run_service_row_has_kind_run(run_orch) -> None:
+    o = run_orch(run_service(subdomain="web", health="/"))
+    reports = {r.service: r for r in o.up("main")}
+    assert reports["web"].kind == "run"
+    [row] = o.ls(probe=False)
+    assert {s.service: s.kind for s in row.services}["web"] == "run"
+
+
 def test_custom_https_port_in_urls(
     orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -152,6 +185,32 @@ def test_logs_errors(orch, docker: FakeDocker) -> None:
         o.logs("feat/cart", "nope")
     with pytest.raises(WtError, match="not up"):
         o.logs("feat/cart", "api")
+
+
+def test_logs_of_run_service_tails_the_log(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    o = run_orch()
+    o.up("main")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(args: list[str], **kw: object) -> proc.Result:
+        calls.append((args, kw))
+        return proc.Result(0, "", "")
+
+    monkeypatch.setattr(proc, "run", fake_run)
+    log = o.store.load().branches["main"].processes["web"].log
+    o.logs("main", "web", follow=True, tail=7)
+    o.logs("main", "web", follow=False, tail=3)
+    assert calls[0][0] == ["tail", "-n", "7", "-f", log]
+    assert calls[1][0] == ["tail", "-n", "3", log]
+    assert calls[0][1].get("capture") is False
+
+
+def test_logs_of_run_service_without_log_file(run_orch) -> None:
+    o = run_orch()
+    o.up("main")
+    Path(o.store.load().branches["main"].processes["web"].log).unlink()
+    with pytest.raises(WtError, match="no log yet for web on main"):
+        o.logs("main", "web")
 
 
 def test_failed_up_shows_in_ls(orch, docker: FakeDocker) -> None:
