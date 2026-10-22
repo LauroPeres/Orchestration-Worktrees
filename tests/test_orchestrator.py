@@ -356,7 +356,28 @@ def test_provider_call_order(orch, fake_provider: FakeProvider) -> None:
     o.up("feat/cart")
     assert fake_provider.events == ["ensure", "create", "verify", "compose up"]
     o.down("feat/cart")
-    assert fake_provider.events[4:] == ["compose down", "destroy"]
+    assert fake_provider.events[4:] == ["compose down", "ensure", "destroy"]
+
+
+def test_down_cannot_start_server_keeps_state_for_rerun(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+
+    def broken() -> None:
+        raise WtError("command failed (1): docker compose up")
+
+    working = fake_provider.ensure_server
+    monkeypatch.setattr(fake_provider, "ensure_server", broken)
+    with pytest.raises(WtError, match="wt doctor --fix") as info:
+        o.down("feat/cart")
+    assert "wt down feat/cart" in str(info.value)
+    assert "destroy" not in fake_provider.events
+    assert o.store.load().branches["feat/cart"].providers == {"postgres": ["db_feat_cart"]}
+    monkeypatch.setattr(fake_provider, "ensure_server", working)
+    o.down("feat/cart")
+    assert o.store.load().branches == {}
 
 
 def test_provider_state_is_recorded_and_cleared(orch, fake_provider: FakeProvider) -> None:

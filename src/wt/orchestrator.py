@@ -583,8 +583,16 @@ class Orchestrator:
                     f"resources by hand: {leftover}"
                 )
                 continue
+            provider = factory(self.cfg, self.log)
+            try:
+                provider.ensure_server()
+            except WtError as exc:
+                raise WtError(
+                    f"cannot start the {name} server to remove this branch's resources: {exc}. "
+                    f"Try `wt doctor --fix`, then run `wt down {branch}` again"
+                ) from exc
             self.log(f"destroying {name} resources")
-            factory(self.cfg, self.log).destroy(ctx)
+            provider.destroy(ctx)
 
             def cleared(b: BranchState, n: str = name) -> None:
                 b.providers.pop(n, None)
