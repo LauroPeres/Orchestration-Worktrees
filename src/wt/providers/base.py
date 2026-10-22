@@ -35,6 +35,9 @@ class Provider(Protocol):
     def ensure_server(self) -> None:
         """Start the shared server if needed."""
 
+    def preflight(self, ctx: BranchContext) -> None:
+        """Refuse a branch before `up` has any side effect (no state, worktree or container)."""
+
     def create(self, ctx: BranchContext) -> Resources:
         """Create this branch's slice (database, group, prefix...). Must be idempotent."""
 

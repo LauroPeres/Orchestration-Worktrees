@@ -284,6 +284,9 @@ class PostgresProvider:
     def ensure_server(self) -> None:
         ensure_server(self.databases)
 
+    def preflight(self, ctx: BranchContext) -> None:
+        self._guard_base_alias(ctx)
+
     def create(self, ctx: BranchContext) -> Resources:
         self._cloned = []
         self._warnings = []

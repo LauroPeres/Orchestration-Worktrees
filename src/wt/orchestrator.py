@@ -164,6 +164,8 @@ class Orchestrator:
             with file_lock(f"ports-{self.cfg.project}"):
                 ports = self._resolve_ports(branch)
                 envs, commands = self._render(names, ports)
+                for provider in self.providers():
+                    provider.preflight(self.provider_context(names))
                 with self.store.edit() as state:
                     for other, bs in state.branches.items():
                         if other != branch and bs.slug == names.slug:
