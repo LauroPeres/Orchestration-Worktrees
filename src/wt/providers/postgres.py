@@ -162,18 +162,24 @@ def _like(database: str) -> str:
     return database.replace("_", "\\_") + "\\_\\_%"
 
 
-def repair_connections(databases: list[str]) -> None:
-    """Re-enable connections on wt databases (`<db>__*`) a crashed template clone left closed.
+def closed_databases(databases: list[str]) -> list[str]:
+    """wt databases (`<db>__*` of the configured names) that have connections disabled.
 
     Only the configured database names are matched, so a user's own `a__b` is never touched.
     """
     if not databases:
-        return
+        return []
     for database in databases:
         ident(database)
     like = " OR ".join(f"datname LIKE '{_like(d)}'" for d in databases)
-    rows = psql(f"SELECT datname FROM pg_database WHERE ({like}) AND NOT datallowconn ORDER BY 1")
-    for name in _rows(rows):
+    return _rows(
+        psql(f"SELECT datname FROM pg_database WHERE ({like}) AND NOT datallowconn ORDER BY 1")
+    )
+
+
+def repair_connections(databases: list[str]) -> None:
+    """Re-enable connections on wt databases a crashed template clone left closed."""
+    for name in closed_databases(databases):
         psql(f"ALTER DATABASE {ident(name)} WITH ALLOW_CONNECTIONS true")
 
 

@@ -6,9 +6,11 @@ import socket
 from dataclasses import dataclass
 from typing import Literal
 
-from wt import compose, proc, router, tls
+from wt import compose, host, proc, router, tls
 from wt.config import LoadedConfig
-from wt.state import file_lock
+from wt.errors import WtError
+from wt.providers import postgres
+from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
 MIN_COMPOSE = (2, 24)  # `!reset` in override files
@@ -174,6 +176,102 @@ def check_resolution(domain: str) -> Check:
     )
 
 
+def check_postgres(databases: list[str], *, fix: bool) -> list[Check]:
+    """Shared Postgres: container, password file mode, closed databases (no secrets shown)."""
+    checks: list[Check] = []
+    name = postgres.container()
+    running = _container_running(name)
+    if not running and fix:
+        try:
+            with file_lock("postgres"):
+                postgres.ensure_server(databases)
+        except WtError as exc:
+            checks.append(Check("postgres", "fail", str(exc).splitlines()[0]))
+        running = _container_running(name)
+    if running:
+        checks.append(Check("postgres", "ok", f"{name} running"))
+    elif not any(c.name == "postgres" for c in checks):
+        checks.append(
+            Check(
+                "postgres",
+                "warn",
+                f"{name} not running",
+                "started on first `wt up` (or `wt doctor --fix`)",
+            )
+        )
+    checks.append(_check_password(fix))
+    if running:
+        checks.append(_check_connections(databases, fix))
+    return checks
+
+
+def _container_running(name: str) -> bool:
+    result = proc.run(["docker", "inspect", "-f", "{{.State.Running}}", name], check=False)
+    return result.ok and result.stdout.strip() == "true"
+
+
+def _check_password(fix: bool) -> Check:
+    path = postgres.password_file()
+    if not path.exists():
+        return Check(
+            "postgres password", "info", "not created yet", "created when the server first starts"
+        )
+    mode = path.stat().st_mode & 0o777
+    if mode != 0o600 and fix:
+        path.chmod(0o600)
+        mode = 0o600
+    if mode == 0o600:
+        return Check("postgres password", "ok", "file exists, mode 0600")
+    return Check(
+        "postgres password",
+        "warn",
+        f"file mode is {mode:04o}, expected 0600",
+        "run `wt doctor --fix`",
+    )
+
+
+def _check_connections(databases: list[str], fix: bool) -> Check:
+    try:
+        closed = postgres.closed_databases(databases)
+        if closed and fix:
+            postgres.repair_connections(databases)
+            closed = postgres.closed_databases(databases)
+    except WtError as exc:
+        return Check("postgres databases", "fail", str(exc).splitlines()[0])
+    if not closed:
+        return Check("postgres databases", "ok", "all accept connections")
+    return Check(
+        "postgres databases",
+        "fail",
+        f"connections disabled: {', '.join(closed)}",
+        "run `wt doctor --fix`",
+    )
+
+
+def check_ports(project: str) -> list[Check]:
+    """Recorded ports of `run:` services whose process is gone must be free to restart."""
+    checks: list[Check] = []
+    state = StateStore(project).load()
+    for branch in state.branches.values():
+        for service, ps in branch.processes.items():
+            if ps.port is None or host.alive(ps):
+                continue
+            label = f"port {ps.port}"
+            where = f"{branch.branch}/{service}"
+            if host.port_free(ps.port):
+                checks.append(Check(label, "ok", f"{where} (stopped) port free"))
+            else:
+                checks.append(
+                    Check(
+                        label,
+                        "fail",
+                        f"{where} (stopped) port is used by another process",
+                        "free it, then `wt up` picks a port again",
+                    )
+                )
+    return checks
+
+
 def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bool) -> list[Check]:
     checks = [check_git()]
     docker = check_docker()
@@ -187,6 +285,9 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
     elif loaded:
         checks.append(Check("config", "ok", f"{loaded.path} (project '{loaded.config.project}')"))
         checks.append(check_resolution(loaded.config.domain))
+        if docker_ok and loaded.config.shared.postgres is not None:
+            checks += check_postgres(loaded.config.shared.postgres.databases, fix=fix)
+        checks += check_ports(loaded.config.project)
     else:
         checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))
     return checks
