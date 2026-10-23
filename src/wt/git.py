@@ -95,3 +95,12 @@ def remove_worktree(repo: Path, path: Path, *, force: bool) -> None:
         args = ["worktree", "remove", *(["--force"] if force else []), str(path)]
         _git(repo, *args)
     _git(repo, "worktree", "prune")
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    return _has_ref(repo, f"refs/heads/{branch}")
+
+
+def delete_branch(repo: Path, branch: str) -> None:
+    """`git branch -D`: drops the branch even when it is not merged."""
+    _git(repo, "branch", "-D", branch)

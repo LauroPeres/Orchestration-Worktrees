@@ -361,3 +361,23 @@ def test_tui_outside_project_lists_known_projects(
     assert entries["gone"].orch is None and "nope.yaml" in entries["gone"].note
     live = entries["live"].orch
     assert live is not None and live() is live()  # built once, lazily
+
+
+def test_add_stop_remove_commands(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    orch()
+    cfg = _cfg(tmp_path)
+    added = runner.invoke(app, [*cfg, "add", "feat/cart"])
+    assert added.exit_code == 0, added.output
+    assert "stopped" in runner.invoke(app, [*cfg, "ls", "--no-probe"]).output
+    assert runner.invoke(app, [*cfg, "stop", "feat/cart"]).exit_code == 0
+    declined = runner.invoke(app, [*cfg, "remove", "feat/cart"], input="n\n")
+    assert declined.exit_code != 0
+    assert "feat/cart" in runner.invoke(app, [*cfg, "ls", "--no-probe"]).output
+    removed = runner.invoke(app, [*cfg, "remove", "feat/cart", "--yes"])
+    assert removed.exit_code == 0, removed.output
+    assert "no branches" in runner.invoke(app, [*cfg, "ls", "--no-probe"]).output
+
+
+def test_stop_unknown_branch_fails(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    orch()
+    assert runner.invoke(app, [*_cfg(tmp_path), "stop", "feat/nope"]).exit_code != 0
