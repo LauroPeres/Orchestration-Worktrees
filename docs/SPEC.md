@@ -314,7 +314,8 @@ databases. At `create` time the provider records the base branch in state
 over the current config, so changing `base_branch` or removing `shared.postgres` after `up` cannot
 make it drop the clone source. It never drops the databases of the recorded base branch; when
 neither state nor config says which branch is the base, it drops nothing. Either way it logs that
-it keeps them. If reopening the source after a template clone fails, the original clone error is
+it keeps them. wt has no command to drop the base databases; the README documents the manual
+`dropdb` (D19, so no new flag or command in v0.2). If reopening the source after a template clone fails, the original clone error is
 still the one reported.
 
 **Postgres template vars.** `postgres.url('shop')` and `postgres.name('shop')`. Compose services get

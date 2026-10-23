@@ -160,6 +160,15 @@ gets the database `shop__feat_cart`.
   `services:` joins the `wt` network when Postgres is configured.
 - `down` drops that branch's databases and never the `base_branch` ones. It starts the shared
   Postgres container first if it is stopped.
+- wt never drops the `base_branch` databases. When you are done with a project, drop them by
+  hand, one per database (named `<database>__<base_branch>`):
+
+  ```bash
+  docker exec wt-postgres dropdb -U wt --force shop__main
+  ```
+
+  To remove the shared server with every database in it:
+  `docker rm -f wt-postgres && docker volume rm wt-postgres-data && rm -r ~/.wt/postgres`.
 - A branch whose database names equal the base branch's (for example `Main` with the base
   `main`) is refused by `up` before anything is created. Rename the branch.
 - Kafka, Redis and Keycloak under `shared:` are validated but ignored until later versions.
