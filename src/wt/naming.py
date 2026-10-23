@@ -10,6 +10,9 @@ from wt.errors import WtError
 MAX_SLUG = 40  # leaves room for prefixes in DNS labels (63) and Postgres identifiers (63)
 MAX_LABEL = 63
 AUTO_PORT_RANGE = (20000, 40000)
+PORT_BASE = 10000
+PORT_STRIDE = 100  # services per worktree
+MAX_PORT = 65535
 
 
 def _short_hash(text: str, length: int = 6) -> str:
@@ -45,6 +48,19 @@ def auto_port(project: str, branch: str, service: str) -> int:
     low, high = AUTO_PORT_RANGE
     digest = int(_short_hash(f"{project}\0{branch}\0{service}", 8), 16)
     return low + digest % (high - low)
+
+
+def host_port(worktree_index: int, service_index: int) -> int:
+    """The host port of a service: PORT_BASE + worktree_index * PORT_STRIDE + service_index."""
+    if not 0 <= service_index < PORT_STRIDE:
+        raise WtError(f"service index {service_index} is outside 0..{PORT_STRIDE - 1}")
+    port = PORT_BASE + worktree_index * PORT_STRIDE + service_index
+    if worktree_index < 0 or port > MAX_PORT:
+        raise WtError(
+            f"worktree index {worktree_index} gives port {port}, outside 1..{MAX_PORT}; "
+            "too many worktrees"
+        )
+    return port
 
 
 @dataclass(frozen=True)
