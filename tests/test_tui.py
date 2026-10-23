@@ -517,3 +517,45 @@ def test_multi_selection_survives_refresh_and_no_projects_message() -> None:
             assert "no projects" in log_text(empty).lower()
 
     asyncio.run(scenario())
+
+
+def test_status_dots_and_colors_render_for_each_status() -> None:
+    from wt.tui import DOT
+
+    statuses = {
+        "up": "#4ade80",
+        "degraded": "#facc15",
+        "failed": "#f87171",
+        "creating": "dim",
+        "down": "dim",
+    }
+    data = [BranchStatus(f"b-{s}", s, 0, 0) for s in statuses]
+
+    async def scenario() -> None:
+        app = WtApp(FakeOrch(data))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            items = list(app.query_one("#branches", ListView).query(ListItem))
+            assert len(items) == len(statuses)
+            for item in items:
+                content: Any = item.query_one(Label).render()
+                status = str(content).split()[-1]
+                assert str(content).endswith(f"{DOT} {status}")
+                assert [str(sp.style) for sp in content.spans] == [statuses[status]]
+            title = str(app.query_one("#titlebar").render())
+            assert "worktree" in title and "demo" in title and "1 branches up" in title
+            assert app.query_one("#services").border_title == "services · b-creating"
+
+    asyncio.run(scenario())
+
+
+def test_health_column_shows_colored_dots() -> None:
+    async def scenario() -> None:
+        app = WtApp(FakeOrch(rows()))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#services", DataTable)
+            cells = [table.get_row_at(i)[3] for i in range(table.row_count)]
+            assert "● ok" in str(cells[0]) and "● fail" in str(cells[1])
+
+    asyncio.run(scenario())
