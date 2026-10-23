@@ -16,10 +16,11 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.2.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
-> routes and local TLS, and a Postgres provider that gives every branch its own cloned
-> databases. A complete two-branch example is in [examples/shop](examples/shop/README.md).
-> Kafka and Redis come in v0.3.
+> **Status: v0.3.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> routes and local TLS, a Postgres provider that gives every branch its own cloned databases,
+> a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch example is in
+> [examples/shop](examples/shop/README.md), and a two-repo one in
+> [examples/notes](examples/notes/README.md). Kafka and Redis come in v0.4.
 
 ## Requirements
 
@@ -41,6 +42,11 @@ wt doctor --fix    # installs the local CA, creates the docker network, starts T
 `wt doctor --fix` creates the Docker network `wt` and starts the `wt-traefik` container on
 `127.0.0.1:80/443`. `mkcert -install` may ask for your sudo password.
 
+Traefik reads its route and certificate files through Docker mounts. After a Docker Desktop
+restart those mounts can show empty folders, and every route answers 404. `wt doctor` reports
+this as `traefik mounts`. `wt doctor --fix` recreates the Traefik container, and `wt up` does the
+same once when the route file it just wrote is not visible to Traefik.
+
 ## Quick start
 
 In your repo:
@@ -51,6 +57,7 @@ $EDITOR worktree.yaml
 wt up my-branch    # prints a SERVICE / URL / CHECK table
 wt ls              # branches, URLs, health, databases (--no-probe skips HTTP checks, --paths shows folders)
 wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
+wt tui                  # terminal UI: branches, services, up/down, logs
 wt down my-branch       # --force also removes worktrees with uncommitted changes
 ```
 
@@ -58,9 +65,10 @@ Running `wt up` again for a branch that is already up changes nothing. `wt down 
 your main checkout.
 
 `wt ls` counts `UP` as running/total over every service of a branch (compose containers and live
-`run:` processes, e.g. `2/2`). STATUS shows `degraded` when docker is reachable and a service is
-not running or a health check fails. Piped or redirected output is never wrapped or cut; only a
-terminal gets the fixed-width layout.
+`run:` processes, e.g. `2/2`). STATUS is live: when docker is reachable, it shows `up` when every
+service is running and passes its health check, and `degraded` otherwise. With `--no-probe` only
+the `UP` count decides. Piped or redirected output is never wrapped or cut; only a terminal gets
+the fixed-width layout.
 
 ## `worktree.yaml`
 
@@ -173,6 +181,53 @@ gets the database `shop__feat_cart`.
   `main`) is refused by `up` before anything is created. Rename the branch.
 - Kafka, Redis and Keycloak under `shared:` are validated but ignored until later versions.
 
+## User catalog (`uses:`)
+
+If the same services serve several projects, describe them once in a catalog. By default it is
+`~/.wt/catalog.yaml`; a `catalog:` key in `worktree.yaml` or `WT_CATALOG` points elsewhere.
+Each service lists its `infra` (what it needs, merged into `shared`) and its `consumes` (other
+services whose URL it reads).
+
+```yaml
+# worktree.yaml
+project: notes
+domain: notes.localhost
+catalog: ./catalog.yaml
+uses: [front]                  # back comes in because front consumes it
+```
+
+- A worktree.yaml has either `services:` (as above) or `uses:`, not both.
+- `uses:` plus every service reached through `consumes` make the stack. Repos come from the
+  catalog.
+- `consumes: {back: API_URL}` sets `API_URL` to the back's branch URL and starts the back first.
+- `wt catalog` prints the catalog: service, repo, kind, infra, consumes and consumed by.
+  `wt catalog --check` validates it.
+
+The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-implementation-notes).
+A working example is in [examples/notes](examples/notes/README.md).
+
+## Terminal UI (`wt tui`)
+
+`wt tui` shows the branches of the current project. The left pane lists them with their status,
+the right pane lists the services of the selected branch, and the bottom pane shows the output
+of what you ran.
+
+| Key | Action |
+|---|---|
+| arrows | select a branch or service |
+| `u` | up the selected branch |
+| `n` | up a new branch (asks for its name) |
+| `d` | down the selected branch (asks to confirm; a second confirm offers `--force`) |
+| `l` | tail the selected service's log in the bottom pane |
+| `r` | refresh |
+| `q` | quit |
+
+The list refreshes by itself. Actions run in the background, one at a time; errors show in the
+bottom pane and the app stays open.
+
+A `worktree` command opens the same TUI from any folder. Inside a project it opens that project.
+Outside a project it lists every project wt knows, with their branches.
+
 ## How isolation works
 
 - **Names are derived from (project, branch)**, so the same branch always gets the same
@@ -242,6 +297,19 @@ uv run pytest                # unit tests
 uv run pytest -m docker      # integration tests against a real Docker daemon
 uv run ruff check && uv run ruff format --check && uv run mypy
 ```
+
+## Roadmap
+
+| Version | Scope |
+|---|---|
+| v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
+| v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
+| v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
+| v0.4 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
+| v0.5 | Keycloak provider (SSO across branch subdomains) |
+| later | shared dependency caches, plugin entry points, native Windows |
+
+The full design is in [docs/SPEC.md](docs/SPEC.md).
 
 ## License
 
