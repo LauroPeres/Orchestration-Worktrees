@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import yaml
 
-from wt import router
+from wt import compose, proc, router
 from wt.errors import WtError
 from wt.naming import Names
 
@@ -75,3 +76,22 @@ def test_invalid_port_variable(
     monkeypatch.setenv(var, bad)
     with pytest.raises(WtError, match=var):
         fn()  # type: ignore[operator]
+
+
+def test_ensure_running_streams_only_with_on_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("WT_HOME", str(tmp_path))
+    calls: list[dict[str, object]] = []
+
+    def fake(args: list[str], **kwargs: object) -> proc.Result:
+        calls.append(kwargs)
+        return proc.Result(0, "", "")
+
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    monkeypatch.setattr(proc, "run", fake)
+    router.ensure_running()
+    sink: Callable[[str], None] = print
+    router.ensure_running(on_line=sink)
+    assert calls[0]["capture"] is True and calls[0]["on_line"] is None
+    assert calls[1]["capture"] is False and calls[1]["on_line"] is sink

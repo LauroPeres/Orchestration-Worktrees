@@ -1,6 +1,7 @@
 """Shared Traefik (file provider) and one route file per branch."""
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,7 +90,7 @@ def host_upstream(port: int) -> str:
     return f"http://{HOST_GATEWAY_NAME}:{port}"
 
 
-def ensure_running(timeout: int = 60) -> None:
+def ensure_running(timeout: int = 60, on_line: Callable[[str], None] | None = None) -> None:
     """Start (or update) the shared Traefik. Safe to call on every `up`."""
     folder = traefik_dir()
     dynamic_dir().mkdir(parents=True, exist_ok=True)
@@ -112,6 +113,8 @@ def ensure_running(timeout: int = 60) -> None:
             str(timeout),
         ],
         cwd=folder,
+        capture=on_line is None,
+        on_line=on_line,
     )
 
 
