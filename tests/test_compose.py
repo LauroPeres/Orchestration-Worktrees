@@ -177,5 +177,5 @@ def test_override_publishes_host_port_on_loopback() -> None:
         ["api", "db"], {"api": compose.ServicePatch(publish=(10101, 8080))}
     )
     text = compose.dump(doc)
-    assert "ports: !reset\n    - 127.0.0.1:10101:8080" in text
+    assert "ports: !override\n    - 127.0.0.1:10101:8080" in text
     assert "ports: !reset []" in text  # db keeps today's behavior

@@ -9,13 +9,9 @@ import time
 from collections.abc import Collection, Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 
-from wt import naming
 from wt.errors import WtError
 from wt.state import ProcessState, now
-
-MAX_PORT_TRIES = 100
 
 
 def port_free(port: int) -> bool:
@@ -35,26 +31,14 @@ def tcp_ok(port: int, timeout: float = 1.0) -> bool:
         return False
 
 
-def pick_port(
-    project: str,
-    branch: str,
-    service: str,
-    taken: Collection[int],
-    requested: int | Literal["auto"] = "auto",
-) -> int:
-    """`taken` = ports state records for any other (branch, service)."""
-    if requested != "auto":
-        if requested in taken:
-            raise WtError(f"{service}: port {requested} is already used by another service of wt")
-        if not port_free(requested):
-            raise WtError(f"{service}: port {requested} is in use; free it or change 'port'")
-        return requested
-    first = naming.auto_port(project, branch, service)
-    for offset in range(MAX_PORT_TRIES):
-        candidate = first + offset
-        if candidate <= 65535 and candidate not in taken and port_free(candidate):
-            return candidate
-    raise WtError(f"{service}: no free port in {first}..{first + MAX_PORT_TRIES - 1}")
+def pick_port(service: str, taken: Collection[int], requested: int) -> int:
+    """An explicit `port` of a `run:` service, checked. `taken` = ports state records for any
+    other (branch, service)."""
+    if requested in taken:
+        raise WtError(f"{service}: port {requested} is already used by another service of wt")
+    if not port_free(requested):
+        raise WtError(f"{service}: port {requested} is in use; free it or change 'port'")
+    return requested
 
 
 def start(
