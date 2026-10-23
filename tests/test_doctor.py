@@ -306,3 +306,87 @@ def test_ports_ignore_live_or_portless_processes(monkeypatch: pytest.MonkeyPatch
     _record_process(None)
     monkeypatch.setattr(host, "alive", lambda ps: False)
     assert doctor.check_ports("app") == []
+
+
+def _mounts(monkeypatch: pytest.MonkeyPatch, after_restart: list[str]) -> list[str]:
+    restarts: list[str] = []
+    missing = {"now": ["shop-main.yml"]}
+
+    def restart(*a: object, **k: object) -> None:
+        restarts.append("restart")
+        missing["now"] = after_restart
+
+    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "", ""))
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    monkeypatch.setattr(router, "is_running", lambda: True)
+    monkeypatch.setattr(router, "has_host_gateway", lambda: True)
+    monkeypatch.setattr(router, "missing_in_container", lambda: missing["now"])
+    monkeypatch.setattr(router, "restart", restart)
+    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
+    return restarts
+
+
+def test_mounts_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    restarts = _mounts(monkeypatch, [])
+    monkeypatch.setattr(router, "missing_in_container", lambda: [])
+    assert _by_name(doctor.check_routing(fix=False))["traefik mounts"].level == "ok"
+    assert restarts == []
+
+
+def test_mounts_missing_fails_with_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    restarts = _mounts(monkeypatch, [])
+    check = _by_name(doctor.check_routing(fix=False))["traefik mounts"]
+    assert check.level == "fail"
+    assert "shop-main.yml" in check.detail
+    assert "wt doctor --fix" in check.hint
+    assert restarts == []
+
+
+def test_mounts_fixed_by_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    restarts = _mounts(monkeypatch, [])
+    assert _by_name(doctor.check_routing(fix=True))["traefik mounts"].level == "ok"
+    assert restarts == ["restart"]
+
+
+def test_mounts_still_missing_after_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    restarts = _mounts(monkeypatch, ["shop-main.yml"])
+    check = _by_name(doctor.check_routing(fix=True))["traefik mounts"]
+    assert check.level == "fail"
+    assert restarts == ["restart"]
+
+
+def test_mounts_recreate_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mounts(monkeypatch, [])
+
+    def boom(*a: object, **k: object) -> None:
+        raise WtError("mount source gone")
+
+    monkeypatch.setattr(router, "restart", boom)
+    check = _by_name(doctor.check_routing(fix=True))["traefik mounts"]
+    assert check.level == "fail"
+    assert "mount source gone" in check.detail
+    assert "wt doctor --fix" in check.hint
+
+
+def test_mounts_fix_passes_force_recreate_to_compose(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    _mounts(monkeypatch, [])
+    monkeypatch.undo()
+    state = {"missing": ["shop-main.yml"]}
+
+    def run(args: list[str], **kw: object) -> proc.Result:
+        calls.append(list(args))
+        if args[:2] == ["docker", "compose"]:
+            state["missing"] = []
+        return proc.Result(0, "", "")
+
+    monkeypatch.setattr(proc, "run", run)
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    monkeypatch.setattr(router, "is_running", lambda: True)
+    monkeypatch.setattr(router, "has_host_gateway", lambda: True)
+    monkeypatch.setattr(router, "missing_in_container", lambda: state["missing"])
+    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
+    assert _by_name(doctor.check_routing(fix=True))["traefik mounts"].level == "ok"
+    assert any("--force-recreate" in c for c in calls)
