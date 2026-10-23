@@ -1,14 +1,17 @@
 """Terminal UI: branches, services of the selected branch and a log pane (SPEC §15)."""
 
+from collections.abc import Callable
 from typing import ClassVar, Protocol
 
 from rich.markup import escape
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
-from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView, RichLog
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog
 
 from wt.config import Config
 from wt.errors import WtError
@@ -25,13 +28,68 @@ class OrchestratorLike(Protocol):
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]: ...
 
+    def up(self, branch: str) -> object: ...
+
+    def down(self, branch: str, *, force: bool = False) -> bool: ...
+
 
 def branch_label(row: BranchStatus) -> str:
     return f"{escape(row.branch)}  [dim]{escape(row.status)}[/]"
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no question; dismisses with True on `y`/Enter, False on `n`/Escape."""
+
+    CSS = """
+    ConfirmScreen { align: center middle; }
+    #dialog { width: 60; height: auto; border: thick $primary; padding: 1 2; background: $surface; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y,enter", "answer(True)", "Yes"),
+        Binding("n,escape", "answer(False)", "No"),
+    ]
+
+    def __init__(self, question: str) -> None:
+        super().__init__()
+        self.question = question
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(Text(self.question))
+            yield Label("[dim]y/Enter = yes, n/Esc = no[/]")
+
+    def action_answer(self, value: bool) -> None:
+        self.dismiss(value)
+
+
+class InputScreen(ModalScreen[str | None]):
+    """Single-line prompt; dismisses with the text, or None on Escape."""
+
+    CSS = """
+    InputScreen { align: center middle; }
+    #dialog { width: 60; height: auto; border: thick $primary; padding: 1 2; background: $surface; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(Text(self.prompt))
+            yield Input(id="answer")
+
+    @on(Input.Submitted)
+    def _submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class WtApp(App[None]):
-    """Read-only view of `wt ls`. Actions (up, down, logs) are added as bindings and workers."""
+    """`wt ls` view plus up/down actions (SPEC §15). Logs are added as a later slice."""
 
     TITLE = "wt"
     CSS = """
@@ -41,6 +99,9 @@ class WtApp(App[None]):
     #log { height: 10; border: round $primary; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("u", "up_selected", "Up"),
+        Binding("n", "up_new", "New"),
+        Binding("d", "down_selected", "Down"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
@@ -50,6 +111,7 @@ class WtApp(App[None]):
         self.orch = orch
         self.rows: list[BranchStatus] = []
         self._loading = False
+        self._busy = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -85,6 +147,91 @@ class WtApp(App[None]):
 
     def write_log(self, text: str) -> None:
         self.query_one("#log", RichLog).write(text)
+
+    def log_threadsafe(self, message: str) -> None:
+        """For `Orchestrator.log` (markup): callable from a worker thread."""
+        self.call_from_thread(self.write_log, message)
+
+    def out_threadsafe(self, line: str) -> None:
+        """For `Orchestrator.out` (plain compose/Traefik lines): callable from a worker thread."""
+        self.call_from_thread(self._write_plain, line)
+
+    def _write_plain(self, line: str) -> None:
+        self.query_one("#log", RichLog).write(Text(line))
+
+    # -- actions --------------------------------------------------------------------
+
+    def _guard(self) -> bool:
+        """True when an action may start; otherwise tell the user and return False."""
+        if self._busy:
+            self.write_log("[yellow]busy: wait for the running action to finish[/]")
+            return False
+        return True
+
+    def action_up_selected(self) -> None:
+        branch = self.selected_branch
+        if branch is not None and self._guard():
+            self._start(f"up {branch}", lambda: self.orch.up(branch))
+
+    def action_up_new(self) -> None:
+        if not self._guard():
+            return
+
+        def got(name: str | None) -> None:
+            if name and self._guard():
+                self._start(f"up {name}", lambda: self.orch.up(name))
+
+        self.push_screen(InputScreen("New branch name"), got)
+
+    def action_down_selected(self) -> None:
+        branch = self.selected_branch
+        if branch is None or not self._guard():
+            return
+
+        def confirmed(yes: bool | None) -> None:
+            if yes and self._guard():
+                self._start(
+                    f"down {branch}",
+                    lambda: self.orch.down(branch),
+                    on_error=lambda: self._offer_force(branch),
+                )
+
+        self.push_screen(ConfirmScreen(f"Bring down {branch}?"), confirmed)
+
+    def _offer_force(self, branch: str) -> None:
+        def confirmed(yes: bool | None) -> None:
+            if yes and self._guard():
+                self._start(f"down --force {branch}", lambda: self.orch.down(branch, force=True))
+
+        self.push_screen(ConfirmScreen(f"down {branch} failed. Retry with --force?"), confirmed)
+
+    def _start(
+        self, label: str, call: Callable[[], object], on_error: Callable[[], None] | None = None
+    ) -> None:
+        self._busy = True
+        self.write_log(f"[bold]{escape(label)}[/]")
+        self._run_action(label, call, on_error)
+
+    @work(thread=True, group="action", exit_on_error=False)
+    def _run_action(
+        self, label: str, call: Callable[[], object], on_error: Callable[[], None] | None
+    ) -> None:
+        try:
+            call()
+        except WtError as exc:
+            self.call_from_thread(self._action_done, f"[red]{escape(str(exc))}[/]", on_error)
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            message = f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"
+            self.call_from_thread(self._action_done, message, on_error)
+        else:
+            self.call_from_thread(self._action_done, f"[green]{escape(label)}: done[/]", None)
+
+    def _action_done(self, message: str, on_error: Callable[[], None] | None) -> None:
+        self._busy = False
+        self.write_log(message)
+        self.action_refresh()
+        if on_error is not None:
+            on_error()
 
     # -- refresh --------------------------------------------------------------------
 

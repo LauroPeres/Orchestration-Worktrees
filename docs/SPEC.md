@@ -473,6 +473,10 @@ healthy, up to `timeout`:
 - `run:` service with a `port`: healthy when the port accepts TCP; without a port: healthy when
   the process is alive.
 
+wt waits for a `run:` service to be healthy only when another step needs it; a service nobody
+needs is not waited on (v0.2 behavior). A needed step that is not healthy in time fails `up`
+with "service 'x' is not healthy: ..." and its consumers are not started.
+
 Routes are still written once, after all services. The HTTP probe through Traefik stays in the
 final verify step. A cycle across steps (e.g. through groups) is a WtError before anything starts.
 

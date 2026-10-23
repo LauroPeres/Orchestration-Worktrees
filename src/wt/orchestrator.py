@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from wt import compose, git, health, host, proc, router, tls
 from wt import providers as registry
-from wt.config import LoadedConfig, Service
+from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
 from wt.naming import Names
 from wt.paths import project_dir
@@ -66,6 +66,15 @@ class ComposeGroup:
     services: list[str]  # worktree.yaml service names in this group
 
 
+@dataclass(frozen=True)
+class Step:
+    """One unit of the start plan: a compose group (`group`) or a `run:` service (`service`)."""
+
+    name: str
+    group: ComposeGroup | None = None
+    service: str | None = None
+
+
 class Orchestrator:
     def __init__(
         self, loaded: LoadedConfig, log: Log = print, out: Callable[[str], None] | None = None
@@ -102,6 +111,35 @@ class Orchestrator:
             group = groups.setdefault(svc.repo, ComposeGroup(svc.repo, svc.compose, []))
             group.services.append(name)
         return list(groups.values())
+
+    def start_plan(self) -> tuple[list[Step], dict[str, set[str]]]:
+        """Steps in start order, plus the step names each step waits for (from `needs`).
+
+        Without `needs` the order is compose groups, then run services. A cycle across steps
+        (e.g. through groups) is a WtError.
+        """
+        steps = [Step(f"compose {g.repo}", group=g) for g in self.compose_groups()]
+        steps += [Step(f"run {n}", service=n) for n, s in self.cfg.services.items() if s.run]
+        owner: dict[str, str] = {}
+        for step in steps:
+            for member in step.group.services if step.group else [step.service or ""]:
+                owner[member] = step.name
+        deps: dict[str, set[str]] = {step.name: set() for step in steps}
+        for name, svc in self.cfg.services.items():
+            for need in svc.needs:
+                if owner[need] != owner[name]:
+                    deps[owner[name]].add(owner[need])
+        if cycle := find_cycle({n: sorted(d) for n, d in deps.items()}):
+            raise WtError("services need each other in a cycle: " + " -> ".join(cycle))
+        ordered: list[Step] = []
+        done: set[str] = set()
+        pending = list(steps)
+        while pending:  # stable: the first pending step whose needs are all started
+            step = next(s for s in pending if deps[s.name] <= done)
+            pending.remove(step)
+            ordered.append(step)
+            done.add(step.name)
+        return ordered, deps
 
     def providers(self) -> list[Provider]:
         return registry.active(self.cfg, self.log)
@@ -162,6 +200,7 @@ class Orchestrator:
     def up(self, branch: str, *, build: bool = False, timeout: int = 120) -> list[ServiceReport]:
         git.check_branch_name(branch)
         names = self.names(branch)
+        plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         with self._branch_lock(names):
             # Ports are picked, templates rendered (a typo fails here, before anything is
             # created) and the ports recorded under one lock, so two `up` never pick the same one.
@@ -217,11 +256,18 @@ class Orchestrator:
                         branch, lambda bs: setattr(bs, "cert_files", [str(p) for p in cert])
                     )
 
-                routes = self._up_compose(
-                    branch, names, worktrees, envs, build=build, timeout=timeout
+                routes = self._start_steps(
+                    branch,
+                    names,
+                    plan,
+                    deps,
+                    worktrees,
+                    commands,
+                    envs,
+                    ports,
+                    build=build,
+                    timeout=timeout,
                 )
-
-                routes += self._up_run(branch, names, worktrees, commands, envs, ports)
 
                 if routes:
                     path = router.write_routes(names, routes, cert)
@@ -314,49 +360,83 @@ class Orchestrator:
             ports[name] = host.pick_port(self.cfg.project, branch, name, taken, svc.port)
         return ports
 
-    def _up_run(
+    def _start_steps(
         self,
         branch: str,
         names: Names,
+        plan: list[Step],
+        deps: dict[str, set[str]],
         worktrees: dict[str, Path],
         commands: dict[str, str],
         envs: dict[str, dict[str, str]],
         ports: dict[str, int],
+        *,
+        build: bool,
+        timeout: int,
+    ) -> list[router.Route]:
+        """Start the steps in order; a step that others need must be healthy first."""
+        consumed = set().union(*deps.values())
+        routes: list[router.Route] = []
+        for step in plan:
+            if step.group is not None:  # healthy once `compose up --wait` returned
+                routes += self._up_compose_group(
+                    branch, names, step.group, worktrees, envs, build=build, timeout=timeout
+                )
+            elif step.service is not None:
+                name = step.service
+                routes += self._up_run_service(
+                    branch, names, name, commands[name], worktrees, envs, ports
+                )
+                if step.name in consumed:
+                    ps = self.store.load().branches[branch].processes[name]
+                    report = self._check_process(name, ps, timeout)
+                    if report.outcome != "ok":
+                        raise WtError(f"service {name!r} is not healthy: {report.detail}")
+        return routes
+
+    def _up_run_service(
+        self,
+        branch: str,
+        names: Names,
+        name: str,
+        command: str,
+        worktrees: dict[str, Path],
+        envs: dict[str, dict[str, str]],
+        ports: dict[str, int],
     ) -> list[router.Route]:
         routes: list[router.Route] = []
-        for name, command in commands.items():
-            svc = self.cfg.services[name]
-            recorded = self.store.load().branches[branch].processes.get(name)
-            env_hash = _env_hash(envs[name])
-            live = recorded is not None and host.alive(recorded)
-            if (
-                live
-                and recorded is not None
-                and _same_process(recorded, command, ports.get(name), env_hash)
-            ):
-                self.log(f"process [bold]{name}[/] already running (pid {recorded.pid})")
+        svc = self.cfg.services[name]
+        recorded = self.store.load().branches[branch].processes.get(name)
+        env_hash = _env_hash(envs[name])
+        live = recorded is not None and host.alive(recorded)
+        if (
+            live
+            and recorded is not None
+            and _same_process(recorded, command, ports.get(name), env_hash)
+        ):
+            self.log(f"process [bold]{name}[/] already running (pid {recorded.pid})")
+        else:
+            if live and recorded is not None:
+                self.log(f"restarting process [bold]{name}[/] (command, port or env changed)")
+                host.stop(recorded)
             else:
-                if live and recorded is not None:
-                    self.log(f"restarting process [bold]{name}[/] (command, port or env changed)")
-                    host.stop(recorded)
-                else:
-                    self.log(f"starting process [bold]{name}[/]")
-                ps = host.start(
-                    command,
-                    worktrees[svc.repo],
-                    {**os.environ, **envs[name]},
-                    self.log_path(names, name),
-                    ports.get(name),
-                ).model_copy(update={"env_hash": env_hash})
+                self.log(f"starting process [bold]{name}[/]")
+            ps = host.start(
+                command,
+                worktrees[svc.repo],
+                {**os.environ, **envs[name]},
+                self.log_path(names, name),
+                ports.get(name),
+            ).model_copy(update={"env_hash": env_hash})
 
-                def record(bs: BranchState, n: str = name, ps: ProcessState = ps) -> None:
-                    bs.processes[n] = ps
+            def record(bs: BranchState, n: str = name, ps: ProcessState = ps) -> None:
+                bs.processes[n] = ps
 
-                self._record(branch, record)
-            if svc.subdomain is not None and name in ports:
-                routes.append(
-                    router.Route(name, names.host(svc.subdomain), router.host_upstream(ports[name]))
-                )
+            self._record(branch, record)
+        if svc.subdomain is not None and name in ports:
+            routes.append(
+                router.Route(name, names.host(svc.subdomain), router.host_upstream(ports[name]))
+            )
         return routes
 
     def _ensure_route_visible(self, route: Path) -> None:
@@ -411,10 +491,11 @@ class Orchestrator:
             self._record(branch, change)
         return worktrees
 
-    def _up_compose(
+    def _up_compose_group(
         self,
         branch: str,
         names: Names,
+        group: ComposeGroup,
         worktrees: dict[str, Path],
         envs: dict[str, dict[str, str]],
         *,
@@ -422,45 +503,44 @@ class Orchestrator:
         timeout: int,
     ) -> list[router.Route]:
         routes: list[router.Route] = []
-        for group in self.compose_groups():
-            compose_file = worktrees[group.repo] / group.file
-            if not compose_file.is_file():
-                raise WtError(f"compose file not found: {compose_file}")
-            available = compose.list_services(compose_file)
-            patches: dict[str, compose.ServicePatch] = {}
-            for name in group.services:
-                svc = self.cfg.services[name]
-                target = svc.compose_service or name
-                if target not in available:
-                    raise WtError(
-                        f"service {name!r}: {group.file} has no service {target!r} "
-                        f"(found: {', '.join(available)}); set 'compose_service'"
-                    )
-                alias = names.network_alias(name) if svc.subdomain is not None else None
-                patches[target] = compose.ServicePatch(
-                    alias=alias, env=envs[name], network=bool(self.providers())
+        compose_file = worktrees[group.repo] / group.file
+        if not compose_file.is_file():
+            raise WtError(f"compose file not found: {compose_file}")
+        available = compose.list_services(compose_file)
+        patches: dict[str, compose.ServicePatch] = {}
+        for name in group.services:
+            svc = self.cfg.services[name]
+            target = svc.compose_service or name
+            if target not in available:
+                raise WtError(
+                    f"service {name!r}: {group.file} has no service {target!r} "
+                    f"(found: {', '.join(available)}); set 'compose_service'"
                 )
-                if alias and svc.subdomain is not None:
-                    routes.append(
-                        router.Route(name, names.host(svc.subdomain), f"http://{alias}:{svc.port}")
-                    )
-            override = self.branch_dir(names) / f"{group.repo}.override.yml"
-            atomic_write(override, compose.dump(compose.build_override(available, patches)))
-            project = names.compose_project(group.repo)
-
-            def record(bs: BranchState, repo: str = group.repo, project: str = project) -> None:
-                bs.compose_projects[repo] = project
-
-            self._record(branch, record)
-            self.log(f"compose up [bold]{project}[/]")
-            compose.up(
-                project,
-                [compose_file, override],
-                cwd=compose_file.parent,
-                build=build,
-                timeout=timeout,
-                on_line=self.out,
+            alias = names.network_alias(name) if svc.subdomain is not None else None
+            patches[target] = compose.ServicePatch(
+                alias=alias, env=envs[name], network=bool(self.providers())
             )
+            if alias and svc.subdomain is not None:
+                routes.append(
+                    router.Route(name, names.host(svc.subdomain), f"http://{alias}:{svc.port}")
+                )
+        override = self.branch_dir(names) / f"{group.repo}.override.yml"
+        atomic_write(override, compose.dump(compose.build_override(available, patches)))
+        project = names.compose_project(group.repo)
+
+        def record(bs: BranchState, repo: str = group.repo, project: str = project) -> None:
+            bs.compose_projects[repo] = project
+
+        self._record(branch, record)
+        self.log(f"compose up [bold]{project}[/]")
+        compose.up(
+            project,
+            [compose_file, override],
+            cwd=compose_file.parent,
+            build=build,
+            timeout=timeout,
+            on_line=self.out,
+        )
         return routes
 
     def _verify(self, branch: str, names: Names, *, timeout: float) -> list[ServiceReport]:
