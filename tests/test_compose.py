@@ -170,3 +170,12 @@ def test_up_without_on_line_prints_to_terminal(
     calls = _record(monkeypatch)
     compose.up("p", [tmp_path / "c.yaml"], cwd=tmp_path, build=False, timeout=9)
     assert calls[0][1].get("on_line") is None
+
+
+def test_override_publishes_host_port_on_loopback() -> None:
+    doc = compose.build_override(
+        ["api", "db"], {"api": compose.ServicePatch(publish=(10101, 8080))}
+    )
+    text = compose.dump(doc)
+    assert "ports: !reset\n    - 127.0.0.1:10101:8080" in text
+    assert "ports: !reset []" in text  # db keeps today's behavior
