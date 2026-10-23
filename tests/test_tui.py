@@ -231,8 +231,8 @@ def test_all_projects_names_and_add_uses_selected_project() -> None:
         app = WtApp(projects=discover)
         async with app.run_test() as pilot:
             await settle(pilot)
-            assert [c[0] for c in cells(app)] == [
-                "gone", "notes/main", "shop/feat-a", "shop/main",
+            assert [c[:2] for c in cells(app)] == [
+                ["gone", "-"], ["notes", "main"], ["shop", "feat-a"], ["shop", "main"],
             ]  # fmt: skip
             await pilot.press("down", "down", "a", *"zz", "enter")
             await settle(pilot)

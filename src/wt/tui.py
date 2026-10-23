@@ -99,7 +99,7 @@ class ServicesScreen(Screen[None]):
     """Repos of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
 
     CSS = """
-    ServicesScreen { background: transparent; }
+    ServicesScreen { background: $background; }  /* opaque: hide the main table's actions */
     #services { height: auto; max-height: 1fr; border: solid $foreground; background: transparent; }
     #services:focus { border: solid $foreground; background-tint: transparent; }
     DataTable > .datatable--header { text-style: bold; background: transparent; }
@@ -529,13 +529,16 @@ class WtApp(App[None]):
             self.rows = rows
             table.clear()
             multi = self.orch is None
+            if multi and len(table.columns) == 2:  # all projects: the project gets its own column
+                table.clear(columns=True)
+                table.add_columns("PROJECT", "NAME", "STATUS")
             for r in rows:
+                cells: tuple[Text, ...]
                 if r.status is not None:
-                    name = f"{r.project}/{r.status.branch}" if multi else r.status.branch
-                    cells = (Text(name), state_text(r.status.status))
+                    cells = (Text(r.status.branch), state_text(r.status.status))
                 else:
-                    cells = (Text(r.project), Text(r.note))
-                table.add_row(*cells, key=r.key)
+                    cells = (Text("-"), Text(r.note))
+                table.add_row(*((Text(r.project), *cells) if multi else cells), key=r.key)
             keys = [r.key for r in rows]
             if previous is not None and previous.key in keys:
                 table.move_cursor(row=keys.index(previous.key))
