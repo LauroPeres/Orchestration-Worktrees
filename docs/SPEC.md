@@ -526,3 +526,42 @@ final verify step. A cycle across steps (e.g. through groups) is a WtError befor
 **ls status.** The `degraded` rule in D13 (§14) is replaced: when docker is reachable and the
 stored status is `up` or `degraded`, STATUS is `up` if `UP` equals its total and no health probe
 failed, else `degraded`. `creating`, `removing` and `failed` are shown as stored.
+
+## 16. v0.3: worktree lifecycle and the table TUI
+
+Agreed with the user after the first TUI. Replaces the TUI layout and keys of §15; the
+`worktree` command and its project discovery stay.
+
+**Lifecycle.** Besides `up` and `down`, a worktree (branch) can be added, stopped and removed.
+
+| Command | What it does | Keeps |
+|---|---|---|
+| `wt add <branch>` | Pre-flight (as `up`), git worktrees for every repo, reserved ports; state entry with status `stopped`. No containers, databases, routes or certs. Already in state: no-op with a note. | — |
+| `wt up <branch>` | As today. On a `stopped` branch it reuses its worktrees, ports and databases. | — |
+| `wt stop <branch>` | Stops the host processes and runs `docker compose down` (no `-v`) for each compose project of the branch; removes its route file. Status `stopped`. Not in state: error. | worktrees, volumes, databases, ports, cert |
+| `wt down <branch>` | As today (removes everything wt created, keeps the git branch). | git branch |
+| `wt remove <branch> [--force] [--yes]` | Hard delete: everything `down` does, then `git branch -D <branch>` in every repo. Asks for confirmation unless `--yes`. | nothing |
+
+- `remove` never deletes a protected branch: the Postgres `base_branch` (default `main`) and the
+  branch checked out in each repo's main folder. It never deletes a branch that is checked out in
+  a folder wt did not create. In those cases it does `down` and keeps the branch, with a note.
+- `--force` works as in `down` (dirty worktrees are removed).
+- State: status gains `stopped`. `ls` shows `stopped` as stored (like `creating`).
+- `BranchStatus` (the `ls()` rows) gains `ports: list[int]`, the reserved host ports of the branch
+  (`BranchState.ports`), sorted.
+
+**TUI (table).** `wt tui` and `worktree` open the same compact, monochrome screen (no colors):
+- One table, one row per worktree, columns `NAME`, `STATUS`, `PORT`. `PORT` is the reserved host
+  ports joined with `, `, or `-`. Outside a project (all projects) `NAME` is `<project>/<branch>`.
+- Below the table, one line with the actions: `u up  d down  a add  r remove  q quit`, and one
+  message line with the last log line or error of the running action.
+- `u` = `up` of the selected row. `d` = `stop` (services down, worktree kept). `a` = an input box
+  for the new worktree name, then `add` in the current project (outside a project: the project of
+  the selected row). `r` = a confirm box (`remove <branch>: deletes its containers, volumes,
+  databases, worktrees and the git branch; unpushed commits are lost. Remove? y/N`), then `remove`
+  with `--force`. Arrows select, `q` quits.
+- One action at a time, in a worker thread; keys pressed while busy show a note on the message
+  line. The table refreshes every 2 s and after each action.
+- Removed for now: services pane, log pane, `l` (logs), `n`, the refresh key, colors.
+- Later (not now): the front of a worktree gets a default URL built from the repo and worktree
+  name.
