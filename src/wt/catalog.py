@@ -9,7 +9,7 @@ from typing import Any, Self
 import yaml
 from pydantic import Field, ValidationError, model_validator
 
-from wt.config import NAME, Service, Shared, Strict, _format_errors, find_cycle
+from wt.config import MAX_SERVICES, NAME, Service, Shared, Strict, _format_errors, find_cycle
 from wt.errors import WtError
 from wt.paths import wt_home
 
@@ -158,10 +158,13 @@ def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any
     return merged
 
 
-def resolve(raw: dict[str, Any], config_path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+def resolve(
+    raw: dict[str, Any], config_path: Path
+) -> tuple[dict[str, Any], dict[str, str], tuple[str, ...]]:
     """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
 
-    Also returns the remote URL of every catalog service that is not selected ("" if none).
+    Also returns the remote URL of every catalog service that is not selected ("" if none), and
+    the catalog's service names in catalog order (the service index follows it).
     """
     if "services" in raw:
         raise WtError("set exactly one of 'services' or 'uses', not both")
@@ -174,6 +177,8 @@ def resolve(raw: dict[str, Any], config_path: Path) -> tuple[dict[str, Any], dic
         raise WtError("'repos' cannot be set with 'uses'; repos come from the catalog")
     loaded = load_catalog(catalog_path(raw.get("catalog"), config_path.parent))
     catalog = loaded.catalog
+    if len(catalog.services) > MAX_SERVICES:
+        raise WtError(f"the catalog has {len(catalog.services)} services; at most 100 services")
     for name in uses:
         if name not in catalog.services:
             raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
@@ -211,4 +216,4 @@ def resolve(raw: dict[str, Any], config_path: Path) -> tuple[dict[str, Any], dic
     if shared:
         out["shared"] = shared
     remotes = {n: s.remote or "" for n, s in catalog.services.items() if n not in chosen}
-    return out, remotes
+    return out, remotes, tuple(catalog.services)
