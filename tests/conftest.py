@@ -104,6 +104,7 @@ class FakeDocker:
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(router, "ensure_running", lambda timeout=60, on_line=None: None)
         monkeypatch.setattr(router, "is_running", lambda: self.traefik_running)
+        monkeypatch.setattr(router, "missing_in_container", lambda: [])
         monkeypatch.setattr(tls, "available", lambda: False)
         monkeypatch.setattr(compose, "list_services", lambda f: ["api", "db"])
         monkeypatch.setattr(compose, "up", self.up)
@@ -137,6 +138,7 @@ def orch(make_repo, tmp_path: Path):
         env: dict[str, str] | None = None,
         shared: dict[str, object] | None = None,
         extra_services: dict[str, object] | None = None,
+        extra_needs: dict[str, list[str]] | None = None,
     ) -> Orchestrator:
         if not (tmp_path / "shop-api").exists():  # a test may build a second config
             make_repo("shop-api", {"docker-compose.yml": COMPOSE})
@@ -157,6 +159,8 @@ def orch(make_repo, tmp_path: Path):
             },
             **({"shared": shared} if shared else {}),
         }
+        for name, needs in (extra_needs or {}).items():
+            config["services"][name]["needs"] = needs  # type: ignore[index]
         path = tmp_path / "worktree.yaml"
         path.write_text(yaml.safe_dump(config))
         return Orchestrator(load_config(path), log=lambda m: None)

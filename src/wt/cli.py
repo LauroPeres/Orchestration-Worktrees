@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
 from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
 from wt import __version__, doctor
+from wt.catalog import catalog_path, load_catalog, rows
 from wt.config import CONFIG_NAME, STARTER, LoadedConfig, find_config, load_config
 from wt.errors import WtError
 from wt.naming import slugify
@@ -260,6 +262,45 @@ def tui(ctx: typer.Context) -> None:
     )
     tui_app = WtApp(orch)
     tui_app.run()
+
+
+@app.command()
+def catalog(
+    ctx: typer.Context,
+    check: Annotated[bool, typer.Option("--check", help="Validate the catalog and exit.")] = False,
+) -> None:
+    """Show the user catalog (services, repos, infra, who consumes whom)."""
+    config = _config_path(ctx)
+    explicit = None
+    if config is not None:
+        try:
+            raw = yaml.safe_load(config.read_text())
+        except (OSError, yaml.YAMLError):
+            raw = None  # a broken worktree.yaml is not this command's problem
+        value = raw.get("catalog") if isinstance(raw, dict) else None
+        explicit = value if isinstance(value, str) else None
+    path = catalog_path(explicit, config.parent if config else None)
+    if check:
+        try:
+            loaded = load_catalog(path)
+        except WtError as exc:
+            console.print(f"[red]catalog invalid:[/] {escape(str(exc))}")
+            raise typer.Exit(1) from None
+        console.print(f"[green]catalog ok:[/] {escape(str(loaded.path))}")
+        return
+    table = Table(box=None, pad_edge=False)
+    for col in ("SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED BY"):
+        table.add_column(col, overflow="fold", no_wrap=True)
+    for row in rows(load_catalog(path).catalog):
+        table.add_row(
+            row.service,
+            row.repo,
+            row.kind,
+            ", ".join(row.infra) or "-",
+            ", ".join(row.consumes) or "-",
+            ", ".join(row.consumed_by) or "-",
+        )
+    console.print(table)
 
 
 def main() -> None:
