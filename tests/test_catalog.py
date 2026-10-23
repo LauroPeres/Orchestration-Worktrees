@@ -245,3 +245,14 @@ def test_diamond_consumes_has_no_duplicates(tmp_path: Path) -> None:
     assert cfg.services["top"].needs == ["left", "right"]
     assert cfg.services["left"].needs == ["base"]
     assert list(cfg.repos) == ["r"]
+
+
+def test_rows(tmp_path: Path) -> None:
+    from wt.catalog import rows
+
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    result = rows(load_catalog(tmp_path / "catalog.yaml").catalog)
+    assert [(r.service, r.repo, r.kind, r.infra, r.consumes, r.consumed_by) for r in result] == [
+        ("back", "notes-back", "compose", ["postgres"], [], ["front"]),
+        ("front", "notes-front", "run", [], ["back"], []),
+    ]

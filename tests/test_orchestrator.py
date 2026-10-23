@@ -208,6 +208,21 @@ def test_logs_of_run_service_tails_the_log(run_orch, monkeypatch: pytest.MonkeyP
     assert calls[0][1].get("capture") is False
 
 
+def test_log_command_for_run_and_compose_services(run_orch, orch, docker: FakeDocker) -> None:
+    o = run_orch()
+    o.up("main")
+    log = o.store.load().branches["main"].processes["web"].log
+    assert o.log_command("main", "web", follow=True, tail=5) == ["tail", "-n", "5", "-f", log]
+    c = orch()
+    c.up("feat/cart")
+    args = c.log_command("feat/cart", "api", follow=False, tail=9)
+    assert args[:2] == ["docker", "compose"]
+    assert args[-4:-1] == ["logs", "--tail", "9"]
+    assert args[-1] == "api"
+    assert "-f" not in c.log_command("feat/cart", "api", follow=False, tail=9)
+    assert "-f" in c.log_command("feat/cart", "api", follow=True, tail=9)
+
+
 def test_logs_of_run_service_without_log_file(run_orch) -> None:
     o = run_orch()
     o.up("main")

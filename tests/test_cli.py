@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.conftest import SHARED, FakeDocker
-from wt import __version__, cli, compose, host
+from wt import __version__, cli, compose, host, proc
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
@@ -88,19 +88,22 @@ def test_up_degraded_exits_1(
 def test_logs_passes_options(
     orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[str, str, bool, int]] = []
+    calls: list[list[str]] = []
 
-    def fake_logs(project: str, service: str, *, follow: bool, tail: int) -> None:
-        calls.append((project, service, follow, tail))
+    def fake_run(args: list[str], **kw: object) -> proc.Result:
+        calls.append(args)
+        return proc.Result(0, "", "")
 
-    monkeypatch.setattr(compose, "logs", fake_logs)
     orch()
     runner.invoke(app, [*_cfg(tmp_path), "up", "feat/cart"])
+    monkeypatch.setattr(proc, "run", fake_run)
     result = runner.invoke(
         app, [*_cfg(tmp_path), "logs", "feat/cart", "api", "--no-follow", "--tail", "5"]
     )
     assert result.exit_code == 0, result.output
-    assert calls == [("wt-shop-feat-cart-api", "api", False, 5)]
+    assert calls == [
+        ["docker", "compose", "-p", "wt-shop-feat-cart-api", "logs", "--tail", "5", "api"]
+    ]
 
 
 def test_logs_of_branch_not_up_fails(orch, docker: FakeDocker, tmp_path: Path) -> None:
@@ -250,3 +253,68 @@ def test_ls_piped_keeps_each_row_on_one_line(orch, docker: FakeDocker, tmp_path:
     lines = [ln for ln in listed.output.splitlines() if "feat/cart" in ln or "https://" in ln]
     assert len(lines) == 1
     assert "https://api.feat-cart.shop.localhost" in lines[0]
+
+
+CATALOG = """\
+repos:
+  notes-back: ./back
+  notes-front: ./front
+services:
+  back:
+    repo: notes-back
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+    infra:
+      postgres: {databases: [notes]}
+  front:
+    repo: notes-front
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    consumes:
+      back: API_URL
+"""
+
+
+def test_catalog_table_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split() == ["SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED", "BY"]
+    assert lines[1].split() == ["back", "notes-back", "compose", "postgres", "-", "front"]
+    assert lines[2].split() == ["front", "notes-front", "run", "-", "back", "-"]
+
+
+def test_catalog_uses_worktree_yaml_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "mine.yaml").write_text(CATALOG)
+    (tmp_path / "worktree.yaml").write_text(
+        "project: notes\ndomain: notes.localhost\ncatalog: ./mine.yaml\nuses: [front]\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "missing.yaml"))
+    result = runner.invoke(app, ["catalog", "--check"])
+    assert result.exit_code == 0, result.output
+    assert f"catalog ok: {tmp_path / 'mine.yaml'}" in result.output
+
+
+def test_catalog_check_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG.replace("repo: notes-front", "repo: nope"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog", "--check"])
+    assert result.exit_code == 1
+    assert "unknown repo 'nope'" in result.output
+
+
+def test_catalog_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "none.yaml"))
+    result = runner.invoke(app, ["catalog"])
+    assert isinstance(result.exception, WtError)
+    assert "catalog not found" in str(result.exception)

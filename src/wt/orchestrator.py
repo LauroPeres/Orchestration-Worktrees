@@ -764,7 +764,8 @@ class Orchestrator:
         with ThreadPoolExecutor(max_workers=8) as pool:
             return list(pool.map(status, state.branches.values()))
 
-    def logs(self, branch: str, service: str, *, follow: bool = True, tail: int = 200) -> None:
+    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
+        """Command that prints (and optionally follows) a service's log."""
         svc = self.cfg.services.get(service)
         if svc is None:
             raise WtError(f"unknown service {service!r} (known: {', '.join(self.cfg.services)})")
@@ -775,15 +776,17 @@ class Orchestrator:
             path = self.log_path(names, service)
             if not path.is_file():
                 raise WtError(f"no log yet for {service} on {branch}")
-            args = ["tail", "-n", str(tail), *(["-f"] if follow else []), str(path)]
-            proc.run(args, capture=False, check=False)
-            return
-        compose.logs(
+            return ["tail", "-n", str(tail), *(["-f"] if follow else []), str(path)]
+        return compose.logs_command(
             names.compose_project(svc.repo),
             svc.compose_service or service,
             follow=follow,
             tail=tail,
         )
+
+    def logs(self, branch: str, service: str, *, follow: bool = True, tail: int = 200) -> None:
+        args = self.log_command(branch, service, follow=follow, tail=tail)
+        proc.run(args, capture=False, check=False)
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:

@@ -133,11 +133,11 @@ def ps(project: str) -> list[Container]:
     return [Container(r.get("Service", ""), r.get("State", ""), r.get("Health", "")) for r in rows]
 
 
-def logs(project: str, service: str, *, follow: bool, tail: int) -> None:
+def logs_command(project: str, service: str, *, follow: bool, tail: int) -> list[str]:
     args = ["docker", "compose", "-p", project, "logs", "--tail", str(tail)]
     if follow:
         args.append("-f")
-    proc.run([*args, service], capture=False, check=False)
+    return [*args, service]
 
 
 def ensure_network() -> None:
