@@ -1,5 +1,6 @@
 """wt command line."""
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
 
@@ -250,18 +251,62 @@ def doctor_(
         raise typer.Exit(1)
 
 
+def open_tui(config: Path | None) -> None:
+    """Open the TUI: the project of `config` (or of the cwd), else every project wt knows."""
+    from wt.projects import known_projects  # imported here so other commands start fast
+    from wt.tui import OrchestratorLike, ProjectEntry, WtApp
+
+    def build(path: Path) -> Orchestrator:
+        return Orchestrator(
+            load_config(path),
+            log=lambda message: tui_app.log_threadsafe(message),
+            out=lambda line: tui_app.out_threadsafe(line),
+        )
+
+    path = config or find_config(Path.cwd())
+    if path is not None:
+        tui_app = WtApp(build(path))
+    else:
+        built: dict[str, Orchestrator] = {}
+
+        def lazy(name: str, config_path: Path) -> Callable[[], OrchestratorLike]:
+            def get() -> Orchestrator:
+                if name not in built:
+                    built[name] = build(config_path)
+                return built[name]
+
+            return get
+
+        def discover() -> list[ProjectEntry]:
+            return [
+                ProjectEntry(p.name, lazy(p.name, p.config_path), "")
+                if p.config_path is not None and p.config_exists
+                else ProjectEntry(p.name, None, f"config not found: {p.config_path or 'unknown'}")
+                for p in known_projects()
+            ]
+
+        tui_app = WtApp(projects=discover)
+    tui_app.run()
+
+
 @app.command()
 def tui(ctx: typer.Context) -> None:
-    """Open the terminal UI (branches, services, logs)."""
-    from wt.tui import WtApp  # imported here so other commands start fast
+    """Open the terminal UI (branches, services, logs). Outside a project: all projects."""
+    open_tui(ctx.obj)
 
-    orch = Orchestrator(
-        _load(ctx),
-        log=lambda message: tui_app.log_threadsafe(message),
-        out=lambda line: tui_app.out_threadsafe(line),
-    )
-    tui_app = WtApp(orch)
-    tui_app.run()
+
+worktree_app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
+
+
+@worktree_app.command()
+def worktree_command(
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", "-c", envvar="WT_CONFIG", help=f"Path to {CONFIG_NAME}."),
+    ] = None,
+) -> None:
+    """Open the terminal UI: this project, or every project wt knows when run outside one."""
+    open_tui(config)
 
 
 @app.command()
@@ -304,8 +349,16 @@ def catalog(
 
 
 def main() -> None:
+    _run(app)
+
+
+def worktree_main() -> None:
+    _run(worktree_app)
+
+
+def _run(entry: typer.Typer) -> None:
     try:
-        app()
+        entry()
     except WtError as exc:
         err.print(f"[red]error:[/] {escape(str(exc))}")
         raise SystemExit(1) from None

@@ -497,6 +497,20 @@ final verify step. A cycle across steps (e.g. through groups) is a WtError befor
 - Tests: Textual `App.run_test()` pilot with a fake orchestrator, run with `asyncio.run(...)`
   (no pytest-asyncio, no Docker).
 
+**`worktree` command (opens the TUI from any folder).** A second console script, `worktree`
+(`wt.cli:worktree_main`, same `--config`/`WT_CONFIG` option), shares its entry with `wt tui`.
+- Inside a project (a `worktree.yaml` found from the cwd, or `--config`): the TUI of that project,
+  as above.
+- Outside a project: the left pane is a tree, project header then its branches. Projects come from
+  `$WT_HOME/<project>/state.json` (`src/wt/projects.py`), sorted by name, re-read on every refresh.
+  A project with no branches, or whose state file is unreadable, is skipped. Its `config_path`
+  gives its config; each project gets its own `Orchestrator`, built lazily on first use.
+- A project whose config file is gone (or never recorded) is shown greyed with a note
+  (`config not found: <path>`) and no branches; `u`, `n`, `d` on it only print the note.
+  A project whose `ls()` fails shows the error on its header; the others keep working.
+- `u`, `d`, `l` act on the selected branch's project; `n` on the project of the selected header or
+  branch. The services pane shows the selected branch only.
+
 **Stale Traefik mounts.** After a Docker Desktop restart, Traefik can see empty
 `/etc/traefik/dynamic` and `/etc/traefik/certs`, so every route returns 404.
 - `doctor` check `traefik mounts`: compares the file names in the host `dynamic/` and `certs/`

@@ -1,6 +1,7 @@
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -318,3 +319,45 @@ def test_catalog_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     result = runner.invoke(app, ["catalog"])
     assert isinstance(result.exception, WtError)
     assert "catalog not found" in str(result.exception)
+
+
+def _capture_tui(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    from wt.tui import WtApp
+
+    opened: list[Any] = []
+    monkeypatch.setattr(WtApp, "run", lambda self, *a, **k: opened.append(self))
+    return opened
+
+
+def test_tui_inside_project_opens_it(orch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    orch()
+    opened = _capture_tui(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.worktree_app, [])
+    assert result.exit_code == 0, result.output
+    assert opened[0].orch is not None
+    assert opened[0].orch.cfg.project
+
+
+def test_tui_outside_project_lists_known_projects(
+    orch, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wt.state import BranchState, StateStore
+
+    orch()
+    for name, config in (("live", tmp_path / "worktree.yaml"), ("gone", tmp_path / "nope.yaml")):
+        with StateStore(name).edit() as state:
+            state.config_path = str(config)
+            state.branches["main"] = BranchState(branch="main", slug="main")
+    opened = _capture_tui(monkeypatch)
+    elsewhere = tmp_path_factory.mktemp("elsewhere")
+    monkeypatch.chdir(elsewhere)
+    result = runner.invoke(app, ["tui"])
+    assert result.exit_code == 0, result.output
+    app_ = opened[0]
+    assert app_.orch is None
+    entries = {e.name: e for e in app_._discover()}
+    assert set(entries) == {"live", "gone"}
+    assert entries["gone"].orch is None and "nope.yaml" in entries["gone"].note
+    live = entries["live"].orch
+    assert live is not None and live() is live()  # built once, lazily
