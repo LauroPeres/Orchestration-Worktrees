@@ -13,7 +13,7 @@ from wt.tui import CONFIRM_REMOVE, ProjectEntry, WtApp
 def status(branch: str, state: str, ports: list[int] | None = None) -> BranchStatus:
     row = BranchStatus(branch, state, 0, 0)
     if ports is not None:
-        row.ports = ports  # type: ignore[attr-defined]
+        row.ports = ports
     return row
 
 
