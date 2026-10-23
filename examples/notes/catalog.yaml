@@ -8,6 +8,7 @@ services:
     compose_service: api         # the service is called `api` in the compose file
     port: 8000
     subdomain: api
+    remote: https://api.staging.notes.example   # used when the back is not selected
     health: /healthz
     infra:
       postgres: {databases: [notes]}

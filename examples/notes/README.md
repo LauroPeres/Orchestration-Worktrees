@@ -2,8 +2,8 @@
 
 A small notes app split in two repos: `notes-back` (an HTTP API in Docker with a Postgres
 database) and `notes-front` (a host process serving one page). The two are described in a
-catalog, and the worktree only says `uses: [front]`: the back comes in because the front
-consumes it. Each branch gets its own front, back and database. `feat/tags` adds a `tags`
+catalog, and the worktree says `uses: [front, back]` (exactly what runs). The catalog gives the
+back a `remote:` URL, which the front would get as `API_URL` if the back were not selected. Each branch gets its own front, back and database. `feat/tags` adds a `tags`
 column to the back. Everything here is fictional.
 
 ## Prerequisites

@@ -266,6 +266,7 @@ services:
     compose: docker-compose.yml
     port: 8000
     subdomain: api
+    remote: https://api.staging.example
     infra:
       postgres: {databases: [notes]}
   front:
