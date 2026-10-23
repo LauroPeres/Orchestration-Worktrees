@@ -491,7 +491,7 @@ class WtApp(App[None]):
     def _collect(self) -> list[Row]:
         if self.orch is not None:
             rows = sorted(self.orch.ls(probe=True), key=lambda r: r.branch)
-            return [Row(self.orch.cfg.project, r) for r in rows]
+            return [Row(self.orch.cfg.project, r) for r in rows if not r.main_checkout]
         assert self._discover is not None
         entries = sorted(self._discover(), key=lambda e: e.name)
         self._entries = {e.name: e for e in entries}
@@ -505,7 +505,8 @@ class WtApp(App[None]):
             except WtError as exc:
                 result.append(Row(entry.name, note=str(exc).splitlines()[0]))
                 continue
-            result.extend(Row(entry.name, s) for s in statuses)
+            # Only the worktrees wt created; the repos' own checkout (main) is not listed.
+            result.extend(Row(entry.name, s) for s in statuses if not s.main_checkout)
         return result
 
     @work(thread=True, group="refresh")
@@ -528,17 +529,12 @@ class WtApp(App[None]):
             previous = self.selected_row
             self.rows = rows
             table.clear()
-            multi = self.orch is None
-            if multi and len(table.columns) == 2:  # all projects: the project gets its own column
-                table.clear(columns=True)
-                table.add_columns("PROJECT", "NAME", "STATUS")
             for r in rows:
-                cells: tuple[Text, ...]
                 if r.status is not None:
                     cells = (Text(r.status.branch), state_text(r.status.status))
                 else:
-                    cells = (Text("-"), Text(r.note))
-                table.add_row(*((Text(r.project), *cells) if multi else cells), key=r.key)
+                    cells = (Text(r.project), Text(r.note))
+                table.add_row(*cells, key=r.key)
             keys = [r.key for r in rows]
             if previous is not None and previous.key in keys:
                 table.move_cursor(row=keys.index(previous.key))

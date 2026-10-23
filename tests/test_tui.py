@@ -231,9 +231,7 @@ def test_all_projects_names_and_add_uses_selected_project() -> None:
         app = WtApp(projects=discover)
         async with app.run_test() as pilot:
             await settle(pilot)
-            assert [c[:2] for c in cells(app)] == [
-                ["gone", "-"], ["notes", "main"], ["shop", "feat-a"], ["shop", "main"],
-            ]  # fmt: skip
+            assert [c[0] for c in cells(app)] == ["gone", "main", "feat-a", "main"]
             await pilot.press("down", "down", "a", *"zz", "enter")
             await settle(pilot)
             assert shop.calls == [("add", "zz")]
@@ -449,5 +447,18 @@ def test_configure_is_blocked_while_an_action_runs() -> None:
             assert "busy" in str(app.screen.query_one("#message", Static).render())
             orch.gate.set()
             await settle(pilot)
+
+    asyncio.run(scenario())
+
+
+def test_the_repos_own_checkout_is_not_listed() -> None:
+    main = BranchStatus("main", "up", 1, 1, main_checkout=True)
+    feat = BranchStatus("feat-a", "up", 1, 1)
+
+    async def scenario() -> None:
+        app = WtApp(FakeOrch(rows=[main, feat]))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert [c[0] for c in cells(app)] == ["feat-a"]
 
     asyncio.run(scenario())
