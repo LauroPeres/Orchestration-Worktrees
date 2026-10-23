@@ -248,6 +248,14 @@ def doctor_(
         raise typer.Exit(1)
 
 
+@app.command()
+def tui(ctx: typer.Context) -> None:
+    """Open the terminal UI (branches, services, logs)."""
+    from wt.tui import WtApp  # imported here so other commands start fast
+
+    WtApp(Orchestrator(_load(ctx), log=_log)).run()
+
+
 def main() -> None:
     try:
         app()
