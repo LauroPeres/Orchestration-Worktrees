@@ -127,7 +127,7 @@ def check_routing(fix: bool) -> list[Check]:
     ports_taken = _port_in_use(router.http_port()) or _port_in_use(router.https_port())
     if not running and fix and not ports_taken:
         with file_lock("traefik"):
-            router.ensure_running()
+            router.ensure_running(force_recreate=True)  # an Exited one may hold a stale mount
         running = router.is_running()
     stale = running and not router.has_host_gateway()
     if stale and fix:
@@ -152,6 +152,8 @@ def check_routing(fix: bool) -> list[Check]:
                 "" if running else "started on first `wt up` (or `wt doctor --fix`)",
             )
         )
+    if running:
+        checks.append(_check_mounts(fix))
     mapped = _traefik_ports() if running else ""
     for label, port, env in [
         ("http port", router.http_port(), "WT_HTTP_PORT"),
@@ -171,6 +173,34 @@ def check_routing(fix: bool) -> list[Check]:
         else:
             checks.append(Check(label, "ok", f"{port} free"))
     return checks
+
+
+_MOUNTS_HINT = "run `wt doctor --fix` (recreates the container)"
+
+
+def _check_mounts(fix: bool) -> Check:
+    missing = router.missing_in_container()
+    if missing and fix:
+        try:
+            with file_lock("traefik"):
+                router.restart()
+        except WtError as exc:
+            return Check(
+                "traefik mounts",
+                "fail",
+                f"recreating {router.container()} failed: {exc}",
+                _MOUNTS_HINT,
+            )
+        missing = router.missing_in_container()
+    if not missing:
+        return Check("traefik mounts", "ok", f"{router.container()} sees the routes and certs")
+    shown = ", ".join(missing[:3]) + (f" (+{len(missing) - 3} more)" if len(missing) > 3 else "")
+    return Check(
+        "traefik mounts",
+        "fail",
+        f"{router.container()} does not see: {shown} (stale bind mount)",
+        _MOUNTS_HINT,
+    )
 
 
 def check_resolution(domain: str) -> Check:

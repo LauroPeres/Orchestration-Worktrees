@@ -1,6 +1,7 @@
 """Shared Traefik (file provider) and one route file per branch."""
 
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import yaml
 
 from wt import compose, proc
+from wt.errors import WtError
 from wt.naming import Names
 from wt.paths import env_port, instance, wt_home
 from wt.state import atomic_write
@@ -90,7 +92,12 @@ def host_upstream(port: int) -> str:
     return f"http://{HOST_GATEWAY_NAME}:{port}"
 
 
-def ensure_running(timeout: int = 60, on_line: Callable[[str], None] | None = None) -> None:
+def ensure_running(
+    timeout: int = 60,
+    on_line: Callable[[str], None] | None = None,
+    *,
+    force_recreate: bool = False,
+) -> None:
     """Start (or update) the shared Traefik. Safe to call on every `up`."""
     folder = traefik_dir()
     dynamic_dir().mkdir(parents=True, exist_ok=True)
@@ -108,6 +115,7 @@ def ensure_running(timeout: int = 60, on_line: Callable[[str], None] | None = No
             str(compose_file),
             "up",
             "-d",
+            *(["--force-recreate"] if force_recreate else []),
             "--wait",
             "--wait-timeout",
             str(timeout),
@@ -121,6 +129,47 @@ def ensure_running(timeout: int = 60, on_line: Callable[[str], None] | None = No
 def is_running() -> bool:
     result = proc.run(["docker", "inspect", "-f", "{{.State.Running}}", container()], check=False)
     return result.ok and result.stdout.strip() == "true"
+
+
+def _listed_in_container(folder: str) -> set[str]:
+    result = proc.run(["docker", "exec", container(), "ls", "-1", folder], check=False)
+    return set(result.stdout.split()) if result.ok else set()
+
+
+def missing_in_container() -> list[str]:
+    """Host files in `dynamic/` and `certs/` that the running container does not see.
+
+    A stale bind mount (e.g. after a Docker Desktop restart) shows empty folders inside the
+    container while the host folders have files. Returns `[]` when it is not running.
+    """
+    if not is_running():
+        return []
+    missing: list[str] = []
+    for host_dir, in_container in [
+        (dynamic_dir(), "/etc/traefik/dynamic"),
+        (certs_dir(), CERTS_IN_CONTAINER),
+    ]:
+        if not host_dir.is_dir():
+            continue
+        names = sorted(p.name for p in host_dir.iterdir() if p.is_file())
+        if names:
+            listed = _listed_in_container(in_container)
+            missing += [n for n in names if n not in listed]
+    return missing
+
+
+def restart(timeout: int = 60) -> None:
+    """Recreate the Traefik container (`up -d --force-recreate`) and wait until it is running.
+
+    A plain `docker restart` reuses the old bind-mount source, which is gone when the host
+    folder was deleted and recreated.
+    """
+    ensure_running(timeout, force_recreate=True)
+    deadline = time.monotonic() + timeout
+    while not is_running():
+        if time.monotonic() >= deadline:
+            raise WtError(f"{container()} did not come back after a recreate within {timeout}s")
+        time.sleep(0.5)
 
 
 def has_host_gateway() -> bool:

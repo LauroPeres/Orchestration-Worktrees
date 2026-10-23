@@ -10,7 +10,7 @@ from wt.errors import WtError
 from wt.providers import REGISTRY
 
 # Names reserved for providers that later versions add (docs/SPEC.md §10).
-UPCOMING = {"postgres": "v0.2", "kafka": "v0.3", "redis": "v0.3", "keycloak": "v0.4"}
+UPCOMING = {"postgres": "v0.2", "kafka": "v0.4", "redis": "v0.4", "keycloak": "v0.5"}
 
 _env = SandboxedEnvironment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True)
 # `run:` commands go through `sh -c`: every rendered value is shell-quoted (D15).
