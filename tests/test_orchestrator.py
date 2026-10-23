@@ -1021,7 +1021,13 @@ def test_consumes_url_reaches_the_consumer_env(
         """\
 repos: {r: ./shop-api}
 services:
-  back: {repo: r, compose: docker-compose.yml, compose_service: api, port: 8000, subdomain: api}
+  back:
+    repo: r
+    compose: docker-compose.yml
+    compose_service: api
+    port: 8000
+    subdomain: api
+    remote: https://api.stg.example
   front:
     repo: r
     compose: docker-compose.yml
@@ -1033,7 +1039,7 @@ services:
     )
     path = tmp_path / "worktree.yaml"
     path.write_text(
-        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front]\n"
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front, back]\n"
     )
     Orchestrator(load_config(path), log=lambda m: None).up("feat/x")
     override = docker.files[0][1].read_text()
@@ -1286,3 +1292,129 @@ def test_remove_keeps_a_branch_checked_out_in_a_foreign_folder(
     assert o.remove("feat/x") is True
     assert foreign.is_dir()
     assert "feat/x" in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+# --- per-worktree selection (§17 D-a, D-d) ---
+SELECTION_CATALOG = """\
+repos:
+  api: ./shop-api
+services:
+  db:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: db
+    port: 5432
+    subdomain: dbx
+    remote: https://db.staging.example
+  web:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: api
+    port: 8000
+    subdomain: web
+    env:
+      DB_URL: "{{ services.db.url }}|{{ services.db.host }}|{{ services.db.port }}"
+    consumes:
+      db: DB
+"""
+
+
+@pytest.fixture
+def catalog_orch(make_repo, tmp_path: Path, docker: FakeDocker):
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(SELECTION_CATALOG)
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [db, web]\n"
+    )
+    return Orchestrator(load_config(path), log=lambda m: None)
+
+
+def _set_uses(o: Orchestrator, branch: str, uses: list[str] | None) -> None:
+    with o.store.edit() as state:
+        state.branches[branch].uses = uses
+
+
+def test_branch_state_uses_defaults_to_none(catalog_orch: Orchestrator, docker: FakeDocker) -> None:
+    catalog_orch.up("feat/x")
+    assert catalog_orch.store.load().branches["feat/x"].uses is None
+    assert catalog_orch.store.load().branches["feat/x"].route_file is not None
+
+
+def test_stored_uses_wins_over_the_yaml(catalog_orch: Orchestrator, docker: FakeDocker) -> None:
+    o = catalog_orch
+    o.up("feat/x")  # yaml: [db, web] -> web routed
+    _set_uses(o, "feat/x", ["db"])
+    reports = o.up("feat/x")
+    assert [r.service for r in reports] == ["db"]
+    assert o.store.load().branches["feat/x"].route_file is not None
+    assert "--web" not in Path(o.store.load().branches["feat/x"].route_file or "").read_text()
+    other = o.up("feat/y")  # a branch without a stored selection keeps the yaml
+    assert [r.service for r in other] == ["db", "web"]
+
+
+def test_ls_down_use_the_branch_selection(catalog_orch: Orchestrator, docker: FakeDocker) -> None:
+    o = catalog_orch
+    o.up("feat/x")
+    _set_uses(o, "feat/x", ["db"])
+    assert [r.service for r in o.ls(probe=False)[0].services] == ["db"]  # web is not selected
+    assert o.down("feat/x") is True
+    assert o.store.load().branches == {}
+
+
+def test_stop_uses_the_branch_selection(
+    catalog_orch: Orchestrator, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = catalog_orch
+    o.up("feat/x")
+    _set_uses(o, "feat/x", ["db"])
+    seen: list[list[str]] = []
+    real = Orchestrator.compose_groups
+
+    def spy(self: Orchestrator) -> Any:
+        seen.append(list(self.cfg.services))
+        return real(self)
+
+    monkeypatch.setattr(Orchestrator, "compose_groups", spy)
+    o.stop("feat/x")
+    assert seen and all(s == ["db"] for s in seen)
+
+
+def test_add_uses_the_branch_selection_when_known(
+    catalog_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = catalog_orch
+    assert o.add("feat/x") is True  # new branch: yaml selection
+    _set_uses(o, "feat/x", ["db"])
+    assert o.add("feat/x") is False
+
+
+def test_unselected_service_renders_its_remote(
+    catalog_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = catalog_orch.__class__(catalog_orch.loaded.with_uses(["web"]), log=lambda m: None)
+    names = o.names("feat/x")
+    ctx = o.template_context(names, o.cfg.services["web"])
+    assert ctx["services"]["db"] == {
+        "url": "https://db.staging.example",
+        "host": "",
+        "port": None,
+    }
+    envs, _ = o._render(names, {})
+    assert envs["web"]["DB_URL"] == "https://db.staging.example||None"
+
+
+def test_unselected_service_without_remote_renders_empty(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(
+        "repos: {api: ./shop-api}\nservices:\n"
+        "  a: {repo: api, compose: docker-compose.yml, compose_service: api}\n"
+        "  b: {repo: api, compose: docker-compose.yml, compose_service: db}\n"
+    )
+    path = tmp_path / "worktree.yaml"
+    path.write_text("project: s\ndomain: s.localhost\ncatalog: ./catalog.yaml\nuses: [a]\n")
+    o = Orchestrator(load_config(path), log=lambda m: None)
+    ctx = o.template_context(o.names("x"), o.cfg.services["a"])
+    assert ctx["services"]["b"] == {"url": "", "host": "", "port": None}

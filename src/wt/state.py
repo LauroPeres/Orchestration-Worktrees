@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -13,7 +13,8 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from wt.errors import WtError
-from wt.paths import locks_dir, project_dir
+from wt.naming import PORT_STRIDE, host_port
+from wt.paths import locks_dir, project_dir, wt_home
 
 
 def now() -> str:
@@ -53,6 +54,8 @@ class BranchState(BaseModel):
     ports: dict[str, int] = Field(default_factory=dict)  # service -> reserved host port
     processes: dict[str, ProcessState] = Field(default_factory=dict)  # service -> host process
     provider_base: dict[str, str] = Field(default_factory=dict)  # provider -> base branch at create
+    index: int | None = None  # worktree index, unique across projects (see allocate_index)
+    uses: list[str] | None = None  # selected catalog services; None = the `uses:` of the yaml
 
 
 STATE_VERSION = 1
@@ -124,3 +127,67 @@ class StateStore:
             state = self.load()
             yield state
             self._save(state)
+
+
+def ports_lock() -> AbstractContextManager[None]:
+    """The global lock that guards the worktree index registry and port reservation."""
+    return file_lock("ports")
+
+
+def index_registry_path() -> Path:
+    return wt_home() / "worktree-index.json"
+
+
+def _read_registry() -> dict[int, str]:
+    """{index: "<project>/<branch>"}. A missing or unreadable file is rebuilt from the state
+    files; entries the state files record but the registry lacks are added."""
+    registry: dict[int, str] = {}
+    path = index_registry_path()
+    try:
+        raw = json.loads(path.read_text())
+        registry = {int(key): str(owner) for key, owner in raw.items()}
+    except (OSError, ValueError, AttributeError):
+        registry = {}
+    home = wt_home()
+    folders = sorted(home.iterdir()) if home.is_dir() else []
+    for folder in folders:
+        if not (folder / "state.json").is_file():
+            continue
+        try:
+            state = StateStore(folder.name).load()
+        except WtError:
+            continue
+        for name, branch in state.branches.items():
+            if branch.index is not None:
+                registry.setdefault(branch.index, f"{folder.name}/{name}")
+    return registry
+
+
+def _write_registry(registry: dict[int, str]) -> None:
+    data = {str(index): registry[index] for index in sorted(registry)}
+    atomic_write(index_registry_path(), json.dumps(data, indent=2) + "\n")
+
+
+def allocate_index(project: str, branch: str) -> int:
+    """The smallest worktree index no branch of any project uses; the same one again for a
+    branch that already has it. The caller holds `ports_lock()`."""
+    owner = f"{project}/{branch}"
+    registry = _read_registry()
+    for index, held_by in registry.items():
+        if held_by == owner:
+            return index
+    index = next(i for i in range(len(registry) + 1) if i not in registry)
+    host_port(index, PORT_STRIDE - 1)  # WtError when the port would pass 65535
+    registry[index] = owner
+    _write_registry(registry)
+    return index
+
+
+def release_index(project: str, branch: str) -> None:
+    """Free the index of a branch that was torn down (not stopped). The caller holds
+    `ports_lock()`."""
+    owner = f"{project}/{branch}"
+    registry = _read_registry()
+    kept = {index: held_by for index, held_by in registry.items() if held_by != owner}
+    if kept != registry or index_registry_path().exists():
+        _write_registry(kept)

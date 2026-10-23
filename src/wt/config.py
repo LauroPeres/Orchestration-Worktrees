@@ -1,7 +1,7 @@
 """Load and validate worktree.yaml."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Self
 
@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from wt.errors import WtError
 
 CONFIG_NAME = "worktree.yaml"
+MAX_SERVICES = 100
 
 NAME = r"^[a-z0-9][a-z0-9_-]{0,30}$"
 PROJECT = r"^[a-z][a-z0-9-]{0,30}$"
@@ -159,6 +160,9 @@ class LoadedConfig:
     config: Config
     path: Path
     catalog: Path | None = None
+    remotes: dict[str, str] = field(default_factory=dict)
+    uses: tuple[str, ...] | None = None  # the selection; None for a `services:` project
+    service_order: tuple[str, ...] = ()  # catalog order (or `services:` order): the port index
 
     @property
     def root(self) -> Path:
@@ -166,6 +170,21 @@ class LoadedConfig:
 
     def repo_path(self, repo: str) -> Path:
         return (self.root / self.config.repos[repo]).resolve()
+
+    def service_index(self, name: str) -> int:
+        """Position of a service in the catalog (whatever the selection) or in `services:`."""
+        try:
+            return self.service_order.index(name)
+        except ValueError:
+            raise WtError(f"unknown service {name!r}") from None
+
+    def with_uses(self, uses: list[str]) -> "LoadedConfig":
+        """The same worktree.yaml and catalog, resolved for another selection."""
+        if self.uses is None:
+            raise WtError("configure needs a catalog project (uses: in worktree.yaml)")
+        if not uses:
+            raise WtError("select at least one service")
+        return load_config(self.path, uses=list(uses))
 
 
 def find_config(start: Path) -> Path | None:
@@ -185,7 +204,8 @@ def _format_errors(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def load_config(path: Path) -> LoadedConfig:
+def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:
+    """`uses` replaces the `uses:` of the file (a per-worktree selection)."""
     path = path.resolve()
     try:
         raw = yaml.safe_load(path.read_text())
@@ -196,18 +216,38 @@ def load_config(path: Path) -> LoadedConfig:
     if not isinstance(raw, dict):
         raise WtError(f"{path} must contain a YAML mapping")
     catalog: Path | None = None
+    remotes: dict[str, str] = {}
+    selection: tuple[str, ...] | None = None
+    order: tuple[str, ...] = ()
     if ("services" in raw) == ("uses" in raw):
         raise WtError(f"invalid {path.name}: set exactly one of 'services' or 'uses'")
+    if uses is not None and "uses" not in raw:
+        raise WtError(f"{path.name} has no 'uses:'; a selection needs a catalog project")
     if "uses" in raw:
         from wt.catalog import catalog_path, resolve  # catalog imports this module
 
+        if uses is not None:
+            raw = {**raw, "uses": uses}
         catalog = catalog_path(raw.get("catalog"), path.parent)
-        raw = resolve(raw, path)
+        selected = raw["uses"]
+        raw, remotes, order = resolve(raw, path)
+        selection = tuple(dict.fromkeys(selected))
     try:
         config = Config.model_validate(raw)
     except ValidationError as exc:
         raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
-    return LoadedConfig(config=config, path=path, catalog=catalog)
+    if catalog is None:
+        order = tuple(config.services)
+        if len(order) > MAX_SERVICES:
+            raise WtError(f"{path.name} has {len(order)} services; at most 100 services")
+    return LoadedConfig(
+        config=config,
+        path=path,
+        catalog=catalog,
+        remotes=remotes,
+        uses=selection,
+        service_order=order,
+    )
 
 
 STARTER = """\

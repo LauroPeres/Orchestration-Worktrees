@@ -105,6 +105,13 @@ class Orchestrator:
         self.log = log
         self.out = out
 
+    def _for(self, branch: str) -> "Orchestrator":
+        """This orchestrator, or one built on the branch's stored selection (§17 D-a)."""
+        bs = self.store.load().branches.get(branch)
+        if bs is None or bs.uses is None or self.loaded.uses == tuple(bs.uses):
+            return self
+        return Orchestrator(self.loaded.with_uses(bs.uses), self.log, self.out)
+
     # ---- naming helpers -------------------------------------------------------------------
 
     def names(self, branch: str) -> Names:
@@ -182,6 +189,8 @@ class Orchestrator:
             }
             for n, s in self.cfg.services.items()
         }
+        for n, remote in self.loaded.remotes.items():  # catalog services that are not selected
+            services[n] = {"url": remote, "port": None, "host": ""}
         context: dict[str, Any] = {
             "project": self.cfg.project,
             "branch": names.branch,
@@ -219,6 +228,8 @@ class Orchestrator:
 
     def up(self, branch: str, *, build: bool = False, timeout: int = 120) -> list[ServiceReport]:
         git.check_branch_name(branch)
+        if (other := self._for(branch)) is not self:
+            return other.up(branch, build=build, timeout=timeout)
         names = self.names(branch)
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         with self._branch_lock(names):
@@ -318,6 +329,8 @@ class Orchestrator:
     def add(self, branch: str) -> bool:
         """Worktrees and reserved ports only, status `stopped`. False when already known."""
         git.check_branch_name(branch)
+        if (other := self._for(branch)) is not self:
+            return other.add(branch)
         names = self.names(branch)
         self.start_plan()  # a cycle fails here, before anything is created
         with self._branch_lock(names):
@@ -335,6 +348,8 @@ class Orchestrator:
 
     def stop(self, branch: str) -> None:
         """Stop processes and compose projects (no volumes) and drop the route; keep the rest."""
+        if (other := self._for(branch)) is not self:
+            return other.stop(branch)
         names = self.names(branch)
         with self._branch_lock(names):
             bs = self.store.load().branches.get(branch)
@@ -672,11 +687,15 @@ class Orchestrator:
 
     def down(self, branch: str, *, force: bool = False) -> bool:
         """Remove everything for a branch. False when there was nothing to remove."""
+        if (other := self._for(branch)) is not self:
+            return other.down(branch, force=force)
         with self._branch_lock(self.names(branch)):
             return self._down_locked(branch, force=force) is not None
 
     def remove(self, branch: str, *, force: bool = False) -> bool:
         """`down`, then delete the git branch in every repo, except protected ones."""
+        if (other := self._for(branch)) is not self:
+            return other.remove(branch, force=force)
         with self._branch_lock(self.names(branch)):
             sources = self._down_locked(branch, force=force)
             if sources is None:
@@ -809,7 +828,11 @@ class Orchestrator:
         state = self.store.load()
 
         def status(bs: BranchState) -> BranchStatus:
-            names = self.names(bs.branch)
+            try:
+                me = self._for(bs.branch)
+            except WtError:  # a stored selection the catalog no longer knows
+                me = self
+            names = me.names(bs.branch)
             containers: list[compose.Container] = []
             docker_ok = True
             try:
@@ -827,8 +850,8 @@ class Orchestrator:
                 ports=sorted(bs.ports.values()),
                 docker_ok=docker_ok,
             )
-            for name, svc in self.cfg.services.items():
-                url = self.service_url(names, svc)
+            for name, svc in me.cfg.services.items():
+                url = me.service_url(names, svc)
                 if url is None or svc.subdomain is None:
                     continue
                 if not probe:

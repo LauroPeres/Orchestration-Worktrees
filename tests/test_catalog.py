@@ -16,6 +16,7 @@ services:
     compose: docker-compose.yml
     port: 8000
     subdomain: api
+    remote: https://api.staging.example
     infra:
       postgres: {databases: [notes]}
   front:
@@ -121,21 +122,50 @@ def project(tmp_path: Path, catalog: str, extra: str = "uses: [front]\n") -> Pat
 
 
 def test_uses_resolves(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD))
+    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
     cfg = loaded.config
     assert loaded.catalog == tmp_path / "catalog.yaml"
-    assert list(cfg.services) == ["front", "back"]  # back comes in through consumes
+    assert list(cfg.services) == ["front", "back"]  # selection order
     assert cfg.services["front"].needs == ["back"]
     assert cfg.services["front"].env == {"API_URL": "{{ services.back.url }}"}
     assert cfg.repos["notes-back"] == str(tmp_path / "back")
     assert cfg.shared.postgres is not None and cfg.shared.postgres.databases == ["notes"]
     assert loaded.repo_path("notes-back") == tmp_path / "back"
+    assert loaded.remotes == {}
 
 
-def test_uses_only_closure(tmp_path: Path) -> None:
+def test_uses_is_exact_and_dep_gets_its_remote(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD, "uses: [front]\n"))
+    cfg = loaded.config
+    assert list(cfg.services) == ["front"]
+    assert list(cfg.repos) == ["notes-front"]
+    assert cfg.services["front"].needs == []
+    assert cfg.services["front"].env == {"API_URL": "https://api.staging.example"}
+    assert cfg.shared.postgres is None
+    assert loaded.remotes == {"back": "https://api.staging.example"}
+
+
+def test_uses_only_dep(tmp_path: Path) -> None:
     loaded = load_config(project(tmp_path, GOOD, "uses: [back]\n"))
     assert list(loaded.config.services) == ["back"]
     assert list(loaded.config.repos) == ["notes-back"]
+    assert loaded.remotes == {"front": ""}  # nothing consumes front, so it has no remote
+
+
+def test_consumed_service_needs_remote(tmp_path: Path) -> None:
+    text = GOOD.replace("    remote: https://api.staging.example\n", "")
+    msg = (
+        r"service 'back' is consumed by 'front' and needs 'remote:' "
+        r"\(the URL used when it is not selected\)"
+    )
+    with pytest.raises(WtError, match=msg):
+        load_catalog(write(tmp_path, text))
+
+
+def test_remote_must_be_http_url(tmp_path: Path) -> None:
+    text = GOOD.replace("https://api.staging.example", "api.staging.example")
+    with pytest.raises(WtError, match="remote"):
+        load_catalog(write(tmp_path, text))
 
 
 @pytest.mark.parametrize(
@@ -156,13 +186,13 @@ def test_uses_errors(tmp_path: Path, extra: str, msg: str) -> None:
 def test_consumes_dep_without_route(tmp_path: Path) -> None:
     text = GOOD.replace("    subdomain: api\n", "")
     with pytest.raises(WtError, match="no 'subdomain'"):
-        load_config(project(tmp_path, text))
+        load_config(project(tmp_path, text, "uses: [front, back]\n"))
 
 
 def test_consumes_var_already_in_env(tmp_path: Path) -> None:
     text = GOOD.replace("    consumes:", "    env: {API_URL: x}\n    consumes:")
     with pytest.raises(WtError, match="API_URL"):
-        load_config(project(tmp_path, text))
+        load_config(project(tmp_path, text, "uses: [front, back]\n"))
 
 
 def two_infra(a: str, b: str) -> str:
@@ -174,6 +204,7 @@ services:
     compose: c.yml
     port: 80
     subdomain: one
+    remote: https://one.example
     infra:
       postgres: {a}
   two:
@@ -187,15 +218,15 @@ services:
 
 def test_infra_union_and_conflict(tmp_path: Path) -> None:
     ok = two_infra("{databases: [a]}", "{databases: [b, a], strategy: dump-restore}")
-    shared = load_config(project(tmp_path, ok, "uses: [two]\n")).config.shared
+    shared = load_config(project(tmp_path, ok, "uses: [two, one]\n")).config.shared
     assert shared.postgres is not None
-    assert shared.postgres.databases == ["b", "a"]  # discovery order: two, then one
+    assert shared.postgres.databases == ["b", "a"]  # selection order: two, then one
     assert shared.postgres.strategy == "dump-restore"
     bad = two_infra(
         "{databases: [a], strategy: template}", "{databases: [b], strategy: dump-restore}"
     )
     with pytest.raises(WtError, match=r"'one'.*'two'|'two'.*'one'"):
-        load_config(project(tmp_path, bad, "uses: [two]\n"))
+        load_config(project(tmp_path, bad, "uses: [two, one]\n"))
 
 
 def test_neither_services_nor_uses(tmp_path: Path) -> None:
@@ -207,9 +238,9 @@ def test_neither_services_nor_uses(tmp_path: Path) -> None:
 def test_consumes_cycle_message(tmp_path: Path) -> None:
     text = GOOD.replace(
         "    subdomain: api\n", "    subdomain: api\n    consumes: {front: FRONT_URL}\n"
-    )
+    ).replace("    consumes:\n", "    remote: https://front.example\n    consumes:\n")
     with pytest.raises(WtError, match="cycle through catalog consumes: front -> back -> front"):
-        load_config(project(tmp_path, text))
+        load_config(project(tmp_path, text, "uses: [front, back]\n"))
 
 
 DIAMOND = """\
@@ -224,23 +255,26 @@ services:
     compose: c.yml
     port: 80
     subdomain: left
+    remote: https://left.example
     consumes: {base: BASE}
   right:
     repo: r
     compose: c.yml
     port: 81
     subdomain: right
+    remote: https://right.example
     consumes: {base: BASE}
   base:
     repo: r
     compose: c.yml
     port: 82
     subdomain: base
+    remote: https://base.example
 """
 
 
 def test_diamond_consumes_has_no_duplicates(tmp_path: Path) -> None:
-    cfg = load_config(project(tmp_path, DIAMOND, "uses: [top, base]\n")).config
+    cfg = load_config(project(tmp_path, DIAMOND, "uses: [top, left, right, base]\n")).config
     assert sorted(cfg.services) == ["base", "left", "right", "top"]
     assert cfg.services["top"].needs == ["left", "right"]
     assert cfg.services["left"].needs == ["base"]
@@ -256,3 +290,73 @@ def test_rows(tmp_path: Path) -> None:
         ("back", "notes-back", "compose", ["postgres"], [], ["front"]),
         ("front", "notes-front", "run", [], ["back"], []),
     ]
+
+
+# --- selection: service_order, service_index, with_uses ---
+def test_service_order_follows_the_catalog_not_the_selection(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    assert loaded.uses == ("front", "back")
+    assert loaded.service_order == ("back", "front")  # catalog order
+    assert loaded.service_index("back") == 0
+    assert loaded.service_index("front") == 1
+    only = loaded.with_uses(["front"])
+    assert only.service_index("front") == 1  # unchanged by the selection
+    assert only.service_index("back") == 0
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        only.service_index("nope")
+
+
+def test_with_uses_re_resolves(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    only = loaded.with_uses(["front"])
+    assert only.uses == ("front",)
+    assert list(only.config.services) == ["front"]
+    assert only.config.services["front"].env == {"API_URL": "https://api.staging.example"}
+    assert only.remotes == {"back": "https://api.staging.example"}
+    assert loaded.uses == ("front", "back")  # the original is untouched
+    assert only.path == loaded.path
+
+
+def test_with_uses_errors(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD, "uses: [front]\n"))
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        loaded.with_uses(["nope"])
+    with pytest.raises(WtError, match="select at least one service"):
+        loaded.with_uses([])
+
+
+def test_with_uses_reports_infra_conflicts(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "    consumes:\n      back: API_URL\n",
+        "    consumes:\n      back: API_URL\n"
+        "    infra:\n      postgres: {databases: [other], base_branch: dev}\n",
+    ).replace("postgres: {databases: [notes]}", "postgres: {databases: [notes], base_branch: main}")
+    loaded = load_config(project(tmp_path, text, "uses: [front]\n"))
+    with pytest.raises(WtError, match="conflicts"):
+        loaded.with_uses(["front", "back"])
+
+
+def test_services_project_has_no_selection(tmp_path: Path) -> None:
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: p\ndomain: p.localhost\nrepos: {a: .}\nservices:\n"
+        "  one: {repo: a, run: x}\n  two: {repo: a, run: y}\n"
+    )
+    loaded = load_config(path)
+    assert loaded.uses is None
+    assert loaded.service_order == ("one", "two")
+    assert loaded.service_index("two") == 1
+    with pytest.raises(WtError, match="catalog"):
+        loaded.with_uses(["one"])
+
+
+def test_more_than_100_services_rejected(tmp_path: Path) -> None:
+    body = "".join(f"  s{i}:\n    repo: r\n    run: x\n" for i in range(101))
+    catalog = f"repos:\n  r: ./r\nservices:\n{body}"
+    with pytest.raises(WtError, match="at most 100 services"):
+        load_config(project(tmp_path, catalog, "uses: [s0]\n"))
+    body = "".join(f"  s{i}:\n    repo: a\n    run: x\n" for i in range(101))
+    path = tmp_path / "w2.yaml"
+    path.write_text(f"project: p\ndomain: p.localhost\nrepos: {{a: .}}\nservices:\n{body}")
+    with pytest.raises(WtError, match="at most 100 services"):
+        load_config(path)
