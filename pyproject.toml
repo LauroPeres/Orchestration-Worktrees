@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 wt = "wt.cli:main"
+worktree = "wt.cli:worktree_main"
 
 [dependency-groups]
 dev = [

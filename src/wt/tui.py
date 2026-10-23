@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import ClassVar, Protocol
 
 from rich.markup import escape
@@ -39,6 +40,38 @@ class OrchestratorLike(Protocol):
     def down(self, branch: str, *, force: bool = False) -> bool: ...
 
     def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]: ...
+
+
+@dataclass(frozen=True)
+class ProjectEntry:
+    """One project in the all-projects view. `orch` is None when its config file is gone."""
+
+    name: str
+    orch: Callable[[], OrchestratorLike] | None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class Row:
+    """A line of the left pane: a project header (`status` None) or one of its branches."""
+
+    project: str
+    status: BranchStatus | None = None
+    note: str = ""
+    stale: bool = False
+
+    @property
+    def key(self) -> tuple[str, str | None]:
+        return (self.project, self.status.branch if self.status else None)
+
+
+def row_label(row: Row, *, tree: bool) -> str:
+    if row.status is not None:
+        return ("  " if tree else "") + branch_label(row.status)
+    name = escape(row.project)
+    if row.stale:
+        return f"[dim]{name}  {escape(row.note)}[/]"
+    return f"[bold]{name}[/]" + (f"  [red]{escape(row.note)}[/]" if row.note else "")
 
 
 def _kill_group(tail: subprocess.Popen[str]) -> None:
@@ -121,10 +154,21 @@ class WtApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, orch: OrchestratorLike) -> None:
+    def __init__(
+        self,
+        orch: OrchestratorLike | None = None,
+        *,
+        projects: Callable[[], list[ProjectEntry]] | None = None,
+    ) -> None:
+        """One project (`orch`), or a project tree from `projects` (called on every refresh)."""
         super().__init__()
+        if (orch is None) == (projects is None):
+            raise ValueError("pass either orch or projects")
         self.orch = orch
-        self.rows: list[BranchStatus] = []
+        self._discover = projects
+        self._entries: dict[str, ProjectEntry] = {}
+        self.rows: list[Row] = []
+        self._said_empty = False
         self._loading = False
         self._busy = False
         self._tail_lock = threading.Lock()
@@ -141,9 +185,9 @@ class WtApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.sub_title = self.orch.cfg.project
+        self.sub_title = self.orch.cfg.project if self.orch else "all projects"
         branches = self.query_one("#branches", ListView)
-        branches.border_title = "Branches"
+        branches.border_title = "Branches" if self.orch else "Projects"
         branches.focus()
         table = self.query_one("#services", DataTable)
         table.border_title = "Services"
@@ -157,12 +201,41 @@ class WtApp(App[None]):
     # -- helpers for later actions ------------------------------------------------
 
     @property
-    def selected_branch(self) -> str | None:
-        view = self.query_one("#branches", ListView)
-        index = view.index
+    def selected_row(self) -> Row | None:
+        index = self.query_one("#branches", ListView).index
         if index is None or index >= len(self.rows):
             return None
-        return self.rows[index].branch
+        return self.rows[index]
+
+    @property
+    def selected_branch(self) -> str | None:
+        row = self.selected_row
+        return row.status.branch if row and row.status else None
+
+    @property
+    def selected_project(self) -> str | None:
+        row = self.selected_row
+        return row.project if row else None
+
+    def _orch_for(self, project: str) -> OrchestratorLike:
+        """The project's orchestrator (built lazily in the all-projects view); may raise."""
+        if self.orch is not None:
+            return self.orch
+        entry = self._entries.get(project)
+        if entry is None or entry.orch is None:
+            raise WtError(f"{project}: {entry.note if entry else 'unknown project'}")
+        return entry.orch()
+
+    def _target(self) -> str | None:
+        """The project an action applies to, or None (with a message) when it has none."""
+        row = self.selected_row
+        if row is None:
+            self.write_log("[yellow]nothing selected[/]")
+            return None
+        if row.stale:
+            self.write_log(f"[yellow]{escape(row.project)}: {escape(row.note)}[/]")
+            return None
+        return row.project
 
     def write_log(self, text: str) -> None:
         self.query_one("#log", RichLog).write(text)
@@ -188,39 +261,42 @@ class WtApp(App[None]):
         return True
 
     def action_up_selected(self) -> None:
-        branch = self.selected_branch
-        if branch is not None and self._guard():
-            self._start(f"up {branch}", lambda: self.orch.up(branch))
+        branch, project = self.selected_branch, self._target()
+        if branch is not None and project is not None and self._guard():
+            self._start(f"up {branch}", lambda: self._orch_for(project).up(branch))
 
     def action_up_new(self) -> None:
-        if not self._guard():
+        if not self._guard() or (project := self._target()) is None:
             return
 
         def got(name: str | None) -> None:
             if name and self._guard():
-                self._start(f"up {name}", lambda: self.orch.up(name))
+                self._start(f"up {name}", lambda: self._orch_for(project).up(name))
 
         self.push_screen(InputScreen("New branch name"), got)
 
     def action_down_selected(self) -> None:
-        branch = self.selected_branch
-        if branch is None or not self._guard():
+        branch, project = self.selected_branch, self._target()
+        if branch is None or project is None or not self._guard():
             return
 
         def confirmed(yes: bool | None) -> None:
             if yes and self._guard():
                 self._start(
                     f"down {branch}",
-                    lambda: self.orch.down(branch),
-                    on_error=lambda: self._offer_force(branch),
+                    lambda: self._orch_for(project).down(branch),
+                    on_error=lambda: self._offer_force(project, branch),
                 )
 
         self.push_screen(ConfirmScreen(f"Bring down {branch}?"), confirmed)
 
-    def _offer_force(self, branch: str) -> None:
+    def _offer_force(self, project: str, branch: str) -> None:
         def confirmed(yes: bool | None) -> None:
             if yes and self._guard():
-                self._start(f"down --force {branch}", lambda: self.orch.down(branch, force=True))
+                self._start(
+                    f"down --force {branch}",
+                    lambda: self._orch_for(project).down(branch, force=True),
+                )
 
         self.push_screen(ConfirmScreen(f"down {branch} failed. Retry with --force?"), confirmed)
 
@@ -263,7 +339,8 @@ class WtApp(App[None]):
 
     def action_tail_log(self) -> None:
         branch, service = self.selected_branch, self.selected_service
-        if branch is None or service is None:
+        project = self.selected_project
+        if branch is None or service is None or project is None:
             self.write_log("[yellow]select a service first[/]")
             return
         self._stop_tail()
@@ -271,7 +348,7 @@ class WtApp(App[None]):
             self._tail_target = (branch, service)
             gen = self._tail_gen
         self.write_log(f"[bold]logs {escape(branch)} / {escape(service)}[/]")
-        self._run_tail(branch, service, gen)
+        self._run_tail(project, branch, service, gen)
 
     def _stop_tail(self) -> None:
         """Kill the running tail (if any) and make its thread's late output a no-op."""
@@ -289,9 +366,11 @@ class WtApp(App[None]):
             self.call_from_thread(self._write_plain if plain else self.write_log, message)
 
     @work(thread=True, group="tail", exit_on_error=False)
-    def _run_tail(self, branch: str, service: str, gen: int) -> None:
+    def _run_tail(self, project: str, branch: str, service: str, gen: int) -> None:
         try:
-            args = self.orch.log_command(branch, service, follow=True, tail=TAIL_LINES)
+            args = self._orch_for(project).log_command(
+                branch, service, follow=True, tail=TAIL_LINES
+            )
             tail = subprocess.Popen(
                 args,
                 stdin=subprocess.DEVNULL,
@@ -335,10 +414,31 @@ class WtApp(App[None]):
             self._loading = True
             self._load_rows()
 
+    def _collect(self) -> list[Row]:
+        if self.orch is not None:
+            rows = sorted(self.orch.ls(probe=True), key=lambda r: r.branch)
+            return [Row(self.orch.cfg.project, r) for r in rows]
+        assert self._discover is not None
+        entries = sorted(self._discover(), key=lambda e: e.name)
+        self._entries = {e.name: e for e in entries}
+        result: list[Row] = []
+        for entry in entries:
+            if entry.orch is None:
+                result.append(Row(entry.name, note=entry.note, stale=True))
+                continue
+            try:
+                statuses = sorted(entry.orch().ls(probe=True), key=lambda r: r.branch)
+            except WtError as exc:
+                result.append(Row(entry.name, note=str(exc).splitlines()[0]))
+                continue
+            result.append(Row(entry.name))
+            result.extend(Row(entry.name, s) for s in statuses)
+        return result
+
     @work(thread=True, group="refresh")
     def _load_rows(self) -> None:
         try:
-            rows = self.orch.ls(probe=True)
+            rows = self._collect()
         except WtError as exc:
             self.call_from_thread(self._load_failed, str(exc))
         else:
@@ -348,24 +448,30 @@ class WtApp(App[None]):
         self._loading = False
         self.write_log(f"[red]{escape(message)}[/]")
 
-    async def _apply_rows(self, rows: list[BranchStatus]) -> None:
+    async def _apply_rows(self, rows: list[Row]) -> None:
         try:
-            rows = sorted(rows, key=lambda r: r.branch)
             view = self.query_one("#branches", ListView)
-            previous = self.selected_branch
+            tree = self.orch is None
+            previous = self.selected_row
             items = list(view.query(ListItem))
-            same = [r.branch for r in rows] == [r.branch for r in self.rows] and len(items) == len(
-                rows
-            )
+            same = [r.key for r in rows] == [r.key for r in self.rows] and len(items) == len(rows)
             self.rows = rows
             if same:
                 for item, row in zip(items, rows, strict=True):
-                    item.query_one(Label).update(branch_label(row))
+                    item.query_one(Label).update(row_label(row, tree=tree))
             else:
                 await view.clear()
-                await view.extend(ListItem(Label(branch_label(r))) for r in rows)
-                names = [r.branch for r in rows]
-                view.index = names.index(previous) if previous in names else (0 if rows else None)
+                await view.extend(ListItem(Label(row_label(r, tree=tree))) for r in rows)
+                keys = [r.key for r in rows]
+                if previous is not None and previous.key in keys:
+                    view.index = keys.index(previous.key)
+                else:
+                    view.index = 0 if rows else None
+            if not rows and tree and not self._said_empty:
+                self._said_empty = True
+                self.write_log(
+                    "[dim]No projects with branches yet. Run `wt up <branch>` in one.[/]"
+                )
             self._show_services()
         except NoMatches:
             pass  # the app is closing: its widgets are gone before this late refresh arrived
@@ -392,14 +498,16 @@ class WtApp(App[None]):
         table = self.query_one("#services", DataTable)
         keep = self.selected_service
         table.clear()
-        name = self.selected_branch
-        row = next((r for r in self.rows if r.branch == name), None)
-        if row is None:
-            return
-        if not row.docker_ok:
+        selected = self.selected_row
+        row = selected.status if selected else None
+        if self.orch is None:
+            self.sub_title = "all projects"
+        elif row is not None and not row.docker_ok:
             self.sub_title = f"{self.orch.cfg.project} (docker unavailable)"
         else:
             self.sub_title = self.orch.cfg.project
+        if row is None:
+            return
         for svc in row.services:
             table.add_row(
                 svc.service,

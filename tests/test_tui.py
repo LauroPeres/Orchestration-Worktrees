@@ -3,11 +3,11 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
-from textual.widgets import DataTable, ListView, RichLog
+from textual.widgets import DataTable, Label, ListItem, ListView, RichLog
 
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, ServiceReport
-from wt.tui import WtApp
+from wt.tui import ProjectEntry, WtApp
 
 
 class FakeOrch:
@@ -394,5 +394,126 @@ def test_quit_kills_tail() -> None:
             await pilot.press("q")
             await pilot.pause()
         assert proc.wait(5) is not None
+
+    asyncio.run(scenario())
+
+
+# -- all projects (outside a project) ------------------------------------------------
+
+
+def make_projects(orchs: dict[str, ActionOrch | None], built: list[str] | None = None) -> Any:
+    def factory(name: str, orch: ActionOrch) -> Any:
+        def build() -> ActionOrch:
+            if built is not None:
+                built.append(name)
+            return orch
+
+        return build
+
+    def discover() -> list[ProjectEntry]:
+        return [
+            ProjectEntry(name, factory(name, o) if o else None, "" if o else "config not found")
+            for name, o in orchs.items()
+        ]
+
+    return discover
+
+
+def labels(app: WtApp) -> list[str]:
+    return [
+        str(item.query_one(Label).render())
+        for item in app.query_one("#branches", ListView).query(ListItem)
+    ]
+
+
+def test_multi_shows_project_tree_and_services() -> None:
+    async def scenario() -> None:
+        built: list[str] = []
+        app = WtApp(projects=make_projects({"shop": ActionOrch(), "notes": ActionOrch()}, built))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            text = labels(app)
+            assert [t.strip().split()[0] for t in text] == [
+                "notes", "feat-a", "main", "shop", "feat-a", "main",
+            ]  # fmt: skip
+            assert app.selected_branch is None  # a project header
+            await pilot.press("down")
+            assert app.selected_project == "notes"
+            assert app.selected_branch == "feat-a"
+            assert table_cells(app)[0][0] == "web"
+            assert sorted(built) == ["notes", "shop"]
+
+    asyncio.run(scenario())
+
+
+def test_multi_actions_use_selected_projects_orch() -> None:
+    async def scenario() -> None:
+        shop, notes = ActionOrch(), ActionOrch()
+        app = WtApp(projects=make_projects({"shop": shop, "notes": notes}))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "down", "down", "down", "u")  # shop / feat-a...
+            await settle(pilot)
+            assert app.selected_project == "shop"
+            assert shop.actions == [("up", "feat-a", False)]
+            assert notes.actions == []
+            await pilot.press("n", *"feat-x", "enter")
+            await settle(pilot)
+            assert shop.actions[-1] == ("up", "feat-x", False)
+            await pilot.press("d", "y")
+            await settle(pilot)
+            assert shop.actions[-1] == ("down", "feat-a", False)
+
+    asyncio.run(scenario())
+
+
+def test_multi_stale_project_is_greyed_without_actions() -> None:
+    async def scenario() -> None:
+        built: list[str] = []
+        live = ActionOrch()
+        app = WtApp(projects=make_projects({"gone": None, "live": live}, built))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            text = labels(app)
+            assert text[0].startswith("gone") and "config not found" in text[0]
+            assert len(text) == 4  # stale project shows no branches
+            assert built == ["live"]
+            await pilot.press("u", "d", "n")
+            await settle(pilot)
+            assert live.actions == []
+            assert "config not found" in log_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_multi_project_error_shown_on_header_not_fatal() -> None:
+    async def scenario() -> None:
+        bad, good = ActionOrch(), ActionOrch()
+        bad.error = "boom"
+        app = WtApp(projects=make_projects({"bad": bad, "good": good}))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            text = labels(app)
+            assert text[0].startswith("bad") and "boom" in text[0]
+            assert text[1].startswith("good")
+            assert app.is_running
+
+    asyncio.run(scenario())
+
+
+def test_multi_selection_survives_refresh_and_no_projects_message() -> None:
+    async def scenario() -> None:
+        app = WtApp(projects=make_projects({"a": ActionOrch(), "b": ActionOrch()}))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "down", "down", "down")
+            before = (app.selected_project, app.selected_branch)
+            await pilot.press("r")
+            await settle(pilot)
+            assert (app.selected_project, app.selected_branch) == before
+        empty = WtApp(projects=make_projects({}))
+        async with empty.run_test() as pilot:
+            await settle(pilot)
+            assert "no projects" in log_text(empty).lower()
 
     asyncio.run(scenario())
