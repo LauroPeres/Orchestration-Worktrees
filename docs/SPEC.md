@@ -553,7 +553,8 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 **TUI (table).** `wt tui` and `worktree` open the same compact, monochrome screen (no colors):
 - One table, one row per worktree, columns `NAME`, `STATUS`, `PORT`. `PORT` is the reserved host
   ports joined with `, `, or `-`. Outside a project (all projects) `NAME` is `<project>/<branch>`.
-- Below the table, one line with the actions: `u up  d down  a add  r remove  q quit`, and one
+- The table has a plain border and only takes the height of its rows. Right below it, one line
+  with the actions: `u: up  d: down  a: add  r: remove  q: quit`, and one
   message line with the last log line or error of the running action.
 - `u` = `up` of the selected row. `d` = `stop` (services down, worktree kept). `a` = an input box
   for the new worktree name, then `add` in the current project (outside a project: the project of
