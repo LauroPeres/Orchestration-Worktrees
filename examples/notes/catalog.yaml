@@ -1,0 +1,26 @@
+repos:
+  notes-back: ./notes-back
+  notes-front: ./notes-front
+services:
+  back:
+    repo: notes-back
+    compose: docker-compose.yml
+    compose_service: api         # the service is called `api` in the compose file
+    port: 8000
+    subdomain: api
+    health: /healthz
+    infra:
+      postgres: {databases: [notes]}
+    env:
+      DATABASE_URL: "{{ postgres.url('notes') }}"
+      BRANCH: "{{ branch }}"
+      FRONT_ORIGIN: "{{ services.front.url }}"   # for CORS
+  front:
+    repo: notes-front
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    consumes:
+      back: API_URL
+    env:
+      BRANCH: "{{ branch }}"
