@@ -29,6 +29,9 @@ class FakeOrch:
     def down(self, branch: str, *, force: bool = False) -> bool:
         return True
 
+    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
+        return ["true"]
+
 
 def rows() -> list[BranchStatus]:
     return [
@@ -285,5 +288,111 @@ def test_unexpected_error_shown_and_app_stays_open() -> None:
             await settle(pilot)
             assert "kaput" in log_text(app)
             assert app.is_running
+
+    asyncio.run(scenario())
+
+
+class TailOrch(ActionOrch):
+    def __init__(self, command: list[str]) -> None:
+        super().__init__()
+        self.command = command
+        self.requests: list[tuple[str, str, bool]] = []
+
+    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
+        self.requests.append((branch, service, follow))
+        if self.command == ["error"]:
+            raise WtError("no log yet for web on feat-a")
+        return self.command
+
+
+async def wait_for(pilot: Any, predicate: Any) -> None:
+    for _ in range(100):
+        await pilot.pause()
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("condition not reached")
+
+
+def test_l_tails_selected_service_into_log() -> None:
+    async def scenario() -> None:
+        orch = TailOrch(["sh", "-c", "echo one; echo two"])
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("l")
+            await wait_for(pilot, lambda: "two" in log_text(app))
+            assert "one" in log_text(app)
+            assert orch.requests == [("feat-a", "web", True)]
+            await pilot.press("tab", "down", "l")  # focus table, second service
+            await wait_for(pilot, lambda: orch.requests[-1] == ("feat-a", "api", True))
+
+    asyncio.run(scenario())
+
+
+def test_l_error_goes_to_log() -> None:
+    async def scenario() -> None:
+        app = WtApp(TailOrch(["error"]))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("l")
+            await wait_for(pilot, lambda: "no log yet" in log_text(app))
+
+    asyncio.run(scenario())
+
+
+def test_l_again_and_selection_change_kill_previous_tail() -> None:
+    async def scenario() -> None:
+        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("l")
+            await wait_for(pilot, lambda: "started" in log_text(app))
+            first = app._tail_proc
+            assert first is not None and first.poll() is None
+            await pilot.press("l")
+            await wait_for(pilot, lambda: first.poll() is not None)
+            await wait_for(pilot, lambda: app._tail_proc not in (None, first))
+            second = app._tail_proc
+            assert second is not None and second.poll() is None
+            await pilot.press("down")  # another branch
+            await wait_for(pilot, lambda: second.poll() is not None)
+            assert app._tail_proc is None
+
+    asyncio.run(scenario())
+
+
+def test_service_change_kills_tail_but_refresh_does_not() -> None:
+    async def scenario() -> None:
+        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("tab", "down", "l")
+            await wait_for(pilot, lambda: app._tail_proc is not None)
+            proc = app._tail_proc
+            assert proc is not None
+            await pilot.press("r")
+            await pilot.pause()
+            await wait_for(pilot, lambda: not app._loading)
+            assert app.selected_service == "api"
+            assert proc.poll() is None
+            await pilot.press("up")
+            await wait_for(pilot, lambda: proc.poll() is not None)
+
+    asyncio.run(scenario())
+
+
+def test_quit_kills_tail() -> None:
+    async def scenario() -> None:
+        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("l")
+            await wait_for(pilot, lambda: app._tail_proc is not None)
+            proc = app._tail_proc
+            assert proc is not None
+            await pilot.press("q")
+            await pilot.pause()
+        assert proc.wait(5) is not None
 
     asyncio.run(scenario())

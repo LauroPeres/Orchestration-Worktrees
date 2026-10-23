@@ -1,5 +1,10 @@
 """Terminal UI: branches, services of the selected branch and a log pane (SPEC §15)."""
 
+import contextlib
+import os
+import signal
+import subprocess
+import threading
 from collections.abc import Callable
 from typing import ClassVar, Protocol
 
@@ -17,6 +22,7 @@ from wt.errors import WtError
 from wt.orchestrator import BranchStatus
 
 REFRESH_SECONDS = 2.0
+TAIL_LINES = 200
 HEALTH = {"ok": "[green]ok[/]", "fail": "[red]fail[/]", "skipped": "[dim]skipped[/]"}
 
 
@@ -30,6 +36,14 @@ class OrchestratorLike(Protocol):
     def up(self, branch: str) -> object: ...
 
     def down(self, branch: str, *, force: bool = False) -> bool: ...
+
+    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]: ...
+
+
+def _kill_group(tail: subprocess.Popen[str]) -> None:
+    """Kill the tail process and the children it started."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(tail.pid, signal.SIGKILL)
 
 
 def branch_label(row: BranchStatus) -> str:
@@ -88,7 +102,7 @@ class InputScreen(ModalScreen[str | None]):
 
 
 class WtApp(App[None]):
-    """`wt ls` view plus up/down actions (SPEC §15). Logs are added as a later slice."""
+    """`wt ls` view, up/down actions and a service log tail (SPEC §15)."""
 
     TITLE = "wt"
     CSS = """
@@ -101,6 +115,7 @@ class WtApp(App[None]):
         Binding("u", "up_selected", "Up"),
         Binding("n", "up_new", "New"),
         Binding("d", "down_selected", "Down"),
+        Binding("l", "tail_log", "Logs"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
@@ -111,6 +126,10 @@ class WtApp(App[None]):
         self.rows: list[BranchStatus] = []
         self._loading = False
         self._busy = False
+        self._tail_lock = threading.Lock()
+        self._tail_gen = 0
+        self._tail_proc: subprocess.Popen[str] | None = None
+        self._tail_target: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -232,6 +251,82 @@ class WtApp(App[None]):
         if on_error is not None:
             on_error()
 
+    # -- log tail -------------------------------------------------------------------
+
+    @property
+    def selected_service(self) -> str | None:
+        table = self.query_one("#services", DataTable)
+        if table.row_count == 0:
+            return None
+        return str(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
+
+    def action_tail_log(self) -> None:
+        branch, service = self.selected_branch, self.selected_service
+        if branch is None or service is None:
+            self.write_log("[yellow]select a service first[/]")
+            return
+        self._stop_tail()
+        with self._tail_lock:
+            self._tail_target = (branch, service)
+            gen = self._tail_gen
+        self.write_log(f"[bold]logs {escape(branch)} / {escape(service)}[/]")
+        self._run_tail(branch, service, gen)
+
+    def _stop_tail(self) -> None:
+        """Kill the running tail (if any) and make its thread's late output a no-op."""
+        with self._tail_lock:
+            self._tail_gen += 1
+            self._tail_target = None
+            tail, self._tail_proc = self._tail_proc, None
+        if tail is not None and tail.poll() is None:
+            _kill_group(tail)
+
+    def _tail_say(self, gen: int, message: str, *, plain: bool = False) -> None:
+        if gen != self._tail_gen:
+            return
+        with contextlib.suppress(RuntimeError):  # app already gone
+            self.call_from_thread(self._write_plain if plain else self.write_log, message)
+
+    @work(thread=True, group="tail", exit_on_error=False)
+    def _run_tail(self, branch: str, service: str, gen: int) -> None:
+        try:
+            args = self.orch.log_command(branch, service, follow=True, tail=TAIL_LINES)
+            tail = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                start_new_session=True,  # so the kill reaches children of a shell command
+            )
+        except WtError as exc:
+            self._tail_say(gen, f"[red]{escape(str(exc))}[/]")
+            return
+        except OSError as exc:
+            self._tail_say(gen, f"[red]{escape(str(exc))}[/]")
+            return
+        with self._tail_lock:
+            if gen != self._tail_gen:
+                _kill_group(tail)
+                tail.wait()
+                return
+            self._tail_proc = tail
+        assert tail.stdout is not None
+        try:
+            for line in tail.stdout:
+                self._tail_say(gen, line.rstrip("\r\n"), plain=True)
+        finally:
+            tail.stdout.close()
+            tail.wait()
+
+    async def action_quit(self) -> None:
+        self._stop_tail()
+        await super().action_quit()
+
+    def on_unmount(self) -> None:
+        self._stop_tail()
+
     # -- refresh --------------------------------------------------------------------
 
     def action_refresh(self) -> None:
@@ -271,10 +366,21 @@ class WtApp(App[None]):
 
     @on(ListView.Highlighted, "#branches")
     def _highlighted(self) -> None:
+        if self._tail_target is not None and self._tail_target[0] != self.selected_branch:
+            self._stop_tail()
         self._show_services()
+
+    @on(DataTable.RowHighlighted, "#services")
+    def _row_highlighted(self) -> None:
+        if self._tail_target is not None and self._tail_target != (
+            self.selected_branch,
+            self.selected_service,
+        ):
+            self._stop_tail()
 
     def _show_services(self) -> None:
         table = self.query_one("#services", DataTable)
+        keep = self.selected_service
         table.clear()
         name = self.selected_branch
         row = next((r for r in self.rows if r.branch == name), None)
@@ -292,3 +398,6 @@ class WtApp(App[None]):
                 f"{HEALTH[svc.outcome]} [dim]{escape(svc.detail)}[/]",
                 key=svc.service,
             )
+        if keep is not None:
+            with contextlib.suppress(Exception):  # service gone: stay on the first row
+                table.move_cursor(row=table.get_row_index(keep))

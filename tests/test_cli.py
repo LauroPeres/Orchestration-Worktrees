@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.conftest import SHARED, FakeDocker
-from wt import __version__, cli, compose, host
+from wt import __version__, cli, compose, host, proc
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
@@ -88,19 +88,22 @@ def test_up_degraded_exits_1(
 def test_logs_passes_options(
     orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[str, str, bool, int]] = []
+    calls: list[list[str]] = []
 
-    def fake_logs(project: str, service: str, *, follow: bool, tail: int) -> None:
-        calls.append((project, service, follow, tail))
+    def fake_run(args: list[str], **kw: object) -> proc.Result:
+        calls.append(args)
+        return proc.Result(0, "", "")
 
-    monkeypatch.setattr(compose, "logs", fake_logs)
     orch()
     runner.invoke(app, [*_cfg(tmp_path), "up", "feat/cart"])
+    monkeypatch.setattr(proc, "run", fake_run)
     result = runner.invoke(
         app, [*_cfg(tmp_path), "logs", "feat/cart", "api", "--no-follow", "--tail", "5"]
     )
     assert result.exit_code == 0, result.output
-    assert calls == [("wt-shop-feat-cart-api", "api", False, 5)]
+    assert calls == [
+        ["docker", "compose", "-p", "wt-shop-feat-cart-api", "logs", "--tail", "5", "api"]
+    ]
 
 
 def test_logs_of_branch_not_up_fails(orch, docker: FakeDocker, tmp_path: Path) -> None:
