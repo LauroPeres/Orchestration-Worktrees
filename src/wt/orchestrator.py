@@ -76,6 +76,25 @@ class Step:
     service: str | None = None
 
 
+@dataclass(frozen=True)
+class RepoRow:
+    """One repo of a branch's selected services, as shown in the services view."""
+
+    name: str
+    status: Literal["healthy", "unhealthy", "starting", "stopped"]
+    port: int | None
+    url: str | None
+
+
+@dataclass(frozen=True)
+class Choice:
+    """One catalog service in the configure list."""
+
+    service: str
+    repo: str
+    selected: bool
+
+
 class Orchestrator:
     def __init__(
         self, loaded: LoadedConfig, log: Log = print, out: Callable[[str], None] | None = None
@@ -854,6 +873,15 @@ class Orchestrator:
     def logs(self, branch: str, service: str, *, follow: bool = True, tail: int = 200) -> None:
         args = self.log_command(branch, service, follow=follow, tail=tail)
         proc.run(args, capture=False, check=False)
+
+    def services(self, branch: str) -> list[RepoRow]:
+        raise NotImplementedError
+
+    def catalog_choices(self, branch: str) -> list[Choice] | None:
+        raise NotImplementedError
+
+    def configure(self, branch: str, uses: list[str]) -> None:
+        raise NotImplementedError
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:

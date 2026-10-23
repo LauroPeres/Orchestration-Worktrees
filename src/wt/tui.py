@@ -15,7 +15,7 @@ from textual.widgets import DataTable, Input, Label, Static
 
 from wt.config import Config
 from wt.errors import WtError
-from wt.orchestrator import BranchStatus
+from wt.orchestrator import BranchStatus, Choice, RepoRow
 
 REFRESH_SECONDS = 2.0
 ACTIONS = "u: up  d: down  a: add  r: remove  q: quit"
@@ -39,6 +39,12 @@ class OrchestratorLike(Protocol):
     def add(self, branch: str) -> object: ...
 
     def remove(self, branch: str, *, force: bool = False) -> object: ...
+
+    def services(self, branch: str) -> list[RepoRow]: ...
+
+    def catalog_choices(self, branch: str) -> list[Choice] | None: ...
+
+    def configure(self, branch: str, uses: list[str]) -> None: ...
 
 
 @dataclass(frozen=True)
