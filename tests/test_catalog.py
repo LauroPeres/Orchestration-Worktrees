@@ -286,9 +286,19 @@ def test_rows(tmp_path: Path) -> None:
 
     (tmp_path / "catalog.yaml").write_text(GOOD)
     result = rows(load_catalog(tmp_path / "catalog.yaml").catalog)
-    assert [(r.service, r.repo, r.kind, r.infra, r.consumes, r.consumed_by) for r in result] == [
-        ("back", "notes-back", "compose", ["postgres"], [], ["front"]),
-        ("front", "notes-front", "run", [], ["back"], []),
+    assert [
+        (r.service, r.repo, r.kind, r.infra, r.consumes, r.consumed_by, r.remote) for r in result
+    ] == [
+        (
+            "back",
+            "notes-back",
+            "compose",
+            ["postgres"],
+            [],
+            ["front"],
+            "https://api.staging.example",
+        ),
+        ("front", "notes-front", "run", [], ["back"], [], None),
     ]
 
 

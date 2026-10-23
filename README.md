@@ -57,7 +57,7 @@ $EDITOR worktree.yaml
 wt up my-branch    # prints a SERVICE / URL / CHECK table
 wt ls              # branches, URLs, health, databases (--no-probe skips HTTP checks, --paths shows folders)
 wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
-wt tui                  # terminal UI: branches, services, up/down, logs
+wt tui                  # terminal UI: worktrees, services view, up/stop/add/remove
 wt add my-branch        # worktrees + reserved ports only, status "stopped"; nothing is started
 wt stop my-branch       # stops containers and processes; worktrees, volumes, databases, ports stay
 wt down my-branch       # --force also removes worktrees with uncommitted changes
@@ -103,7 +103,7 @@ services:
 | `compose` | Compose file relative to the repo root. Set exactly one of `compose` or `run`. |
 | `run` | Command for a host process (see below). Templates allowed. |
 | `compose_service` | Service name in the compose file, if it differs from the key. |
-| `port` | Container port Traefik routes to (compose), or the host port of a `run:` service, or `auto`. Required when `subdomain` is set. |
+| `port` | Container port Traefik routes to (compose), or the host port of a `run:` service (a number, or `auto`, see [Ports](#ports)). Required when `subdomain` is set. |
 | `subdomain` | `""` = branch root (`https://<branch>.<domain>`); unset = not routed. |
 | `health` | Path probed through Traefik after `up` (default `/`). |
 | `env` | Extra environment for the container. Values can use templates; a `$` in a value is literal. |
@@ -121,7 +121,7 @@ branch's worktree:
   web:
     repo: web
     run: npm run dev -- --host 0.0.0.0 --port {{ port }}
-    port: auto                  # a free port per branch, kept for that branch
+    port: auto                  # a deterministic port per branch and service (see Ports)
     subdomain: ""               # https://<branch>.shop.localhost
 ```
 
@@ -129,8 +129,8 @@ branch's worktree:
   `services.<name>.port` hold the resolved port.
 - Every `{{ ... }}` value in `run:` is shell-quoted for you, so a branch name like `x;rm -rf ~`
   stays one literal argument. Do not add quotes around template values in `run:`.
-- `port: auto` picks a stable free port per (project, branch, service); an explicit number is
-  used as is and `up` fails if something else holds it.
+- `port: auto` gets the port from the formula in [Ports](#ports). An explicit number is used as
+  is, and `up` fails if something else holds it.
 - Running `wt up` again keeps a live process as is. If its rendered command, port or `env`
   changed in `worktree.yaml`, `up` stops it and starts the new one.
 - Output goes to `~/.wt/<project>/branches/<slug>/logs/<service>.log`; read it with
@@ -196,48 +196,92 @@ services whose URL it reads).
 project: notes
 domain: notes.localhost
 catalog: ./catalog.yaml
-uses: [front]                  # back comes in because front consumes it
+uses: [front, back]            # exactly these; back's remote: is used if it were not selected
 ```
 
 - A worktree.yaml has either `services:` (as above) or `uses:`, not both.
-- `uses:` plus every service reached through `consumes` make the stack. Repos come from the
-  catalog.
-- `consumes: {back: API_URL}` sets `API_URL` to the back's branch URL and starts the back first.
+- `uses:` is exactly what runs. `consumes` does not add services. Repos come from the catalog.
+- `consumes: {back: API_URL}` sets `API_URL` to the back's branch URL and starts the back first,
+  when `back` is selected.
+- When `back` is not selected, `API_URL` is the back's `remote:` URL.
+- Every catalog service that some service consumes must set `remote:` (an `http://` or
+  `https://` URL), or the catalog is invalid.
+- A worktree can change its selection with `configure` (`c` in the services view of `wt tui`).
+  The selection is stored per branch and starts from `uses:`.
 - `wt catalog` prints the catalog: service, repo, kind, infra, consumes and consumed by.
   `wt catalog --check` validates it.
 
-The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-implementation-notes).
+The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-implementation-notes)
+and [§17](docs/SPEC.md#17-v03-services-view-per-worktree-selection-deterministic-ports).
 A working example is in [examples/notes](examples/notes/README.md).
 
 ## Terminal UI (`wt tui`)
 
-`wt tui` shows the branches of the current project. The left pane lists them with their status,
-the right pane lists the services of the selected branch, and the bottom pane shows the output
-of what you ran.
+`wt tui` shows one compact table with one row per worktree of the current project. Columns:
+`NAME` and `STATUS`. Below the table is the action line and a message line.
+
+```
+NAME          STATUS
+feat/cart     up
+main          stopped
+enter: services  u: up  d: down  a: add  r: remove  q: quit
+```
 
 | Key | Action |
 |---|---|
-| arrows | select a branch or service |
-| `u` | up the selected branch |
-| `n` | up a new branch (asks for its name) |
-| `d` | down the selected branch (asks to confirm; a second confirm offers `--force`) |
-| `l` | tail the selected service's log in the bottom pane |
-| `r` | refresh |
+| arrows | select a worktree |
+| `enter` | open the services view of the selected worktree |
+| `u` | up the selected worktree |
+| `d` | stop the selected worktree (services down, worktree kept; the key is labeled `down`) |
+| `a` | add a worktree (asks for its name) |
+| `r` | remove the selected worktree (asks to confirm; then `remove --force`) |
 | `q` | quit |
 
-The list refreshes by itself. Actions run in the background, one at a time; errors show in the
-bottom pane and the app stays open.
+The services view has one row per repo of the worktree: `NAME`, `STATUS`, `PORT` and `URL`.
+It refreshes every 2 s.
+
+| Key | Action |
+|---|---|
+| `c` | configure: a checklist of the catalog services (`<service> (<repo>)`) |
+| `esc` | back to the table |
+| `q` | quit |
+
+In the checklist, space toggles a service, enter confirms and runs `configure`, and esc cancels.
+`configure` needs a catalog project (`uses:`); a `services:` project shows a message instead.
+
+Colors: the key letters of the action line are green, `PORT` values are purple, and `STATUS`
+values `healthy` and `up` are green. Everything else is plain.
+
+Actions run in the background, one at a time; errors show on the message line and the app stays
+open. The table refreshes by itself.
 
 A `worktree` command opens the same TUI from any folder. Inside a project it opens that project.
-Outside a project it lists every project wt knows, with their branches.
+Outside a project it lists every project wt knows, and `NAME` becomes `<project>/<branch>`.
+
+## Ports
+
+- Each worktree gets a global index: the smallest number not used by any worktree of any project.
+  It is kept in `$WT_HOME/worktree-index.json`. `stop` keeps the index; `down` and `remove`
+  free it.
+- A host port is `10000 + worktree index × 100 + service index`. The service index is the
+  position of the service in the catalog's `services:` (or in your `services:` list), so it does
+  not change with the selection. More than 100 services is an error. Worktree indexes above 554
+  are an error, because the port would pass 65535.
+- The formula applies to `port: auto` on `run:` services and to compose services with `port:`.
+  An explicit number on a `run:` service is used as is.
+- Compose services are published on `127.0.0.1` only, as `127.0.0.1:<host port>:<container port>`.
+- There is no probing. If a port is used by another worktree, or is not free on the host, `up`
+  or `add` fails with a message such as `port 10101 for service 'back' (worktree index 1) is in
+  use; free it`.
 
 ## How isolation works
 
 - **Names are derived from (project, branch)**, so the same branch always gets the same
   resources and `down` never guesses. `feat/cart` becomes `feat-cart`.
 - **One compose project per branch and repo** (`wt-shop-feat-cart-api`). wt adds an override
-  file that removes published host ports and fixed `container_name`s (they would collide
-  between branches) and attaches routed services to a shared `wt` Docker network.
+  file that replaces published host ports with `127.0.0.1` bindings (see [Ports](#ports)), removes
+  fixed `container_name`s (they would collide between branches) and attaches routed services to
+  a shared `wt` Docker network.
 - **One shared Traefik** bound to `127.0.0.1`, with one route file per branch in
   `~/.wt/traefik/dynamic/`.
 - **One mkcert certificate per branch** for `<branch>.<domain>` and `*.<branch>.<domain>`,
