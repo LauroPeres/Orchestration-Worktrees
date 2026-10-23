@@ -1,4 +1,4 @@
 project: notes
 domain: notes.localhost
 catalog: ./catalog.yaml
-uses: [front]
+uses: [front, back]

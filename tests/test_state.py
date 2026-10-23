@@ -1,3 +1,4 @@
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -5,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from wt.errors import WtError
-from wt.state import BranchState, StateStore, atomic_write
+from wt.state import (
+    BranchState,
+    StateStore,
+    allocate_index,
+    atomic_write,
+    index_registry_path,
+    release_index,
+)
 
 
 def test_edit_roundtrip(isolated_home: Path) -> None:
@@ -139,3 +147,78 @@ def test_providers_roundtrip(isolated_home: Path) -> None:
     with store.edit() as state:
         state.branches["b"] = BranchState(branch="b", slug="b", providers={"postgres": ["shop__b"]})
     assert store.load().branches["b"].providers == {"postgres": ["shop__b"]}
+
+
+def test_old_state_without_index_loads(isolated_home: Path) -> None:
+    store = StateStore("shop")
+    _write_raw(
+        store,
+        json.dumps({"project": "shop", "branches": {"x": {"branch": "x", "slug": "x"}}}),
+    )
+    assert store.load().branches["x"].index is None
+
+
+def test_allocate_index_is_smallest_free_and_global(isolated_home: Path) -> None:
+    assert allocate_index("shop", "a") == 0
+    assert allocate_index("blog", "a") == 1
+    assert allocate_index("shop", "b") == 2
+    assert json.loads(index_registry_path().read_text()) == {
+        "0": "shop/a",
+        "1": "blog/a",
+        "2": "shop/b",
+    }
+
+
+def test_allocate_index_is_idempotent_per_owner(isolated_home: Path) -> None:
+    assert allocate_index("shop", "feat/x") == 0
+    assert allocate_index("shop", "feat/x") == 0
+    assert allocate_index("shop", "other") == 1
+
+
+def test_release_index_frees_the_gap(isolated_home: Path) -> None:
+    for branch in ("a", "b", "c"):
+        allocate_index("shop", branch)
+    release_index("shop", "b")
+    assert allocate_index("shop", "d") == 1
+    release_index("shop", "missing")  # no-op
+    assert allocate_index("shop", "e") == 3
+
+
+def test_release_without_registry_is_a_noop(isolated_home: Path) -> None:
+    release_index("shop", "a")
+    assert allocate_index("shop", "a") == 0
+
+
+def test_registry_is_rebuilt_from_state_files(isolated_home: Path) -> None:
+    with StateStore("shop").edit() as state:
+        state.branches["a"] = BranchState(branch="a", slug="a", index=0)
+        state.branches["c"] = BranchState(branch="c", slug="c", index=2)
+    with StateStore("blog").edit() as state:
+        state.branches["a"] = BranchState(branch="a", slug="a", index=1)
+        state.branches["old"] = BranchState(branch="old", slug="old")  # no index yet
+    assert not index_registry_path().exists()
+    assert allocate_index("blog", "new") == 3
+    assert json.loads(index_registry_path().read_text()) == {
+        "0": "shop/a",
+        "1": "blog/a",
+        "2": "shop/c",
+        "3": "blog/new",
+    }
+
+
+def test_registry_gains_entries_missing_from_it(isolated_home: Path) -> None:
+    assert allocate_index("shop", "a") == 0
+    with StateStore("blog").edit() as state:
+        state.branches["b"] = BranchState(branch="b", slug="b", index=1)
+    assert allocate_index("shop", "c") == 2
+
+
+def test_corrupt_registry_is_rebuilt(isolated_home: Path) -> None:
+    atomic_write(index_registry_path(), "not json")
+    assert allocate_index("shop", "a") == 0
+
+
+def test_allocate_index_stops_at_the_port_limit(isolated_home: Path) -> None:
+    atomic_write(index_registry_path(), json.dumps({str(i): f"p/b{i}" for i in range(555)}))
+    with pytest.raises(WtError, match="too many worktrees"):
+        allocate_index("shop", "late")

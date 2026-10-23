@@ -48,18 +48,23 @@ class ServicePatch:
     alias: str | None = None  # network alias on the shared `wt` network (routed services)
     env: dict[str, str] = field(default_factory=dict)
     network: bool = False  # join the shared `wt` network even without an alias
+    publish: tuple[int, int] | None = None  # (host port, container port) bound on 127.0.0.1
 
 
 def build_override(all_services: list[str], patches: dict[str, ServicePatch]) -> dict[str, Any]:
     """Override file that makes a compose project safe to run once per branch.
 
     Every service loses its published host ports and fixed container_name (they would collide
-    between branches). Routed services join the shared `wt` network so Traefik can reach them.
+    between branches); a patch with `publish` gets one loopback host port back.
+    Routed services join the shared `wt` network so Traefik can reach them.
     """
     services: dict[str, Any] = {}
     for name in all_services:
-        spec: dict[str, Any] = {"ports": Reset([]), "container_name": Reset(None)}
         patch = patches.get(name)
+        published: list[Any] = []
+        if patch and patch.publish:
+            published = [f"127.0.0.1:{patch.publish[0]}:{patch.publish[1]}"]
+        spec: dict[str, Any] = {"ports": Reset(published), "container_name": Reset(None)}
         if patch and patch.env:
             # Compose interpolates `$` in values; `$$` makes it pass them literally.
             spec["environment"] = {k: v.replace("$", "$$") for k, v in patch.env.items()}
