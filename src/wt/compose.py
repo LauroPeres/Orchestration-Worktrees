@@ -1,6 +1,7 @@
 """Docker Compose runtime: one compose project per (branch, repo)."""
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,12 +87,20 @@ def list_services(compose_file: Path) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def up(project: str, files: list[Path], *, cwd: Path, build: bool, timeout: int) -> None:
+def up(
+    project: str,
+    files: list[Path],
+    *,
+    cwd: Path,
+    build: bool,
+    timeout: int,
+    on_line: Callable[[str], None] | None = None,
+) -> None:
     args = [*_base(project, files), "up", "-d", "--remove-orphans", "--wait", "--quiet-pull"]
     args += ["--wait-timeout", str(timeout)]
     if build:
         args.append("--build")
-    proc.run(args, cwd=cwd, capture=False)
+    proc.run(args, cwd=cwd, capture=False, on_line=on_line)
 
 
 def down(project: str) -> None:
