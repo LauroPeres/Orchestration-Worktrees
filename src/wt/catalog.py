@@ -95,6 +95,7 @@ class Row:
     infra: list[str]
     consumes: list[str]
     consumed_by: list[str]
+    remote: str | None
 
 
 def rows(cat: Catalog) -> list[Row]:
@@ -107,6 +108,7 @@ def rows(cat: Catalog) -> list[Row]:
             infra=svc.infra.configured(),
             consumes=list(svc.consumes),
             consumed_by=sorted(n for n, other in cat.services.items() if name in other.consumes),
+            remote=svc.remote,
         )
         for name, svc in sorted(cat.services.items())
     ]

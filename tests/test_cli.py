@@ -286,9 +286,26 @@ def test_catalog_table_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     result = runner.invoke(app, ["catalog"])
     assert result.exit_code == 0, result.output
     lines = result.output.splitlines()
-    assert lines[0].split() == ["SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED", "BY"]
-    assert lines[1].split() == ["back", "notes-back", "compose", "postgres", "-", "front"]
-    assert lines[2].split() == ["front", "notes-front", "run", "-", "back", "-"]
+    assert lines[0].split() == [
+        "SERVICE",
+        "REPO",
+        "KIND",
+        "INFRA",
+        "CONSUMES",
+        "CONSUMED",
+        "BY",
+        "REMOTE",
+    ]
+    assert lines[1].split() == [
+        "back",
+        "notes-back",
+        "compose",
+        "postgres",
+        "-",
+        "front",
+        "https://api.staging.example",
+    ]
+    assert lines[2].split() == ["front", "notes-front", "run", "-", "back", "-", "-"]
 
 
 def test_catalog_uses_worktree_yaml_catalog(
