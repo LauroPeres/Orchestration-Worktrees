@@ -17,7 +17,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog
+from textual.widgets import DataTable, Footer, Input, Label, ListItem, ListView, RichLog, Static
 
 from wt.config import Config
 from wt.errors import WtError
@@ -25,7 +25,10 @@ from wt.orchestrator import BranchStatus
 
 REFRESH_SECONDS = 2.0
 TAIL_LINES = 200
-HEALTH = {"ok": "[green]ok[/]", "fail": "[red]fail[/]", "skipped": "[dim]skipped[/]"}
+DOT = "\u25cf"
+STATUS_COLORS = {"up": "#4ade80", "degraded": "#facc15", "failed": "#f87171"}
+HEALTH_COLORS = {"ok": "#4ade80", "fail": "#f87171", "skipped": "dim"}
+HEALTH = {k: f"[{c}]{DOT} {k}[/]" for k, c in HEALTH_COLORS.items()}
 
 
 class OrchestratorLike(Protocol):
@@ -81,7 +84,8 @@ def _kill_group(tail: subprocess.Popen[str]) -> None:
 
 
 def branch_label(row: BranchStatus) -> str:
-    return f"{escape(row.branch)}  [dim]{escape(row.status)}[/]"
+    color = STATUS_COLORS.get(row.status, "dim")
+    return f"{escape(row.branch):<20}[{color}]{DOT} {escape(row.status)}[/]"
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -140,10 +144,18 @@ class WtApp(App[None]):
 
     TITLE = "wt"
     CSS = """
+    #titlebar { height: 1; padding: 0 1; background: $boost; }
     #main { height: 1fr; }
-    #branches { width: 32; border: round $primary; }
-    #services { width: 1fr; border: round $primary; }
-    #log { height: 10; border: round $primary; }
+    #branches, #services, #log { border: round $accent; border-title-color: $accent; }
+    #branches:focus, #services:focus, #log:focus { border: round $success; }
+    #branches { width: 36; }
+    #services { width: 1fr; }
+    #log { height: 10; }
+    ListView > ListItem.-highlight { background: $primary 50%; text-style: bold; }
+    ListView:focus > ListItem.-highlight { background: $primary 70%; }
+    DataTable > .datatable--cursor { background: $primary 50%; text-style: bold; }
+    DataTable > .datatable--header { text-style: bold; color: $accent; }
+    Footer { background: $boost; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("u", "up_selected", "Up"),
@@ -177,7 +189,7 @@ class WtApp(App[None]):
         self._tail_target: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Static(id="titlebar")
         with Horizontal(id="main"):
             yield ListView(id="branches")
             yield DataTable(id="services", cursor_type="row")
@@ -186,17 +198,35 @@ class WtApp(App[None]):
 
     def on_mount(self) -> None:
         self.sub_title = self.orch.cfg.project if self.orch else "all projects"
+        self._update_titles()
         branches = self.query_one("#branches", ListView)
-        branches.border_title = "Branches" if self.orch else "Projects"
+        branches.border_title = "branches" if self.orch else "projects"
         branches.focus()
         table = self.query_one("#services", DataTable)
-        table.border_title = "Services"
+        table.border_title = "services"
         table.add_columns("SERVICE", "KIND", "URL", "HEALTH")
         log = self.query_one("#log", RichLog)
-        log.border_title = "Log"
+        log.border_title = "log"
         log.write("[dim]No log yet.[/]")
         self.set_interval(REFRESH_SECONDS, self.action_refresh)
         self.action_refresh()
+
+    def _update_titles(self) -> None:
+        """Colored title line and the services panel title (`services · <branch>`)."""
+        project = self.orch.cfg.project if self.orch else "all projects"
+        up = sum(1 for r in self.rows if r.status is not None and r.status.status == "up")
+        line = Text.assemble(
+            ("worktree", "bold magenta"),
+            (" \u00b7 ", "dim"),
+            (project, "bold cyan"),
+            (" \u00b7 ", "dim"),
+            (f"{up} branches up", "#4ade80" if up else "dim"),
+        )
+        self.query_one("#titlebar", Static).update(line)
+        branch = self.selected_branch
+        self.query_one("#services", DataTable).border_title = (
+            f"services \u00b7 {escape(branch)}" if branch else "services"
+        )
 
     # -- helpers for later actions ------------------------------------------------
 
@@ -506,6 +536,7 @@ class WtApp(App[None]):
             self.sub_title = f"{self.orch.cfg.project} (docker unavailable)"
         else:
             self.sub_title = self.orch.cfg.project
+        self._update_titles()
         if row is None:
             return
         for svc in row.services:
