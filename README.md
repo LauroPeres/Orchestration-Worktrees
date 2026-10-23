@@ -256,7 +256,7 @@ Actions run in the background, one at a time; errors show on the message line an
 open. The table refreshes by itself.
 
 A `worktree` command opens the same TUI from any folder. Inside a project it opens that project.
-Outside a project it lists every project wt knows, and `NAME` becomes `<project>/<branch>`.
+Outside a project it lists every project wt knows, with a `PROJECT` column first.
 
 ## Ports
 
