@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from wt.catalog import catalog_path, load_catalog
+from wt.config import load_config
 from wt.errors import WtError
 
 GOOD = """\
@@ -109,3 +110,138 @@ def test_two_consumed_services_cannot_share_an_env_var() -> None:
         CatalogService.model_validate(
             {"repo": "r", "run": "x", "consumes": {"a": "API_URL", "b": "API_URL"}}
         )
+
+
+# --- resolve (uses:) ---
+def project(tmp_path: Path, catalog: str, extra: str = "uses: [front]\n") -> Path:
+    (tmp_path / "catalog.yaml").write_text(catalog)
+    cfg = tmp_path / "worktree.yaml"
+    cfg.write_text(f"project: notes\ndomain: notes.localhost\ncatalog: ./catalog.yaml\n{extra}")
+    return cfg
+
+
+def test_uses_resolves(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD))
+    cfg = loaded.config
+    assert loaded.catalog == tmp_path / "catalog.yaml"
+    assert list(cfg.services) == ["front", "back"]  # back comes in through consumes
+    assert cfg.services["front"].needs == ["back"]
+    assert cfg.services["front"].env == {"API_URL": "{{ services.back.url }}"}
+    assert cfg.repos["notes-back"] == str(tmp_path / "back")
+    assert cfg.shared.postgres is not None and cfg.shared.postgres.databases == ["notes"]
+    assert loaded.repo_path("notes-back") == tmp_path / "back"
+
+
+def test_uses_only_closure(tmp_path: Path) -> None:
+    loaded = load_config(project(tmp_path, GOOD, "uses: [back]\n"))
+    assert list(loaded.config.services) == ["back"]
+    assert list(loaded.config.repos) == ["notes-back"]
+
+
+@pytest.mark.parametrize(
+    ("extra", "msg"),
+    [
+        ("uses: [front]\nservices: {}\n", "exactly one"),
+        ("uses: [front]\nshared: {}\n", "'shared'"),
+        ("uses: [nope]\n", "unknown service 'nope'"),
+        ("uses: []\n", "non-empty"),
+        ("uses: [front]\nrepos: {x: .}\n", "repos"),
+    ],
+)
+def test_uses_errors(tmp_path: Path, extra: str, msg: str) -> None:
+    with pytest.raises(WtError, match=msg):
+        load_config(project(tmp_path, GOOD, extra))
+
+
+def test_consumes_dep_without_route(tmp_path: Path) -> None:
+    text = GOOD.replace("    subdomain: api\n", "")
+    with pytest.raises(WtError, match="no 'subdomain'"):
+        load_config(project(tmp_path, text))
+
+
+def test_consumes_var_already_in_env(tmp_path: Path) -> None:
+    text = GOOD.replace("    consumes:", "    env: {API_URL: x}\n    consumes:")
+    with pytest.raises(WtError, match="API_URL"):
+        load_config(project(tmp_path, text))
+
+
+def two_infra(a: str, b: str) -> str:
+    return f"""\
+repos: {{r: ./r}}
+services:
+  one:
+    repo: r
+    compose: c.yml
+    port: 80
+    subdomain: one
+    infra:
+      postgres: {a}
+  two:
+    repo: r
+    compose: c.yml
+    consumes: {{one: ONE_URL}}
+    infra:
+      postgres: {b}
+"""
+
+
+def test_infra_union_and_conflict(tmp_path: Path) -> None:
+    ok = two_infra("{databases: [a]}", "{databases: [b, a], strategy: dump-restore}")
+    shared = load_config(project(tmp_path, ok, "uses: [two]\n")).config.shared
+    assert shared.postgres is not None
+    assert shared.postgres.databases == ["b", "a"]  # discovery order: two, then one
+    assert shared.postgres.strategy == "dump-restore"
+    bad = two_infra(
+        "{databases: [a], strategy: template}", "{databases: [b], strategy: dump-restore}"
+    )
+    with pytest.raises(WtError, match=r"'one'.*'two'|'two'.*'one'"):
+        load_config(project(tmp_path, bad, "uses: [two]\n"))
+
+
+def test_neither_services_nor_uses(tmp_path: Path) -> None:
+    cfg = project(tmp_path, GOOD, "")
+    with pytest.raises(WtError, match="set exactly one of 'services' or 'uses'"):
+        load_config(cfg)
+
+
+def test_consumes_cycle_message(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "    subdomain: api\n", "    subdomain: api\n    consumes: {front: FRONT_URL}\n"
+    )
+    with pytest.raises(WtError, match="cycle through catalog consumes: front -> back -> front"):
+        load_config(project(tmp_path, text))
+
+
+DIAMOND = """\
+repos: {r: ./r}
+services:
+  top:
+    repo: r
+    compose: c.yml
+    consumes: {left: LEFT, right: RIGHT}
+  left:
+    repo: r
+    compose: c.yml
+    port: 80
+    subdomain: left
+    consumes: {base: BASE}
+  right:
+    repo: r
+    compose: c.yml
+    port: 81
+    subdomain: right
+    consumes: {base: BASE}
+  base:
+    repo: r
+    compose: c.yml
+    port: 82
+    subdomain: base
+"""
+
+
+def test_diamond_consumes_has_no_duplicates(tmp_path: Path) -> None:
+    cfg = load_config(project(tmp_path, DIAMOND, "uses: [top, base]\n")).config
+    assert sorted(cfg.services) == ["base", "left", "right", "top"]
+    assert cfg.services["top"].needs == ["left", "right"]
+    assert cfg.services["left"].needs == ["base"]
+    assert list(cfg.repos) == ["r"]
