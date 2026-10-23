@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from tests.conftest import COMPOSE, SHARED, FakeDocker, FakeProvider
 from wt import compose, git, health, host, naming, proc, router, tls
@@ -541,7 +542,7 @@ def run_service(**extra: object) -> dict[str, object]:
 def run_orch(orch, docker: FakeDocker) -> Iterator[Callable[..., Orchestrator]]:
     built: list[Orchestrator] = []
 
-    def build(services: dict[str, object] | None = None, **kwargs: object) -> Orchestrator:
+    def build(services: dict[str, object] | None = None, **kwargs: Any) -> Orchestrator:
         o: Orchestrator = orch(extra_services=services or run_service(), **kwargs)
         built.append(o)
         return o
@@ -1021,3 +1022,124 @@ services:
     Orchestrator(load_config(path), log=lambda m: None).up("feat/x")
     override = docker.files[0][1].read_text()
     assert "API_URL: https://api.feat-x.shop.localhost" in override
+
+
+# ---- start order (needs) -----------------------------------------------------------------
+
+
+@pytest.fixture
+def start_events(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Compose group and process starts, in call order."""
+    events: list[str] = []
+    real_start, real_up = host.start, compose.up
+
+    def start(command: str, cwd: Path, *a: Any, **k: Any) -> ProcessState:
+        events.append(f"process {Path(cwd).name}:{command.split()[-1]}")
+        return real_start(command, cwd, *a, **k)
+
+    def up(project: str, *a: Any, **k: Any) -> None:
+        events.append(f"compose {project}")
+        real_up(project, *a, **k)
+
+    monkeypatch.setattr(host, "start", start)
+    monkeypatch.setattr(compose, "up", up)
+    return events
+
+
+def sleeper(tag: str, **extra: object) -> dict[str, object]:
+    return {"repo": "api", "run": f"sleep 60 # {tag}", **extra}
+
+
+def test_run_service_needing_a_compose_group_starts_after_it(
+    run_orch, start_events: list[str]
+) -> None:
+    o = run_orch({"front": sleeper("front", needs=["db"])})
+    o.up("main")
+    assert [e.split(":")[0] for e in start_events] == [
+        "compose wt-shop-main-api",
+        "process shop-api",
+    ]
+
+
+def test_compose_group_needing_a_run_service_starts_after_it(
+    run_orch, start_events: list[str]
+) -> None:
+    services = {"job": sleeper("job")}
+    o = run_orch(services, extra_needs={"db": ["job"]})
+    o.up("main")
+    assert [e.split(":")[0] for e in start_events] == [
+        "process shop-api",
+        "compose wt-shop-main-api",
+    ]
+
+
+def test_run_services_start_in_needs_order(run_orch, start_events: list[str]) -> None:
+    services = {
+        "front": sleeper("front", needs=["mid"]),
+        "mid": sleeper("mid", needs=["back"]),
+        "back": sleeper("back"),
+    }
+    o = run_orch(services)
+    o.up("main")
+    assert start_events[1:] == [
+        "process shop-api:back",
+        "process shop-api:mid",
+        "process shop-api:front",
+    ]
+
+
+def test_without_needs_the_order_is_compose_then_run_in_config_order(
+    run_orch, start_events: list[str]
+) -> None:
+    o = run_orch({"one": sleeper("one"), "two": sleeper("two")})
+    o.up("main")
+    assert start_events == [
+        "compose wt-shop-main-api",
+        "process shop-api:one",
+        "process shop-api:two",
+    ]
+
+
+def test_consumer_waits_for_a_run_service_port(run_orch, start_events: list[str]) -> None:
+    services = {
+        "back": sleeper("back", port="auto"),
+        "front": sleeper("front", needs=["back"]),
+    }
+    o = run_orch(services)
+    with pytest.raises(WtError, match="back"):
+        o.up("main", timeout=1)
+    assert start_events == [
+        "compose wt-shop-main-api",
+        "process shop-api:back",
+    ]  # front never started
+
+
+def test_cycle_across_compose_groups_is_an_error_before_anything_starts(
+    make_repo, tmp_path: Path, docker: FakeDocker, start_events: list[str]
+) -> None:
+    make_repo("one", {"docker-compose.yml": COMPOSE})
+    make_repo("two", {"docker-compose.yml": COMPOSE})
+    config = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"one": "./one", "two": "./two"},
+        "services": {
+            "a1": {"repo": "one", "compose": "docker-compose.yml", "compose_service": "api"},
+            "a2": {"repo": "one", "compose": "docker-compose.yml", "compose_service": "db"},
+            "b1": {
+                "repo": "two",
+                "compose": "docker-compose.yml",
+                "compose_service": "api",
+                "needs": ["a1"],
+            },
+            "b2": {"repo": "two", "compose": "docker-compose.yml", "compose_service": "db"},
+        },
+    }
+    config["services"]["a2"]["needs"] = ["b2"]  # type: ignore[index]
+    path = tmp_path / "worktree.yaml"
+    path.write_text(yaml.safe_dump(config))
+    o = Orchestrator(load_config(path), log=lambda m: None)
+    with pytest.raises(WtError, match="cycle"):
+        o.up("main")
+    assert start_events == [] and docker.ups == []
+    assert "main" not in o.store.load().branches
