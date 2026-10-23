@@ -1,7 +1,17 @@
 import pytest
 
 from wt.errors import WtError
-from wt.naming import AUTO_PORT_RANGE, MAX_SLUG, Names, auto_port, fit, slugify
+from wt.naming import (
+    AUTO_PORT_RANGE,
+    MAX_SLUG,
+    PORT_BASE,
+    PORT_STRIDE,
+    Names,
+    auto_port,
+    fit,
+    host_port,
+    slugify,
+)
 
 
 @pytest.mark.parametrize(
@@ -79,3 +89,22 @@ def test_fit_differs_for_long_names_that_differ_at_the_end() -> None:
 def test_slugify_cuts_a_60_char_branch_to_max_slug() -> None:
     slug = slugify("feat/" + "b" * 55)
     assert len(slug) <= MAX_SLUG
+
+
+def test_host_port_formula() -> None:
+    assert (PORT_BASE, PORT_STRIDE) == (10000, 100)
+    assert host_port(0, 0) == 10000
+    assert host_port(1, 1) == 10101
+    assert host_port(3, 99) == 10399
+    assert host_port(554, 99) == 65499
+
+
+def test_host_port_limits() -> None:
+    with pytest.raises(WtError, match="service index"):
+        host_port(0, 100)
+    with pytest.raises(WtError, match="65535"):
+        host_port(555, 99)
+    with pytest.raises(WtError):
+        host_port(-1, 0)
+    with pytest.raises(WtError):
+        host_port(0, -1)

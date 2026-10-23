@@ -158,7 +158,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 |---|---|
 | v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
-| v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
+| v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
 | v0.4 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
 | v0.5 | Keycloak provider (SSO across branch subdomains) |
 | later | shared dependency caches, plugin entry points, native Windows |
@@ -189,6 +189,7 @@ Decisions taken while building v0.1. Change them here first if they need to chan
   An override file drops published `ports` and `container_name` from every service (`!reset`,
   Compose 2.24+), adds `env`, and puts routed services on the shared `wt` network with a
   per-branch alias. One compose file per repo in v0.1. `down` also removes the branch's volumes.
+  Changed by §17: compose services with a `port` keep their published port, bound to `127.0.0.1`.
 - **Routing.** One Traefik container (`wt-traefik`) bound to `127.0.0.1`, static config as CLI
   flags, file provider on `~/.wt/traefik/dynamic/`. Route files are written atomically.
   Ports: `WT_HTTP_PORT` / `WT_HTTPS_PORT` (default 80/443). Image: `WT_TRAEFIK_IMAGE`.
@@ -335,6 +336,7 @@ ports lock held while picking and rendering, so two concurrent `up` never pick t
 it is kept for the branch. An explicit integer port is used as is and
 fails clearly if taken (unless it is our own live process). Ports are resolved before rendering.
 The context vars `port` and `services.<name>.port` show the resolved port.
+Changed by §17: `port: auto` no longer probes; ports come from the deterministic formula.
 
 **Process state.** `ProcessState(pid, pgid, port, command, started_at, log, env_hash)`. Alive = `os.killpg(pgid, 0)`
 succeeds and, while the leader pid exists, it is still in that group and started no later than
@@ -432,6 +434,8 @@ domain: notes.localhost
 catalog: ./catalog.yaml        # optional
 uses: [front]                  # back comes in because front consumes it
 ```
+
+Changed by §17: `uses` is the exact stack (no closure through `consumes`), and the service order is the selection order.
 
 Rules:
 - A worktree.yaml has exactly one of `services:` (v0.2 style, unchanged) or `uses:`.
@@ -550,7 +554,7 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 - `BranchStatus` (the `ls()` rows) gains `ports: list[int]`, the reserved host ports of the branch
   (`BranchState.ports`), sorted.
 
-**TUI (table).** `wt tui` and `worktree` open the same compact, monochrome screen (no colors):
+**TUI (table).** `wt tui` and `worktree` open the same compact, monochrome screen (no colors; changed by §17):
 - One table, one row per worktree, columns `NAME`, `STATUS`, `PORT`. `PORT` is the reserved host
   ports joined with `, `, or `-`. Outside a project (all projects) `NAME` is `<project>/<branch>`.
 - The table has a plain border and only takes the height of its rows. Right below it, one line
@@ -564,5 +568,91 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 - One action at a time, in a worker thread; keys pressed while busy show a note on the message
   line. The table refreshes every 2 s and after each action.
 - Removed for now: services pane, log pane, `l` (logs), `n`, the refresh key, colors.
+- Changed by §17: the PORT column is gone (`NAME`, `STATUS`), and colors are back (§17 item 8).
 - Later (not now): the front of a worktree gets a default URL built from the repo and worktree
   name.
+
+## 17. v0.3: services view, per-worktree selection, deterministic ports
+
+Decided during the services-view sprint. Replaces the parts of §15 and §16 named there, and the
+port rules of §13 (compose isolation) and §14 (ports).
+
+**Decisions**
+- **D-a. Selection.** Stored as `BranchState.uses: list[str] | None`. `None` means the `uses:` of
+  worktree.yaml. The configure checkboxes start from this selection, not from live status.
+- **D-b. Service index.** Position in the catalog's `services:` (catalog projects, whatever the
+  selection) or in `services:` (v0.2 projects). More than 100 services is a WtError at load.
+  A worktree index above 554 (the port would pass 65535) is a WtError.
+- **D-c. Worktree index is global.** The index is shared by all projects of the user, so two
+  worktrees never share ports. It is the smallest index not used by any branch of any project,
+  kept in the registry `$WT_HOME/worktree-index.json` (`{index: "<project>/<branch>"}`) under the
+  ports lock, and recorded as `BranchState.index`. It is freed on `down` and `remove`, kept on
+  `stop`. Registry entries missing from the state files are rebuilt from the state files.
+- **D-d. `services.<x>.url` for remote services.** A catalog service that is not selected renders
+  its `remote:` (or `""` if it has none). Its `host` is `""` and its `port` is None. `needs` lists
+  selected dependencies only.
+- **D-e. Configure.** Validate and store the selection. Tear down the services that left: their
+  processes are killed; a repo's compose project gets `docker compose down` (no `-v`) only when
+  none of that repo's services stays selected; routes are rewritten. Worktrees, databases and
+  volumes of removed services stay until `down` or `remove`. Then `up(branch)`, unless the
+  worktree is `stopped` and nothing was added. An empty selection is a WtError
+  "select at least one service".
+- **D-f. TUI.** The main action line gains `enter: services`.
+
+**Contract**
+1. **Exact `uses`.** The stack is exactly the selection (`BranchState.uses`, else `uses:`).
+   `consumes` no longer pulls services in. For `consumes: {dep: VAR}`: if `dep` is selected,
+   `VAR = {{ services.dep.url }}` and `dep` is added to `needs` (as before); if not, `VAR` is the
+   `remote:` URL of `dep` (literal). `infra` is merged from the selected services only. Service
+   order is the selection order. D-d applies to `services.<x>` in templates.
+2. **`remote:`.** New CatalogService key `remote: str | None`, which must start with `http://` or
+   `https://`. Every service that some catalog service consumes must set it, otherwise the
+   catalog is invalid: `service 'back' is consumed by 'front' and needs 'remote:' (the URL used
+   when it is not selected)`. `wt catalog` gains a REMOTE column.
+3. **Selection in state.** `BranchState.uses: list[str] | None = None` (D-a). `LoadedConfig` gains
+   `uses: tuple[str, ...] | None` (None for `services:` projects), `remotes: dict[str, str]`
+   (non-selected catalog services, mapped to their remote or ""), `service_order: tuple[str, ...]`,
+   `service_index(name) -> int`, and `with_uses(uses: list[str]) -> LoadedConfig`. `with_uses`
+   re-resolves from the same worktree.yaml and catalog, and raises WtError on unknown names or
+   infra conflicts. The Orchestrator runs every branch operation (`up`, `add`, `stop`, `down`,
+   `remove`, `ls` rows, `services`) with the config of that branch's selection.
+4. **Ports.** `BranchState.index: int | None`. The worktree index is assigned by D-c when the
+   entry is created (or on the next `add` or `up` for older entries), kept by `stop`, and freed
+   when the entry is deleted. `naming.host_port(worktree_index, service_index) = PORT_BASE +
+   worktree_index * 100 + service_index` with `PORT_BASE = 10000`. It applies to `port: auto` run
+   services and to compose services with `port` (the container port). An explicit integer `port`
+   on a run service is used as is (§14 Ports rule). All host ports go to `BranchState.ports`.
+   There is no probing. A port that another state branch records, or that is not free on the
+   host (unless this worktree already records it and is `up` or `degraded`), fails `up` or `add`
+   with `port 10101 for service 'back' (worktree index 1) is in use; free it`.
+   `naming.auto_port`, `AUTO_PORT_RANGE` and the probing in `host.pick_port` are removed; this
+   replaces §14 "Ports".
+5. **Compose publish.** The override keeps `ports: !reset`, but sets it to
+   `["127.0.0.1:<host_port>:<port>"]` for compose services with a `port`. This replaces the
+   "drops published ports" part of §13 Compose isolation. Traefik routes are unchanged.
+6. **Services view rows.** `Orchestrator.services(branch) -> list[RepoRow]`, with
+   `RepoRow(name: str, status: Literal["healthy", "unhealthy", "starting", "stopped"],
+   port: int | None, url: str | None)`. One row per repo of the branch's selected services, in
+   service order. PORT and URL are those of the repo's first routed service (`subdomain` set). If
+   there is no routed service, they are those of the first service with a port, and URL is None.
+   Status comes from all containers of the repo's compose project and from its run processes.
+   Checked in this order: `stopped` if the branch is not in state, its status is `stopped`, or
+   nothing is running; `starting` if the branch is `creating`, or a container has health
+   `starting` or state `created`/`restarting`; `unhealthy` if any container is not running or has
+   health `unhealthy`, a selected run process is dead, or the routed health probe fails (as `ls`,
+   2 s); `healthy` otherwise.
+7. **Configure.** `Orchestrator.catalog_choices(branch) -> list[Choice] | None`, with
+   `Choice(service: str, repo: str, selected: bool)` in catalog order, and None for a `services:`
+   project. `Orchestrator.configure(branch, uses: list[str]) -> None` follows D-e. A branch not in
+   state is a WtError.
+8. **TUI.** The main table has `NAME` and `STATUS` columns (PORT is gone). The action line is
+   `enter: services  u: up  d: down  a: add  r: remove  q: quit`. Enter opens the services screen of
+   the selected worktree (its project's orchestrator). The screen has a table `NAME STATUS PORT URL`
+   (`-` for None), with the same border and height rules, refreshed every 2 s in a worker, and the
+   action line `c: configure  esc: back  q: quit`, plus a message line. `c` opens a modal with a
+   checkbox list (`<service> (<repo>)`): space toggles, enter confirms, esc cancels. Confirm runs
+   `configure` as the one running action. For a `services:` project the message is
+   `configure needs a catalog project (uses: in worktree.yaml)`. Colors: the initials of the action
+   line are green, PORT values are purple, STATUS `healthy` and `up` are green, everything else is
+   plain. This replaces "no colors" in §16.
+9. **`examples/notes`.** `uses: [front, back]`. `back` gets `remote: https://api.staging.notes.example`.
