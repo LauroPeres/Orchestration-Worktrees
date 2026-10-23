@@ -639,8 +639,9 @@ port rules of §13 (compose isolation) and §14 (ports).
    Checked in this order: `stopped` if the branch is not in state, its status is `stopped`, or
    nothing is running; `starting` if the branch is `creating`, or a container has health
    `starting` or state `created`/`restarting`; `unhealthy` if any container is not running or has
-   health `unhealthy`, a selected run process is dead, or the routed health probe fails (as `ls`,
-   2 s); `healthy` otherwise.
+   health `unhealthy`, a selected run process is dead, or its port refuses a TCP connect (0.3 s);
+   `healthy` otherwise. No HTTP probe: the view refreshes every 2 s and must stay fast (one
+   `docker compose ps` per compose project).
 7. **Configure.** `Orchestrator.catalog_choices(branch) -> list[Choice] | None`, with
    `Choice(service: str, repo: str, selected: bool)` in catalog order, and None for a `services:`
    project. `Orchestrator.configure(branch, uses: list[str]) -> None` follows D-e. A branch not in
