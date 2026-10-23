@@ -4,7 +4,7 @@ from typing import Any
 import pytest
 import yaml
 
-from wt.config import STARTER, find_config, load_config
+from wt.config import STARTER, Config, find_config, load_config
 from wt.errors import WtError
 
 BASE: dict[str, Any] = {
@@ -134,3 +134,26 @@ def test_postgres_base_branch_must_be_a_string(tmp_path: Path) -> None:
     data["shared"]["postgres"]["base_branch"] = ["main"]
     with pytest.raises(WtError, match="base_branch"):
         load_config(write(tmp_path, data))
+
+
+def _needs(**needs: list[str]) -> dict:  # type: ignore[type-arg]
+    return {
+        "project": "p",
+        "domain": "p.localhost",
+        "repos": {"r": "."},
+        "services": {n: {"repo": "r", "compose": "c.yml", "needs": v} for n, v in needs.items()},
+    }
+
+
+def test_needs_ok() -> None:
+    assert Config.model_validate(_needs(a=["b"], b=[])).services["a"].needs == ["b"]
+
+
+def test_needs_unknown() -> None:
+    with pytest.raises(ValueError, match="unknown service 'x'"):
+        Config.model_validate(_needs(a=["x"]))
+
+
+def test_needs_cycle_message() -> None:
+    with pytest.raises(ValueError, match="a -> b -> a"):
+        Config.model_validate(_needs(a=["b"], b=["a"]))
