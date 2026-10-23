@@ -113,6 +113,29 @@ def down(project: str) -> None:
     proc.run(["docker", "compose", "-p", project, "down", "-v", "--remove-orphans"])
 
 
+def down_keep_volumes(project: str) -> None:
+    """Stop and remove the project's containers and networks; volumes stay. No-op if absent."""
+    proc.run(["docker", "compose", "-p", project, "down", "--remove-orphans"])
+
+
+def remove_service(project: str, service: str) -> None:
+    """Stop and remove the containers of one compose service; the rest of the project stays."""
+    found = proc.run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+        ],
+        check=False,
+    ).stdout.split()
+    if found:
+        proc.run(["docker", "rm", "-f", *found])
+
+
 @dataclass(frozen=True)
 class Container:
     service: str
