@@ -3,7 +3,7 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, SelectionList, Static
 
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
@@ -36,6 +36,11 @@ class FakeOrch:
         ]
         self.service_calls: list[str] = []
         self.services_error: Exception | None = None
+        self.choices: list[Choice] | None = [
+            Choice("front", "web", True),
+            Choice("back", "api", True),
+            Choice("db", "api", False),
+        ]
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         self.ls_count += 1
@@ -71,7 +76,7 @@ class FakeOrch:
         return self.service_rows
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
-        return None
+        return self.choices
 
     def configure(self, branch: str, uses: list[str]) -> None:
         self._act("configure", branch, list(uses))
@@ -279,7 +284,7 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
             assert healthy.style == "green" and port.style == "purple"
             assert not table.get_row_at(1)[1].style
             actions: Any = app.screen.query_one("#actions", Static).render()
-            assert actions.plain == "esc: back  q: quit"
+            assert actions.plain == "c: configure  esc: back  q: quit"
             await pilot.press("escape")
             await settle(pilot)
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
@@ -334,5 +339,115 @@ def test_q_quits_from_services_screen() -> None:
             await pilot.press("q")
             await pilot.pause()
         assert not app.is_running
+
+    asyncio.run(scenario())
+
+
+def checked(app: WtApp) -> list[str]:
+    return list(app.screen.query_one("#choices", SelectionList).selected)
+
+
+def test_c_toggle_and_confirm_calls_configure_and_refreshes() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            before = len(orch.service_calls)
+            await pilot.press("c")
+            await pilot.pause()
+            assert checked(app) == ["front", "back"]
+            hints: Any = app.screen.query_one("#hints", Static).render()
+            assert hints.plain == "space: toggle  enter: confirm  esc: cancel"
+            assert [hints.plain[s.start : s.end] for s in hints.spans] == ["space", "enter", "esc"]
+            await pilot.press("space", "down", "down", "space")  # uncheck front, check db
+            assert checked(app) == ["back", "db"]
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["back", "db"])]
+            assert len(orch.service_calls) > before
+            assert str(app.screen.query_one("#message", Static).render()) == (
+                "configure feat-a: done"
+            )
+
+    asyncio.run(scenario())
+
+
+def test_configure_cancel_does_not_call() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            await pilot.press("c", "space", "escape")
+            await settle(pilot)
+            assert orch.calls == []
+            assert app.screen.query("#services")
+
+    asyncio.run(scenario())
+
+
+def test_configure_on_services_project_shows_note() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = None
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            await pilot.press("c")
+            await pilot.pause()
+            assert str(app.screen.query_one("#message", Static).render()) == (
+                "configure needs a catalog project (uses: in worktree.yaml)"
+            )
+            assert not app.screen.query("#choices")
+
+    asyncio.run(scenario())
+
+
+def test_configure_empty_selection_is_an_error_without_call() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            await pilot.press("c", "space", "down", "space", "enter")
+            await pilot.pause()
+            assert checked(app) == []
+            assert str(app.screen.query_one("#error", Static).render()) == (
+                "check at least one service"
+            )
+            assert orch.calls == []
+            await pilot.press("space", "enter")  # still open: check one and confirm
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["back"])]
+
+    asyncio.run(scenario())
+
+
+def test_configure_is_blocked_while_an_action_runs() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.gate = threading.Event()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("u")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("c")
+            await pilot.pause()
+            assert not app.screen.query("#choices")
+            assert "busy" in str(app.screen.query_one("#message", Static).render())
+            orch.gate.set()
+            await settle(pilot)
 
     asyncio.run(scenario())
