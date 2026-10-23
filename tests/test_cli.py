@@ -250,3 +250,68 @@ def test_ls_piped_keeps_each_row_on_one_line(orch, docker: FakeDocker, tmp_path:
     lines = [ln for ln in listed.output.splitlines() if "feat/cart" in ln or "https://" in ln]
     assert len(lines) == 1
     assert "https://api.feat-cart.shop.localhost" in lines[0]
+
+
+CATALOG = """\
+repos:
+  notes-back: ./back
+  notes-front: ./front
+services:
+  back:
+    repo: notes-back
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+    infra:
+      postgres: {databases: [notes]}
+  front:
+    repo: notes-front
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    consumes:
+      back: API_URL
+"""
+
+
+def test_catalog_table_from_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split() == ["SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED", "BY"]
+    assert lines[1].split() == ["back", "notes-back", "compose", "postgres", "-", "front"]
+    assert lines[2].split() == ["front", "notes-front", "run", "-", "back", "-"]
+
+
+def test_catalog_uses_worktree_yaml_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "mine.yaml").write_text(CATALOG)
+    (tmp_path / "worktree.yaml").write_text(
+        "project: notes\ndomain: notes.localhost\ncatalog: ./mine.yaml\nuses: [front]\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "missing.yaml"))
+    result = runner.invoke(app, ["catalog", "--check"])
+    assert result.exit_code == 0, result.output
+    assert f"catalog ok: {tmp_path / 'mine.yaml'}" in result.output
+
+
+def test_catalog_check_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG.replace("repo: notes-front", "repo: nope"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog", "--check"])
+    assert result.exit_code == 1
+    assert "unknown repo 'nope'" in result.output
+
+
+def test_catalog_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "none.yaml"))
+    result = runner.invoke(app, ["catalog"])
+    assert isinstance(result.exception, WtError)
+    assert "catalog not found" in str(result.exception)
