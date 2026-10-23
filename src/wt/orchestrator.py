@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from wt import compose, git, health, host, proc, router, tls
+from wt import compose, git, health, host, naming, proc, router, tls
 from wt import providers as registry
 from wt.catalog import load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
@@ -25,9 +25,12 @@ from wt.state import (
     ProcessState,
     RepoState,
     StateStore,
+    allocate_index,
     atomic_write,
     file_lock,
     now,
+    ports_lock,
+    release_index,
 )
 from wt.templating import render
 
@@ -307,24 +310,33 @@ class Orchestrator:
         Ports are picked, templates rendered (a typo fails here, before anything is created)
         and the ports recorded under one lock, so two callers never pick the same one.
         """
-        with file_lock(f"ports-{self.cfg.project}"):
-            ports = self._resolve_ports(branch)
-            envs, commands = self._render(names, ports)
-            for provider in self.providers():
-                provider.preflight(self.provider_context(names))
-            with self.store.edit() as state:
-                for other, bs in state.branches.items():
-                    if other != branch and bs.slug == names.slug:
-                        raise WtError(
-                            f"branch {branch!r} and the running branch {other!r} map to "
-                            f"the same name {names.slug!r}; run `wt down {other}` first"
-                        )
-                state.config_path = str(self.loaded.path)
-                current = state.branches.setdefault(
-                    branch, BranchState(branch=branch, slug=names.slug)
+        with ports_lock():
+            index = allocate_index(self.cfg.project, branch)
+            try:
+                ports = self._resolve_ports(branch, index)
+                envs, commands = self._render(
+                    names, {n: p for n, p in ports.items() if self.cfg.services[n].run is not None}
                 )
-                current.status = "creating"
-                current.ports = dict(ports)
+                for provider in self.providers():
+                    provider.preflight(self.provider_context(names))
+                with self.store.edit() as state:
+                    for other, bs in state.branches.items():
+                        if other != branch and bs.slug == names.slug:
+                            raise WtError(
+                                f"branch {branch!r} and the running branch {other!r} map to "
+                                f"the same name {names.slug!r}; run `wt down {other}` first"
+                            )
+                    state.config_path = str(self.loaded.path)
+                    current = state.branches.setdefault(
+                        branch, BranchState(branch=branch, slug=names.slug)
+                    )
+                    current.status = "creating"
+                    current.index = index
+                    current.ports = dict(ports)
+            except Exception:
+                if branch not in self.store.load().branches:
+                    release_index(self.cfg.project, branch)
+                raise
         return envs, commands, ports
 
     def add(self, branch: str) -> bool:
@@ -428,13 +440,15 @@ class Orchestrator:
         }
         return envs, commands
 
-    def _resolve_ports(self, branch: str) -> dict[str, int]:
-        """Ports of `run:` services (D9). A port recorded for this branch is kept."""
+    def _resolve_ports(self, branch: str, index: int) -> dict[str, int]:
+        """Host ports (§17): `port: auto` run services and compose services with a `port` get
+        `host_port(index, service_index)`; an explicit run port is used as is. No probing: a
+        port that is taken fails."""
         state = self.store.load()
         mine = state.branches.get(branch)
         ports: dict[str, int] = {}
         for name, svc in self.cfg.services.items():
-            if svc.run is None or svc.port is None:
+            if svc.port is None or (svc.run is None and svc.compose is None):
                 continue
             taken = set(ports.values())
             for other, bs in state.branches.items():
@@ -442,17 +456,27 @@ class Orchestrator:
                     if p.port is not None and (other, n) != (branch, name):
                         taken.add(p.port)
                 taken |= {p for n, p in bs.ports.items() if (other, n) != (branch, name)}
-            recorded = mine.ports.get(name) if mine else None
             process = mine.processes.get(name) if mine else None
-            if (
-                recorded is not None
-                and svc.port in ("auto", recorded)
-                and recorded not in taken
-                and ((process is not None and host.alive(process)) or host.port_free(recorded))
-            ):
-                ports[name] = recorded
+            if svc.run is not None and svc.port != "auto":
+                own_live = (
+                    process is not None and process.port == svc.port and host.alive(process)
+                )  # our own process already listens there (SPEC §14 "Ports")
+                ports[name] = svc.port if own_live else host.pick_port(name, taken, svc.port)
                 continue
-            ports[name] = host.pick_port(self.cfg.project, branch, name, taken, svc.port)
+            port = naming.host_port(index, self.loaded.service_index(name))
+            ours = (
+                mine is not None
+                and mine.ports.get(name) == port
+                and (
+                    (process is not None and host.alive(process))
+                    or mine.status in ("up", "degraded")
+                )
+            )
+            if port in taken or not (ours or host.port_free(port)):
+                raise WtError(
+                    f"port {port} for service '{name}' (worktree index {index}) is in use; free it"
+                )
+            ports[name] = port
         return ports
 
     def _start_steps(
@@ -475,7 +499,7 @@ class Orchestrator:
         for step in plan:
             if step.group is not None:  # healthy once `compose up --wait` returned
                 routes += self._up_compose_group(
-                    branch, names, step.group, worktrees, envs, build=build, timeout=timeout
+                    branch, names, step.group, worktrees, envs, ports, build=build, timeout=timeout
                 )
             elif step.service is not None:
                 name = step.service
@@ -593,6 +617,7 @@ class Orchestrator:
         group: ComposeGroup,
         worktrees: dict[str, Path],
         envs: dict[str, dict[str, str]],
+        ports: dict[str, int],
         *,
         build: bool,
         timeout: int,
@@ -612,8 +637,11 @@ class Orchestrator:
                     f"(found: {', '.join(available)}); set 'compose_service'"
                 )
             alias = names.network_alias(name) if svc.subdomain is not None else None
+            publish = (
+                (ports[name], svc.port) if isinstance(svc.port, int) and name in ports else None
+            )
             patches[target] = compose.ServicePatch(
-                alias=alias, env=envs[name], network=bool(self.providers())
+                alias=alias, env=envs[name], network=bool(self.providers()), publish=publish
             )
             if alias and svc.subdomain is not None:
                 routes.append(
@@ -783,8 +811,10 @@ class Orchestrator:
         if slug_dir.is_dir() and not any(slug_dir.iterdir()):
             slug_dir.rmdir()
 
-        with self.store.edit() as state:
-            state.branches.pop(branch, None)
+        with ports_lock():
+            with self.store.edit() as state:
+                state.branches.pop(branch, None)
+            release_index(self.cfg.project, branch)
         sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
         sources.update({r: Path(s.source) for r, s in (bs.repos if bs else {}).items()})
         return sources
@@ -905,7 +935,63 @@ class Orchestrator:
         proc.run(args, capture=False, check=False)
 
     def services(self, branch: str) -> list[RepoRow]:
-        raise NotImplementedError
+        """One row per repo of the branch's selected services (§17 Contract 6).
+
+        Cheap on purpose (the TUI calls it every 2 s): one `compose ps` per project, a TCP
+        connect per run process with a port, no HTTP probes.
+        """
+        me = self._for(branch)
+        bs = self.store.load().branches.get(branch)
+        names = me.names(branch)
+        repos: dict[str, list[str]] = {}
+        for name, svc in me.cfg.services.items():
+            repos.setdefault(svc.repo, []).append(name)
+        rows: list[RepoRow] = []
+        for repo, members in repos.items():
+            shown = [(n, me.cfg.services[n]) for n in members]
+            pick = next((n for n, s in shown if s.subdomain is not None), None)
+            routed = pick is not None
+            if pick is None:
+                pick = next((n for n, s in shown if s.port is not None), None)
+            port = bs.ports.get(pick) if bs is not None and pick is not None else None
+            url = me.service_url(names, me.cfg.services[pick]) if routed and pick else None
+            status = me._repo_status(bs, repo, [n for n, s in shown if s.run is not None])
+            rows.append(RepoRow(repo, status, port, url))
+        return rows
+
+    def _repo_status(
+        self, bs: BranchState | None, repo: str, run_services: list[str]
+    ) -> Literal["healthy", "unhealthy", "starting", "stopped"]:
+        if bs is None or bs.status == "stopped":
+            return "stopped"
+        containers: list[compose.Container] = []
+        project = bs.compose_projects.get(repo)
+        docker_ok = True
+        if project is not None:
+            try:
+                containers = compose.ps(project)
+            except WtError:
+                docker_ok = False
+        procs = [bs.processes.get(n) for n in run_services]
+        alive = [p is not None and host.alive(p) for p in procs]
+        busy = ("running", "created", "restarting")
+        if docker_ok and not any(alive) and not any(c.state in busy for c in containers):
+            return "stopped"
+        if bs.status == "creating" or any(
+            c.health == "starting" or c.state in ("created", "restarting") for c in containers
+        ):
+            return "starting"
+        listening = [
+            p is not None and a and (p.port is None or host.tcp_ok(p.port, timeout=0.3))
+            for p, a in zip(procs, alive, strict=True)
+        ]
+        if (
+            not docker_ok
+            or any(c.state != "running" or c.health == "unhealthy" for c in containers)
+            or not all(listening)
+        ):
+            return "unhealthy"
+        return "healthy"
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
         """Every catalog service with its repo and whether the branch selects it (§17 D-a)."""

@@ -26,6 +26,14 @@ class Reset:
         self.value = value
 
 
+class Override:
+    """Renders as a compose `!override` tag: replaces the list from the user's compose file
+    (`!reset` with a value would just drop it)."""
+
+    def __init__(self, value: list[Any]) -> None:
+        self.value = value
+
+
 class _Dumper(yaml.SafeDumper):
     pass
 
@@ -36,7 +44,12 @@ def _represent_reset(dumper: yaml.SafeDumper, data: Reset) -> yaml.Node:
     return dumper.represent_sequence("!reset", data.value)
 
 
+def _represent_override(dumper: yaml.SafeDumper, data: Override) -> yaml.Node:
+    return dumper.represent_sequence("!override", data.value)
+
+
 _Dumper.add_representer(Reset, _represent_reset)
+_Dumper.add_representer(Override, _represent_override)
 
 
 def dump(doc: dict[str, Any]) -> str:
@@ -61,10 +74,10 @@ def build_override(all_services: list[str], patches: dict[str, ServicePatch]) ->
     services: dict[str, Any] = {}
     for name in all_services:
         patch = patches.get(name)
-        published: list[Any] = []
+        ports: Reset | Override = Reset([])
         if patch and patch.publish:
-            published = [f"127.0.0.1:{patch.publish[0]}:{patch.publish[1]}"]
-        spec: dict[str, Any] = {"ports": Reset(published), "container_name": Reset(None)}
+            ports = Override([f"127.0.0.1:{patch.publish[0]}:{patch.publish[1]}"])
+        spec: dict[str, Any] = {"ports": ports, "container_name": Reset(None)}
         if patch and patch.env:
             # Compose interpolates `$` in values; `$$` makes it pass them literally.
             spec["environment"] = {k: v.replace("$", "$$") for k, v in patch.env.items()}
