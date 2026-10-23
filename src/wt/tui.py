@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, Protocol
+from typing import ClassVar, Protocol, cast
 
 from rich.text import Text
 from textual import on, work
@@ -11,7 +11,8 @@ from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, Input, Label, Static
+from textual.widgets import DataTable, Input, Label, SelectionList, Static
+from textual.widgets.selection_list import Selection
 
 from wt.config import Config
 from wt.errors import WtError
@@ -73,7 +74,10 @@ class Row:
 GREEN = "green"
 GREEN_STATES = {"up", "healthy"}
 PURPLE = "purple"
-SERVICES_ACTIONS = "esc: back  q: quit"
+SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
+CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
+NEEDS_CATALOG = "configure needs a catalog project (uses: in worktree.yaml)"
+NOTHING_CHECKED = "check at least one service"
 
 
 def actions_text(actions: str = ACTIONS) -> Text:
@@ -105,6 +109,7 @@ class ServicesScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
+        Binding("c", "configure", "Configure", show=False),
     ]
 
     def __init__(self, orch: Callable[[], OrchestratorLike], branch: str) -> None:
@@ -112,6 +117,7 @@ class ServicesScreen(Screen[None]):
         self._orch = orch
         self.branch = branch
         self._loading = False
+        self._failed_shown = False
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="services", cursor_type="row")
@@ -127,6 +133,26 @@ class ServicesScreen(Screen[None]):
 
     def say(self, text: str) -> None:
         self.query_one("#message", Static).update(Text(text))
+
+    def action_configure(self) -> None:
+        app = cast("WtApp", self.app)
+        if not app.guard():
+            return
+        try:
+            choices = self._orch().catalog_choices(self.branch)
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            self.say(str(exc) if isinstance(exc, WtError) else f"{type(exc).__name__}: {exc}")
+            return
+        if choices is None:
+            self.say(NEEDS_CATALOG)
+            return
+        branch = self.branch
+
+        def chosen(uses: list[str] | None) -> None:
+            if uses is not None and app.guard():
+                app.start(f"configure {branch}", lambda: self._orch().configure(branch, uses))
+
+        app.push_screen(ConfigureScreen(choices), chosen)
 
     def refresh_rows(self) -> None:
         if not self._loading:
@@ -147,6 +173,7 @@ class ServicesScreen(Screen[None]):
     def _failed(self, message: str) -> None:
         self._loading = False
         if self.is_attached:
+            self._failed_shown = True
             self.say(message)
 
     def _apply(self, rows: list[RepoRow]) -> None:
@@ -159,7 +186,9 @@ class ServicesScreen(Screen[None]):
                 table.add_row(Text(r.name), state_text(r.status), port, Text(r.url or "-"))
             if rows:
                 table.move_cursor(row=min(cursor, len(rows) - 1))
-            self.say("")
+            if self._failed_shown:
+                self._failed_shown = False
+                self.say("")
         except NoMatches:
             pass  # the screen was popped before this late refresh arrived
         finally:
@@ -211,6 +240,62 @@ class InputScreen(ModalScreen[str | None]):
     @on(Input.Submitted)
     def _submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfigureScreen(ModalScreen[list[str] | None]):
+    """Check-box list of the catalog services; dismisses with the checked names, None on Escape."""
+
+    CSS = """
+    ConfigureScreen { align: center middle; background: transparent; }
+    #dialog { width: auto; min-width: 40; max-width: 100%; height: auto; max-height: 100%;
+              border: solid $foreground; padding: 0 1; background: $surface; }
+    #choices { height: auto; max-height: 20; border: none; padding: 0; background: transparent; }
+    #choices > .selection-list--button { color: $panel; background: $panel; }
+    #choices > .selection-list--button-highlighted { color: $panel; background: $panel; }
+    #choices > .selection-list--button-selected {
+        color: green; background: $panel; text-style: bold;
+    }
+    #choices > .selection-list--button-selected-highlighted {
+        color: green; background: $panel; text-style: bold;
+    }
+    #choices:focus { border: none; background-tint: transparent; }
+    #hints, #error { height: 1; }
+    #error { color: $error; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("enter", "confirm", "Confirm", show=False, priority=True),
+        Binding("escape", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, choices: list[Choice]) -> None:
+        super().__init__()
+        self.choices = choices
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(Text("Services"))
+            yield SelectionList[str](
+                *[
+                    Selection(Text(f"{c.service} ({c.repo})"), c.service, c.selected)
+                    for c in self.choices
+                ],
+                id="choices",
+            )
+            yield Static(actions_text(CONFIGURE_HINTS), id="hints")
+            yield Static("", id="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#choices", SelectionList).focus()
+
+    def action_confirm(self) -> None:
+        uses = list(self.query_one("#choices", SelectionList).selected)
+        if not uses:
+            self.query_one("#error", Static).update(Text(NOTHING_CHECKED))
+            return
+        self.dismiss(uses)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -279,8 +364,10 @@ class WtApp(App[None]):
         return self.rows[table.cursor_row]
 
     def say(self, text: str) -> None:
-        """Show `text` (plain, no markup) on the message line."""
-        self._main.query_one("#message", Static).update(Text(text))
+        """Show `text` (plain, no markup) on the message line of the services screen, else main."""
+        screens = [s for s in self.screen_stack if isinstance(s, ServicesScreen)]
+        target = screens[-1] if screens else self._main
+        target.query_one("#message", Static).update(Text(text))
 
     def log_threadsafe(self, message: str) -> None:
         """For `Orchestrator.log` (markup): callable from a worker thread."""
@@ -299,7 +386,7 @@ class WtApp(App[None]):
             raise WtError(f"{project}: {entry.note if entry else 'unknown project'}")
         return entry.orch()
 
-    def _guard(self) -> bool:
+    def guard(self) -> bool:
         if self._busy:
             self.say("busy: wait for the running action to finish")
             return False
@@ -327,15 +414,15 @@ class WtApp(App[None]):
 
     def action_up_selected(self) -> None:
         row = self._selected_worktree()
-        if row is not None and row.status is not None and self._guard():
+        if row is not None and row.status is not None and self.guard():
             branch = row.status.branch
-            self._start(f"up {branch}", lambda: self._orch_for(row.project).up(branch))
+            self.start(f"up {branch}", lambda: self._orch_for(row.project).up(branch))
 
     def action_down_selected(self) -> None:
         row = self._selected_worktree()
-        if row is not None and row.status is not None and self._guard():
+        if row is not None and row.status is not None and self.guard():
             branch = row.status.branch
-            self._start(f"down {branch}", lambda: self._orch_for(row.project).stop(branch))
+            self.start(f"down {branch}", lambda: self._orch_for(row.project).stop(branch))
 
     def action_add_new(self) -> None:
         row = self.selected_row
@@ -345,32 +432,32 @@ class WtApp(App[None]):
         if row.stale:
             self.say(f"{row.project}: {row.note}")
             return
-        if not self._guard():
+        if not self.guard():
             return
         project = row.project
 
         def got(name: str | None) -> None:
-            if name and self._guard():
-                self._start(f"add {name}", lambda: self._orch_for(project).add(name))
+            if name and self.guard():
+                self.start(f"add {name}", lambda: self._orch_for(project).add(name))
 
         self.push_screen(InputScreen("New worktree name"), got)
 
     def action_remove_selected(self) -> None:
         row = self._selected_worktree()
-        if row is None or row.status is None or not self._guard():
+        if row is None or row.status is None or not self.guard():
             return
         branch = row.status.branch
 
         def confirmed(yes: bool | None) -> None:
-            if yes and self._guard():
-                self._start(
+            if yes and self.guard():
+                self.start(
                     f"remove {branch}",
                     lambda: self._orch_for(row.project).remove(branch, force=True),
                 )
 
         self.push_screen(ConfirmScreen(CONFIRM_REMOVE.format(branch=branch)), confirmed)
 
-    def _start(self, label: str, call: Callable[[], object]) -> None:
+    def start(self, label: str, call: Callable[[], object]) -> None:
         self._busy = True
         self.say(label)
         self._run_action(label, call)
@@ -390,6 +477,9 @@ class WtApp(App[None]):
         self._busy = False
         self.say(message)
         self.action_refresh()
+        for screen in self.screen_stack:
+            if isinstance(screen, ServicesScreen):
+                screen.refresh_rows()
 
     # -- refresh --------------------------------------------------------------------
 
