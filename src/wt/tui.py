@@ -18,7 +18,7 @@ from wt.errors import WtError
 from wt.orchestrator import BranchStatus
 
 REFRESH_SECONDS = 2.0
-ACTIONS = "u up  d down  a add  r remove  q quit"
+ACTIONS = "u: up  d: down  a: add  r: remove  q: quit"
 CONFIRM_REMOVE = (
     "remove {branch}: deletes its containers, volumes, databases, worktrees and the git "
     "branch; unpushed commits are lost. Remove? y/N"
@@ -125,7 +125,8 @@ class WtApp(App[None]):
     TITLE = "wt"
     CSS = """
     Screen { background: transparent; }
-    #table { height: 1fr; background: transparent; }
+    #table { height: auto; max-height: 1fr; border: solid $foreground; background: transparent; }
+    #table:focus { border: solid $foreground; background-tint: transparent; }
     DataTable > .datatable--header { text-style: bold; background: transparent; }
     DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
     #actions, #message { height: 1; background: transparent; }

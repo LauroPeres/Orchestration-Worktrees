@@ -81,7 +81,7 @@ def test_rows_and_columns() -> None:
             table = app.query_one("#table", DataTable)
             assert [str(c.label) for c in table.columns.values()] == ["NAME", "STATUS", "PORT"]
             assert cells(app) == [["feat-a", "up", "8001, 8002"], ["main", "stopped", "-"]]
-            assert "u up  d down  a add  r remove  q quit" in str(
+            assert "u: up  d: down  a: add  r: remove  q: quit" in str(
                 app.query_one("#actions", Static).render()
             )
 
