@@ -67,11 +67,14 @@ class ComposeGroup:
 
 
 class Orchestrator:
-    def __init__(self, loaded: LoadedConfig, log: Log = print) -> None:
+    def __init__(
+        self, loaded: LoadedConfig, log: Log = print, out: Callable[[str], None] | None = None
+    ) -> None:
         self.loaded = loaded
         self.cfg = loaded.config
         self.store = StateStore(self.cfg.project)
         self.log = log
+        self.out = out
 
     # ---- naming helpers -------------------------------------------------------------------
 
@@ -193,7 +196,7 @@ class Orchestrator:
                 with file_lock("traefik"):
                     if not router.is_running():
                         self.log("starting shared Traefik")
-                    router.ensure_running()
+                    router.ensure_running(on_line=self.out)
 
                 worktrees = self._up_worktrees(branch, names)
                 self._up_providers(branch, names)
@@ -442,6 +445,7 @@ class Orchestrator:
                 cwd=compose_file.parent,
                 build=build,
                 timeout=timeout,
+                on_line=self.out,
             )
         return routes
 
