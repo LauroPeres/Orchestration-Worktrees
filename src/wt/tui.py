@@ -106,21 +106,28 @@ class WtApp(App[None]):
         self.write_log(f"[red]{escape(message)}[/]")
 
     async def _apply_rows(self, rows: list[BranchStatus]) -> None:
-        self._loading = False
-        rows = sorted(rows, key=lambda r: r.branch)
-        view = self.query_one("#branches", ListView)
-        previous = self.selected_branch
-        same = [r.branch for r in rows] == [r.branch for r in self.rows]
-        self.rows = rows
-        if same:
-            for item, row in zip(view.query(ListItem), rows, strict=True):
-                item.query_one(Label).update(branch_label(row))
-        else:
-            await view.clear()
-            await view.extend(ListItem(Label(branch_label(r))) for r in rows)
-            names = [r.branch for r in rows]
-            view.index = names.index(previous) if previous in names else (0 if rows else None)
-        self._show_services()
+        try:
+            rows = sorted(rows, key=lambda r: r.branch)
+            view = self.query_one("#branches", ListView)
+            previous = self.selected_branch
+            items = list(view.query(ListItem))
+            same = [r.branch for r in rows] == [r.branch for r in self.rows] and len(items) == len(
+                rows
+            )
+            self.rows = rows
+            if same:
+                for item, row in zip(items, rows, strict=True):
+                    item.query_one(Label).update(branch_label(row))
+            else:
+                await view.clear()
+                await view.extend(ListItem(Label(branch_label(r))) for r in rows)
+                names = [r.branch for r in rows]
+                view.index = names.index(previous) if previous in names else (0 if rows else None)
+            self._show_services()
+        finally:
+            # Cleared only now: a refresh that starts while the list is being rebuilt would see
+            # the new rows but not the new items yet.
+            self._loading = False
 
     @on(ListView.Highlighted, "#branches")
     def _highlighted(self) -> None:
