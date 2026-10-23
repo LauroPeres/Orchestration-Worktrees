@@ -1251,7 +1251,7 @@ def test_stop_keeps_worktrees_and_ports_and_removes_the_route(
     o.stop("feat/cart")
     bs = o.store.load().branches["feat/cart"]
     assert bs.status == "stopped" and not bs.processes and bs.route_file is None
-    assert docker.downs == ["wt-shop-feat-cart-api"]
+    assert docker.kept_downs == ["wt-shop-feat-cart-api"]  # volumes kept
     assert bs.ports == before.ports
     assert Path(bs.repos["api"].path).is_dir()
     assert not list((isolated_home / "traefik" / "dynamic").iterdir())
@@ -1448,3 +1448,193 @@ def test_unselected_service_without_remote_renders_empty(
     o = Orchestrator(load_config(path), log=lambda m: None)
     ctx = o.template_context(o.names("x"), o.cfg.services["a"])
     assert ctx["services"]["b"] == {"url": "", "host": "", "port": None}
+
+
+# ---- configure / catalog_choices (§17 D-e) -----------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+@pytest.fixture
+def cfg_orch(make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch):
+    """Catalog project: db+api (repo api, compose), web (repo ui, compose), front (repo ui, run)."""
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    make_repo("shop-ui", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(
+        f"""\
+repos: {{api: ./shop-api, ui: ./shop-ui}}
+services:
+  db: {{repo: api, compose: docker-compose.yml, compose_service: db}}
+  api:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: api
+    port: 8000
+    subdomain: api
+    remote: https://api.staging.example
+  web:
+    repo: ui
+    compose: docker-compose.yml
+    compose_service: db
+  front:
+    repo: ui
+    run: "{sys.executable} {SERVE} {{{{ port }}}}"
+    port: {_free_port()}
+    subdomain: front
+    env: {{PLAIN: x}}
+    consumes: {{api: API_URL}}
+"""
+    )
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [api, front]\n"
+    )
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(compose, "down_keep_volumes", lambda p: calls.append(("down", p)))
+    monkeypatch.setattr(compose, "remove_service", lambda p, s: calls.append(("rm", f"{p}/{s}")))
+    o = Orchestrator(load_config(path), log=lambda m: None)
+    o.calls = calls  # type: ignore[attr-defined]
+    yield o
+    for bs in o.store.load().branches.values():
+        for ps in bs.processes.values():
+            host.stop(ps, grace=0.2)
+
+
+def _calls(o: Orchestrator) -> list[tuple[str, str]]:
+    return o.calls  # type: ignore[attr-defined,no-any-return]
+
+
+def test_catalog_choices_follow_the_branch_selection(cfg_orch: Orchestrator) -> None:
+    o = cfg_orch
+    o.add("feat/x")
+    got = o.catalog_choices("feat/x")
+    assert got is not None
+    assert [(c.service, c.repo, c.selected) for c in got] == [
+        ("db", "api", False),
+        ("api", "api", True),
+        ("web", "ui", False),
+        ("front", "ui", True),
+    ]
+    o.configure("feat/x", ["db"])
+    assert [c.service for c in o.catalog_choices("feat/x") or [] if c.selected] == ["db"]
+
+
+def test_catalog_choices_none_for_services_project(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.add("feat/x")
+    assert o.catalog_choices("feat/x") is None
+
+
+def test_catalog_choices_unknown_branch(cfg_orch: Orchestrator) -> None:
+    with pytest.raises(WtError, match="not found"):
+        cfg_orch.catalog_choices("nope")
+
+
+def test_configure_validates(cfg_orch: Orchestrator, orch, docker: FakeDocker) -> None:
+    o = cfg_orch
+    o.add("feat/x")
+    with pytest.raises(WtError, match="select at least one service"):
+        o.configure("feat/x", [])
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        o.configure("feat/x", ["nope"])
+    with pytest.raises(WtError, match="not found"):
+        o.configure("missing", ["api"])
+    assert o.store.load().branches["feat/x"].uses is None
+    with pytest.raises(WtError, match="needs a catalog project"):
+        orch().configure("feat/x", ["api"])
+
+
+def test_configure_adds_a_service_and_starts_it(cfg_orch: Orchestrator, docker: FakeDocker) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    docker.ups.clear()
+    o.configure("feat/x", ["api", "front", "web"])
+    bs = o.store.load().branches["feat/x"]
+    assert bs.uses == ["api", "front", "web"]
+    assert "wt-shop-feat-x-ui" in docker.ups
+    assert bs.status == "up"
+    assert "front" in bs.processes
+
+
+def test_configure_removes_a_run_service(cfg_orch: Orchestrator, docker: FakeDocker) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    bs = o.store.load().branches["feat/x"]
+    ps = bs.processes["front"]
+    assert host.alive(ps)
+    worktree = Path(bs.repos["ui"].path)
+    route = Path(bs.route_file or "")
+    assert "front" in route.read_text()
+    o.configure("feat/x", ["api"])
+    after = o.store.load().branches["feat/x"]
+    assert after.uses == ["api"]
+    assert "front" not in after.processes and "front" not in after.ports
+    assert not host.alive(ps)
+    assert "front" not in Path(after.route_file or "").read_text()
+    assert worktree.is_dir()
+    assert _calls(o) == []
+
+
+def test_configure_consumer_restarts_with_the_remote(
+    cfg_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.configure("feat/x", ["front"])
+    after = o.store.load().branches["feat/x"]
+    assert after.uses == ["front"]
+    bo = o._for("feat/x")
+    envs, _ = bo._render(bo.names("feat/x"), {"front": after.processes["front"].port or 0})
+    assert envs["front"]["API_URL"] == "https://api.staging.example"
+
+
+def test_configure_drops_one_compose_service_of_a_kept_repo(
+    cfg_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.configure("feat/x", ["db", "api", "front"])
+    o.configure("feat/x", ["api", "front"])
+    assert _calls(o) == [("rm", "wt-shop-feat-x-api/db")]
+    assert "api" in o.store.load().branches["feat/x"].compose_projects
+
+
+def test_configure_downs_a_repo_when_none_of_its_services_stays(
+    cfg_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.configure("feat/x", ["api", "web"])  # front leaves, web (repo ui) arrives
+    assert _calls(o) == []  # front is a run service: no compose
+    o.configure("feat/x", ["api"])  # last service of repo ui leaves
+    assert _calls(o) == [("down", "wt-shop-feat-x-ui")]
+    assert "ui" not in o.store.load().branches["feat/x"].compose_projects
+
+
+def test_configure_on_a_stopped_branch_does_not_start_it(
+    cfg_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.stop("feat/x")
+    docker.ups.clear()
+    o.configure("feat/x", ["api"])
+    bs = o.store.load().branches["feat/x"]
+    assert (bs.uses, bs.status, docker.ups) == (["api"], "stopped", [])
+    o.configure("feat/x", ["api", "web"])  # something new: it comes up
+    assert o.store.load().branches["feat/x"].status == "up"
+    assert docker.ups
+
+
+def test_stop_keeps_compose_volumes_and_down_removes_them(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    o.stop("feat/cart")
+    assert docker.kept_downs == ["wt-shop-feat-cart-api"]  # compose down without -v
+    assert docker.downs == []
+    o.down("feat/cart")
+    assert docker.downs == ["wt-shop-feat-cart-api"]  # down removes volumes

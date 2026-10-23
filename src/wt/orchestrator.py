@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from wt import compose, git, health, host, naming, proc, router, tls
 from wt import providers as registry
+from wt.catalog import load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
 from wt.naming import Names
@@ -367,7 +368,7 @@ class Orchestrator:
             bs = self.store.load().branches.get(branch)
             if bs is None:
                 raise WtError(f"branch {branch!r} not found (see `wt ls`)")
-            self._stop_services(branch, names, bs)
+            self._stop_services(branch, names, bs, volumes=False)
 
             def stopped(b: BranchState) -> None:
                 b.status = "stopped"
@@ -375,13 +376,19 @@ class Orchestrator:
 
             self._record(branch, stopped)
 
-    def _stop_services(self, branch: str, names: Names, bs: BranchState | None) -> None:
+    def _stop_services(
+        self, branch: str, names: Names, bs: BranchState | None, *, volumes: bool
+    ) -> None:
+        """Processes, containers and routes. `volumes=False` (stop) keeps the compose volumes."""
         self._down_processes(branch, bs)
         projects = {names.compose_project(g.repo) for g in self.compose_groups()}
         projects |= set(bs.compose_projects.values()) if bs else set()
         for project in sorted(projects):
             self.log(f"compose down [bold]{project}[/]")
-            compose.down(project)
+            if volumes:
+                compose.down(project)
+            else:
+                compose.down_keep_volumes(project)
         router.remove_routes(router.route_file(names))
         if bs and bs.route_file:
             router.remove_routes(Path(bs.route_file))
@@ -789,7 +796,7 @@ class Orchestrator:
         if bs:
             self._record(branch, lambda b: setattr(b, "status", "removing"))
 
-        self._stop_services(branch, names, bs)
+        self._stop_services(branch, names, bs, volumes=True)
         tls.remove_cert([*tls.cert_paths(names), *(Path(p) for p in (bs.cert_files if bs else []))])
         self._down_providers(branch, names, bs)
         shutil.rmtree(self.branch_dir(names), ignore_errors=True)
@@ -928,10 +935,74 @@ class Orchestrator:
         raise NotImplementedError
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
-        raise NotImplementedError
+        """Every catalog service with its repo and whether the branch selects it (§17 D-a)."""
+        if self.loaded.uses is None or self.loaded.catalog is None:
+            return None
+        bs = self.store.load().branches.get(branch)
+        if bs is None:
+            raise WtError(f"branch {branch!r} not found (see `wt ls`)")
+        selected = set(bs.uses if bs.uses is not None else self.loaded.uses)
+        catalog = load_catalog(self.loaded.catalog).catalog
+        return [Choice(n, s.repo, n in selected) for n, s in catalog.services.items()]
 
     def configure(self, branch: str, uses: list[str]) -> None:
-        raise NotImplementedError
+        """Change the services of a branch: store the selection, tear down what left, `up`."""
+        if self.store.load().branches.get(branch) is None:
+            raise WtError(f"branch {branch!r} not found (see `wt ls`)")
+        old = self._for(branch)
+        wanted = list(dict.fromkeys(uses))
+        new = Orchestrator(self.loaded.with_uses(wanted), self.log, self.out)
+        names = self.names(branch)
+        added = [n for n in new.cfg.services if n not in old.cfg.services]
+        removed = [n for n in old.cfg.services if n not in new.cfg.services]
+        with self._branch_lock(names):
+            bs = self.store.load().branches[branch]
+            self._record(branch, lambda b: setattr(b, "uses", wanted))
+            self._drop_services(branch, names, bs, old, new, removed)
+            stopped = bs.status == "stopped"
+        if not stopped or added:
+            new.up(branch)
+
+    def _drop_services(
+        self,
+        branch: str,
+        names: Names,
+        bs: BranchState,
+        old: "Orchestrator",
+        new: "Orchestrator",
+        removed: list[str],
+    ) -> None:
+        """Kill the processes and remove the containers of services that left the selection."""
+        kept_repos = {s.repo for s in new.cfg.services.values()}
+        compose_by_repo: dict[str, list[str]] = {}
+        for name in removed:
+            svc = old.cfg.services[name]
+            if svc.run is not None:
+                if (ps := bs.processes.get(name)) is not None:
+                    self.log(f"stopping process [bold]{name}[/]")
+                    host.stop(ps)
+            else:
+                compose_by_repo.setdefault(svc.repo, []).append(name)
+        for repo, services in compose_by_repo.items():
+            project = bs.compose_projects.get(repo) or names.compose_project(repo)
+            if repo in kept_repos:
+                for name in services:
+                    target = old.cfg.services[name].compose_service or name
+                    self.log(f"removing compose service [bold]{project}/{target}[/]")
+                    compose.remove_service(project, target)
+            else:
+                self.log(f"compose down [bold]{project}[/] (volumes kept)")
+                compose.down_keep_volumes(project)
+
+        def cleared(b: BranchState) -> None:
+            for name in removed:
+                b.processes.pop(name, None)
+                b.ports.pop(name, None)
+            for repo in compose_by_repo:
+                if repo not in kept_repos:
+                    b.compose_projects.pop(repo, None)
+
+        self._record(branch, cleared)
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:
