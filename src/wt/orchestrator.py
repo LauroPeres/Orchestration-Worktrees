@@ -58,6 +58,8 @@ class BranchStatus:
     databases: list[str] = field(default_factory=list)
     ports: list[int] = field(default_factory=list)
     docker_ok: bool = True
+    # True when wt created none of its worktrees: the repos' own checkout (e.g. main)
+    main_checkout: bool = False
 
 
 def _kind(svc: Service) -> Literal["compose", "run"]:
@@ -886,6 +888,7 @@ class Orchestrator:
                 databases=list(bs.providers.get("postgres", [])),
                 ports=sorted(bs.ports.values()),
                 docker_ok=docker_ok,
+                main_checkout=bool(bs.repos) and not any(r.created for r in bs.repos.values()),
             )
             for name, svc in me.cfg.services.items():
                 url = me.service_url(names, svc)

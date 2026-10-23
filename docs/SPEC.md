@@ -556,7 +556,9 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 
 **TUI (table).** `wt tui` and `worktree` open the same compact, monochrome screen (no colors; changed by §17):
 - One table, one row per worktree, columns `NAME`, `STATUS`, `PORT`. `PORT` is the reserved host
-  ports joined with `, `, or `-`. Outside a project (all projects) a `PROJECT` column comes first.
+  ports joined with `, `, or `-`. Only the worktrees wt created are listed: a branch whose repos are all the repos' own checkout
+  (`BranchStatus.main_checkout`, e.g. `main`) is hidden. Outside a project the rows of every project are
+  listed the same way, by worktree name only.
 - The table has a plain border and only takes the height of its rows. Right below it, one line
   with the actions: `u: up  d: down  a: add  r: remove  q: quit`, and one
   message line with the last log line or error of the running action.

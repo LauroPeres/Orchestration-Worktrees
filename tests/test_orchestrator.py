@@ -1743,3 +1743,12 @@ def test_services_follow_the_branch_selection(cfg_orch: Orchestrator, monkeypatc
     o.up("feat/x")
     o.configure("feat/x", ["front"])
     assert [r.name for r in o.services("feat/x")] == ["ui"]
+
+
+def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("main")  # already checked out in the repo folder: wt does not create a worktree
+    o.up("feat/cart")
+    rows = {r.branch: r for r in o.ls(probe=False)}
+    assert rows["main"].main_checkout
+    assert not rows["feat/cart"].main_checkout
