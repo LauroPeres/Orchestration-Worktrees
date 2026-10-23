@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -154,3 +155,18 @@ def test_env_dollar_is_escaped_for_compose() -> None:
         "PLAIN": "x",
     }
     assert env["A"] == "ab$cd"  # the patch itself is not mutated
+
+
+def test_up_passes_on_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls = _record(monkeypatch)
+    sink: Callable[[str], None] = print
+    compose.up("p", [tmp_path / "c.yaml"], cwd=tmp_path, build=False, timeout=9, on_line=sink)
+    assert calls[0][1]["on_line"] is sink and calls[0][1]["capture"] is False
+
+
+def test_up_without_on_line_prints_to_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _record(monkeypatch)
+    compose.up("p", [tmp_path / "c.yaml"], cwd=tmp_path, build=False, timeout=9)
+    assert calls[0][1].get("on_line") is None

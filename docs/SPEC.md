@@ -498,9 +498,12 @@ final verify step. A cycle across steps (e.g. through groups) is a WtError befor
 - `doctor` check `traefik mounts`: compares the file names in the host `dynamic/` and `certs/`
   folders with `docker exec <container> ls -1 /etc/traefik/dynamic` and
   `ls -1 /etc/traefik/certs`. Any missing name → `fail` with the hint `wt doctor --fix`.
-- `doctor --fix` runs `docker restart <container>`, waits until it is running, and checks again.
+- `doctor --fix` recreates the container (`docker compose up -d --force-recreate`), waits until
+  it is running, and checks again. Not `docker restart`: a restart reuses the old mount source,
+  which fails when the host folder was deleted and recreated. A failed recreate is reported as
+  `fail` for this check; doctor goes on.
 - `up`, after it writes its route file, checks that the file name is listed inside the container.
-  If not, it restarts Traefik once; if the name is still missing, `up` fails with a WtError.
+  If not, it recreates Traefik once; if the name is still missing, `up` fails with a WtError.
 
 **ls status.** The `degraded` rule in D13 (§14) is replaced: when docker is reachable and the
 stored status is `up` or `degraded`, STATUS is `up` if `UP` equals its total and no health probe

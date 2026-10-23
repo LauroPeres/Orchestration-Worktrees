@@ -53,7 +53,7 @@ def test_up_twice_is_safe(orch, docker: FakeDocker) -> None:
 
 def test_template_error_creates_nothing(orch, docker: FakeDocker, isolated_home: Path) -> None:
     o = orch(env={"DB": "{{ kafka.topic('x') }}"})
-    with pytest.raises(WtError, match=r"v0\.3"):
+    with pytest.raises(WtError, match=r"v0\.4"):
         o.up("feat/cart")
     assert o.store.load().branches == {}
     assert not (isolated_home / "shop" / "worktrees").exists()
