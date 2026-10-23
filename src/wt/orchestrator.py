@@ -222,6 +222,7 @@ class Orchestrator:
 
                 if routes:
                     path = router.write_routes(names, routes, cert)
+                    self._ensure_route_visible(path)
                     self._record(branch, lambda bs: setattr(bs, "route_file", str(path)))
                 else:
                     self._drop_routes(branch, names)
@@ -354,6 +355,19 @@ class Orchestrator:
                     router.Route(name, names.host(svc.subdomain), router.host_upstream(ports[name]))
                 )
         return routes
+
+    def _ensure_route_visible(self, route: Path) -> None:
+        """Recreate Traefik once if it cannot see the route file (stale bind mount)."""
+        with file_lock("traefik"):
+            if route.name not in router.missing_in_container():
+                return
+            self.log("[yellow]warning:[/] Traefik does not see the route file; recreating it")
+            router.restart()
+            if route.name in router.missing_in_container():
+                raise WtError(
+                    f"Traefik still does not see the route file {route.name} after a "
+                    "recreate; run `wt doctor --fix`"
+                )
 
     def _drop_routes(self, branch: str, names: Names) -> None:
         recorded = self.store.load().branches[branch].route_file
