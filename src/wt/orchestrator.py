@@ -670,15 +670,11 @@ class Orchestrator:
                 result.services.append(
                     ServiceReport(name, "ok" if check.ok else "fail", check.detail, url, _kind(svc))
                 )
-            if (
-                result.status == "up"
-                and docker_ok
-                and (
-                    result.running < result.total
-                    or any(s.outcome == "fail" for s in result.services)
+            if docker_ok and result.status in ("up", "degraded"):
+                healthy = result.running >= result.total and not any(
+                    s.outcome == "fail" for s in result.services
                 )
-            ):
-                result.status = "degraded"
+                result.status = "up" if healthy else "degraded"
             return result
 
         with ThreadPoolExecutor(max_workers=8) as pool:
