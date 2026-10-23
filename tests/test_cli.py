@@ -81,7 +81,7 @@ def test_up_degraded_exits_1(
     result = runner.invoke(app, [*_cfg(tmp_path), "up", "feat/cart"])
     assert result.exit_code == 1
     assert "not healthy" in result.output
-    listed = runner.invoke(app, [*_cfg(tmp_path), "ls", "--no-probe"])
+    listed = runner.invoke(app, [*_cfg(tmp_path), "ls"])
     assert "degraded" in listed.output
 
 

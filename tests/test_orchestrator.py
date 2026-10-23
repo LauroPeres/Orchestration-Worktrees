@@ -861,6 +861,45 @@ def test_ls_status_is_degraded_when_not_all_services_run(
     assert row.status == "degraded"
 
 
+def _store_status(o: Any, status: str) -> None:
+    with o.store.edit() as state:
+        state.branches["feat/cart"].status = status
+
+
+def test_ls_status_degraded_recovers_to_up(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _store_status(o, "degraded")
+    assert [r.status for r in o.ls()] == ["up"]
+    assert [r.status for r in o.ls(probe=False)] == ["up"]
+    monkeypatch.setattr(health, "probe", lambda *a, **k: health.Check(False, "HTTP 502"))
+    assert [r.status for r in o.ls()] == ["degraded"]
+
+
+def test_ls_status_other_states_are_shown_as_stored(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    for status in ("failed", "creating", "removing"):
+        _store_status(o, status)
+        assert [r.status for r in o.ls()] == [status]
+
+
+def test_ls_status_keeps_stored_when_docker_is_unreachable(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _store_status(o, "degraded")
+
+    def boom(p: str) -> list[compose.Container]:
+        raise WtError("docker down")
+
+    monkeypatch.setattr(compose, "ps", boom)
+    assert [r.status for r in o.ls()] == ["degraded"]
+
+
 def test_up_and_down_hold_the_provider_lock(
     orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
