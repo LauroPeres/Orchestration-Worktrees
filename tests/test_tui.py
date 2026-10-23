@@ -79,11 +79,15 @@ def test_rows_and_columns() -> None:
         async with app.run_test() as pilot:
             await settle(pilot)
             table = app.query_one("#table", DataTable)
-            assert [str(c.label) for c in table.columns.values()] == ["NAME", "STATUS", "PORT"]
-            assert cells(app) == [["feat-a", "up", "8001, 8002"], ["main", "stopped", "-"]]
-            assert "u: up  d: down  a: add  r: remove  q: quit" in str(
-                app.query_one("#actions", Static).render()
-            )
+            assert [str(c.label) for c in table.columns.values()] == ["NAME", "STATUS"]
+            assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
+            actions: Any = app.query_one("#actions", Static).render()
+            assert actions.plain == "enter: services  u: up  d: down  a: add  r: remove  q: quit"
+            green = [actions.plain[s.start : s.end] for s in actions.spans]
+            assert green == ["enter", "u", "d", "a", "r", "q"]
+            table = app.query_one("#table", DataTable)
+            up, stopped = table.get_row_at(0)[1], table.get_row_at(1)[1]
+            assert up.style == "green" and not stopped.style
 
     asyncio.run(scenario())
 
@@ -170,11 +174,11 @@ def test_refresh_after_action_and_on_timer() -> None:
         async with app.run_test() as pilot:
             await settle(pilot)
             before = orch.ls_count
-            orch.rows = [status("feat-a", "up", [8001])]
+            orch.rows = [status("feat-a", "stopped")]
             await pilot.press("u")
             await settle(pilot)
             assert orch.ls_count > before
-            assert cells(app) == [["feat-a", "up", "8001"]]
+            assert cells(app) == [["feat-a", "stopped"]]
 
     asyncio.run(scenario())
 
@@ -221,7 +225,7 @@ def test_cells_have_no_color_markup() -> None:
         app = WtApp(FakeOrch(rows=[status("[red]x[/]", "up")]))
         async with app.run_test() as pilot:
             await settle(pilot)
-            assert cells(app) == [["[red]x[/]", "up", "-"]]
+            assert cells(app) == [["[red]x[/]", "up"]]
             table = app.query_one("#table", DataTable)
             for cell in table.get_row_at(0):
                 assert not cell.spans

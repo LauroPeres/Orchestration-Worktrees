@@ -1,4 +1,4 @@
-"""Terminal UI: one monochrome table, one row per worktree (SPEC §16)."""
+"""Terminal UI: one table, one row per worktree, a few green/purple accents (SPEC §16)."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ from wt.errors import WtError
 from wt.orchestrator import BranchStatus
 
 REFRESH_SECONDS = 2.0
-ACTIONS = "u: up  d: down  a: add  r: remove  q: quit"
+ACTIONS = "enter: services  u: up  d: down  a: add  r: remove  q: quit"
 CONFIRM_REMOVE = (
     "remove {branch}: deletes its containers, volumes, databases, worktrees and the git "
     "branch; unpushed commits are lost. Remove? y/N"
@@ -64,9 +64,23 @@ class Row:
         return f"{self.project}\0{self.status.branch if self.status else ''}"
 
 
-def _ports(status: BranchStatus) -> str:
-    ports = getattr(status, "ports", [])
-    return ", ".join(str(p) for p in ports) or "-"
+GREEN = "green"
+GREEN_STATES = {"up"}
+
+
+def actions_text(actions: str = ACTIONS) -> Text:
+    """The action line with each key (the part before the colon) in green."""
+    text = Text()
+    for i, item in enumerate(actions.split("  ")):
+        key, _, label = item.partition(":")
+        text.append("  " if i else "")
+        text.append(key, style=GREEN)
+        text.append(":" + label)
+    return text
+
+
+def state_text(state: str) -> Text:
+    return Text(state, style=GREEN if state in GREEN_STATES else "")
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -158,11 +172,11 @@ class WtApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="table", cursor_type="row")
-        yield Static(Text(ACTIONS), id="actions")
+        yield Static(actions_text(), id="actions")
         yield Static("", id="message")
 
     def on_mount(self) -> None:
-        self.query_one("#table", DataTable).add_columns("NAME", "STATUS", "PORT")
+        self.query_one("#table", DataTable).add_columns("NAME", "STATUS")
         self.query_one("#table", DataTable).focus()
         self.set_interval(REFRESH_SECONDS, self.action_refresh)
         self.action_refresh()
@@ -333,10 +347,10 @@ class WtApp(App[None]):
             for r in rows:
                 if r.status is not None:
                     name = f"{r.project}/{r.status.branch}" if multi else r.status.branch
-                    cells = (name, r.status.status, _ports(r.status))
+                    cells = (Text(name), state_text(r.status.status))
                 else:
-                    cells = (r.project, r.note, "-")
-                table.add_row(*(Text(c) for c in cells), key=r.key)
+                    cells = (Text(r.project), Text(r.note))
+                table.add_row(*cells, key=r.key)
             keys = [r.key for r in rows]
             if previous is not None and previous.key in keys:
                 table.move_cursor(row=keys.index(previous.key))
