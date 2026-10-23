@@ -905,7 +905,63 @@ class Orchestrator:
         proc.run(args, capture=False, check=False)
 
     def services(self, branch: str) -> list[RepoRow]:
-        raise NotImplementedError
+        """One row per repo of the branch's selected services (§17 Contract 6).
+
+        Cheap on purpose (the TUI calls it every 2 s): one `compose ps` per project, a TCP
+        connect per run process with a port, no HTTP probes.
+        """
+        me = self._for(branch)
+        bs = self.store.load().branches.get(branch)
+        names = me.names(branch)
+        repos: dict[str, list[str]] = {}
+        for name, svc in me.cfg.services.items():
+            repos.setdefault(svc.repo, []).append(name)
+        rows: list[RepoRow] = []
+        for repo, members in repos.items():
+            shown = [(n, me.cfg.services[n]) for n in members]
+            pick = next((n for n, s in shown if s.subdomain is not None), None)
+            routed = pick is not None
+            if pick is None:
+                pick = next((n for n, s in shown if s.port is not None), None)
+            port = bs.ports.get(pick) if bs is not None and pick is not None else None
+            url = me.service_url(names, me.cfg.services[pick]) if routed and pick else None
+            status = me._repo_status(bs, repo, [n for n, s in shown if s.run is not None])
+            rows.append(RepoRow(repo, status, port, url))
+        return rows
+
+    def _repo_status(
+        self, bs: BranchState | None, repo: str, run_services: list[str]
+    ) -> Literal["healthy", "unhealthy", "starting", "stopped"]:
+        if bs is None or bs.status == "stopped":
+            return "stopped"
+        containers: list[compose.Container] = []
+        project = bs.compose_projects.get(repo)
+        docker_ok = True
+        if project is not None:
+            try:
+                containers = compose.ps(project)
+            except WtError:
+                docker_ok = False
+        procs = [bs.processes.get(n) for n in run_services]
+        alive = [p is not None and host.alive(p) for p in procs]
+        busy = ("running", "created", "restarting")
+        if docker_ok and not any(alive) and not any(c.state in busy for c in containers):
+            return "stopped"
+        if bs.status == "creating" or any(
+            c.health == "starting" or c.state in ("created", "restarting") for c in containers
+        ):
+            return "starting"
+        listening = [
+            p is not None and a and (p.port is None or host.tcp_ok(p.port, timeout=0.3))
+            for p, a in zip(procs, alive, strict=True)
+        ]
+        if (
+            not docker_ok
+            or any(c.state != "running" or c.health == "unhealthy" for c in containers)
+            or not all(listening)
+        ):
+            return "unhealthy"
+        return "healthy"
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
         """Every catalog service with its repo and whether the branch selects it (§17 D-a)."""

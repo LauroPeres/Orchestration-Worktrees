@@ -1608,3 +1608,108 @@ def test_stop_keeps_compose_volumes_and_down_removes_them(orch, docker: FakeDock
     assert docker.downs == []
     o.down("feat/cart")
     assert docker.downs == ["wt-shop-feat-cart-api"]  # down removes volumes
+
+
+def _set_ps(monkeypatch: pytest.MonkeyPatch, *containers: compose.Container) -> None:
+    monkeypatch.setattr(compose, "ps", lambda p: list(containers))
+
+
+def _rows(o: Orchestrator, branch: str = "feat/x") -> dict[str, str]:
+    return {r.name: r.status for r in o.services(branch)}
+
+
+def test_services_rows_of_a_healthy_branch(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(monkeypatch, compose.Container("api", "running", "healthy"))
+    front = o.store.load().branches["feat/x"].processes["front"]
+    assert wait_until(lambda: host.tcp_ok(front.port or 0))
+    api, ui = o.services("feat/x")
+    bs = o.store.load().branches["feat/x"]
+    assert (api.name, api.status, api.port) == ("api", "healthy", bs.ports.get("api"))
+    assert api.url == "https://api.feat-x.shop.localhost"
+    assert (ui.name, ui.status, ui.port) == ("ui", "healthy", bs.ports["front"])
+    assert ui.url == "https://front.feat-x.shop.localhost"
+
+
+@pytest.mark.parametrize(
+    ("container", "expected"),
+    [
+        (compose.Container("api", "running", "starting"), "starting"),
+        (compose.Container("api", "restarting", ""), "starting"),
+        (compose.Container("api", "running", "unhealthy"), "unhealthy"),
+        (compose.Container("api", "exited", ""), "stopped"),
+    ],
+)
+def test_services_compose_states(
+    cfg_orch: Orchestrator, monkeypatch, container: compose.Container, expected: str
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(monkeypatch, container)
+    assert _rows(o)["api"] == expected
+
+
+def test_services_one_row_for_two_compose_services_of_a_repo(
+    cfg_orch: Orchestrator, monkeypatch
+) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(
+        monkeypatch,
+        compose.Container("db", "running", "healthy"),
+        compose.Container("api", "exited", ""),
+    )
+    rows = o.services("feat/x")
+    assert [r.name for r in rows] == ["api", "ui"]
+    assert rows[0].status == "unhealthy"  # something runs, one container is down
+
+
+def test_services_precedence_starting_over_unhealthy(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(
+        monkeypatch,
+        compose.Container("db", "running", "unhealthy"),
+        compose.Container("api", "running", "starting"),
+    )
+    assert _rows(o)["api"] == "starting"
+
+
+def test_services_dead_run_process_and_closed_port(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(monkeypatch, compose.Container("api", "running", "healthy"))
+    monkeypatch.setattr(host, "tcp_ok", lambda *a, **k: False)
+    assert _rows(o)["ui"] == "unhealthy"  # alive, nothing listening
+    ps = o.store.load().branches["feat/x"].processes["front"]
+    host.stop(ps, grace=0.2)
+    assert _rows(o)["ui"] == "stopped"  # nothing runs in that repo
+
+
+def test_services_stopped_and_missing_branch(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.stop("feat/x")
+    assert _rows(o) == {"api": "stopped", "ui": "stopped"}
+    rows = o.services("nope")
+    assert [(r.name, r.status, r.port) for r in rows] == [
+        ("api", "stopped", None),
+        ("ui", "stopped", None),
+    ]
+    assert rows[0].url == "https://api.nope.shop.localhost"
+
+
+def test_services_creating_branch_is_starting(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    _set_ps(monkeypatch, compose.Container("api", "running", ""))
+    o._record("feat/x", lambda b: setattr(b, "status", "creating"))
+    assert _rows(o)["api"] == "starting"
+
+
+def test_services_follow_the_branch_selection(cfg_orch: Orchestrator, monkeypatch) -> None:
+    o = cfg_orch
+    o.up("feat/x")
+    o.configure("feat/x", ["front"])
+    assert [r.name for r in o.services("feat/x")] == ["ui"]
