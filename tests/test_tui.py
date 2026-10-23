@@ -6,7 +6,7 @@ from typing import Any
 from textual.widgets import DataTable, Static
 
 from wt.errors import WtError
-from wt.orchestrator import BranchStatus
+from wt.orchestrator import BranchStatus, Choice, RepoRow
 from wt.tui import CONFIRM_REMOVE, ProjectEntry, WtApp
 
 
@@ -56,6 +56,15 @@ class FakeOrch:
     def remove(self, branch: str, *, force: bool = False) -> object:
         self._act("remove", branch, force)
         return True
+
+    def services(self, branch: str) -> list[RepoRow]:
+        return []
+
+    def catalog_choices(self, branch: str) -> list[Choice] | None:
+        return None
+
+    def configure(self, branch: str, uses: list[str]) -> None:
+        self._act("configure", branch, list(uses))
 
 
 async def settle(pilot: Any) -> None:
