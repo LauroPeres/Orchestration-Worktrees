@@ -11,8 +11,9 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import SHARED, FakeDocker, FakeProvider
+from tests.conftest import COMPOSE, SHARED, FakeDocker, FakeProvider
 from wt import compose, git, health, host, naming, proc, router, tls
+from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import Check
@@ -993,3 +994,30 @@ def test_up_fails_when_route_file_is_still_missing(
         o.up("feat/cart")
     assert restarts == [1]
     assert [r.status for r in o.ls(probe=False)] == ["failed"]
+
+
+def test_consumes_url_reaches_the_consumer_env(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(
+        """\
+repos: {r: ./shop-api}
+services:
+  back: {repo: r, compose: docker-compose.yml, compose_service: api, port: 8000, subdomain: api}
+  front:
+    repo: r
+    compose: docker-compose.yml
+    compose_service: db
+    port: 80
+    subdomain: ""
+    consumes: {back: API_URL}
+"""
+    )
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front]\n"
+    )
+    Orchestrator(load_config(path), log=lambda m: None).up("feat/x")
+    override = docker.files[0][1].read_text()
+    assert "API_URL: https://api.feat-x.shop.localhost" in override

@@ -33,6 +33,9 @@ class Service(Strict):
     )
     health: str = "/"
     env: dict[str, str] = Field(default_factory=dict)
+    needs: list[str] = Field(
+        default_factory=list, description="services that must be healthy before this one starts"
+    )
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -118,13 +121,44 @@ class Config(Strict):
                     f"subdomain {svc.subdomain!r}"
                 )
             hosts[svc.subdomain] = name
+        for name, svc in self.services.items():
+            for dep in svc.needs:
+                if dep not in self.services:
+                    raise ValueError(f"service {name!r} needs unknown service {dep!r}")
+        cycle = find_cycle({n: s.needs for n, s in self.services.items()})
+        if cycle:
+            raise ValueError("services need each other in a cycle: " + " -> ".join(cycle))
         return self
+
+
+def find_cycle(edges: dict[str, list[str]]) -> list[str] | None:
+    """Return a dependency cycle as [a, b, ..., a], or None."""
+    state: dict[str, int] = {}  # 1 = on the current path, 2 = done
+    path: list[str] = []
+
+    def visit(node: str) -> list[str] | None:
+        state[node] = 1
+        path.append(node)
+        for dep in edges.get(node, []):
+            if state.get(dep) == 1:
+                return [*path[path.index(dep) :], dep]
+            if dep not in state and (found := visit(dep)):
+                return found
+        path.pop()
+        state[node] = 2
+        return None
+
+    for name in edges:
+        if name not in state and (found := visit(name)):
+            return found
+    return None
 
 
 @dataclass(frozen=True)
 class LoadedConfig:
     config: Config
     path: Path
+    catalog: Path | None = None
 
     @property
     def root(self) -> Path:
@@ -161,11 +195,19 @@ def load_config(path: Path) -> LoadedConfig:
         raise WtError(f"{path} is not valid YAML:\n{exc}") from exc
     if not isinstance(raw, dict):
         raise WtError(f"{path} must contain a YAML mapping")
+    catalog: Path | None = None
+    if ("services" in raw) == ("uses" in raw):
+        raise WtError(f"invalid {path.name}: set exactly one of 'services' or 'uses'")
+    if "uses" in raw:
+        from wt.catalog import catalog_path, resolve  # catalog imports this module
+
+        catalog = catalog_path(raw.get("catalog"), path.parent)
+        raw = resolve(raw, path)
     try:
         config = Config.model_validate(raw)
     except ValidationError as exc:
         raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
-    return LoadedConfig(config=config, path=path)
+    return LoadedConfig(config=config, path=path, catalog=catalog)
 
 
 STARTER = """\

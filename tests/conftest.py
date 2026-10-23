@@ -102,7 +102,7 @@ class FakeDocker:
     files: list[list[Path]] = field(default_factory=list)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(router, "ensure_running", lambda timeout=60: None)
+        monkeypatch.setattr(router, "ensure_running", lambda timeout=60, on_line=None: None)
         monkeypatch.setattr(router, "is_running", lambda: self.traefik_running)
         monkeypatch.setattr(router, "missing_in_container", lambda: [])
         monkeypatch.setattr(tls, "available", lambda: False)
