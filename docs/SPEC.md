@@ -451,6 +451,15 @@ Rules:
 - Catalog services accept every `Service` key, plus `infra` (keys of `shared`) and `consumes`.
   Env var names in `consumes` match `^[A-Z_][A-Z0-9_]*$`.
 - Repo paths are made absolute when the catalog is resolved.
+- A local `repos:` together with `uses` is an error (repos come from the catalog). A worktree.yaml
+  with neither `services:` nor `uses:` is an error.
+- `catalog:` is read by `load_config` and is not part of the resolved `Config`.
+- Infra merge conflicts are checked only on explicitly set fields; list fields (`databases`,
+  `groups`) are unioned.
+- Service order follows discovery: the `uses` entries, then their dependencies.
+- `env` and `needs` set on a catalog service are kept; the `consumes` variable is added to `env`
+  and the dependency to `needs`.
+- A cycle through `consumes` is an error ("cycle through catalog consumes: a -> b -> a").
 - **Needs (decision a).** `Service.needs: list[str]` (default `[]`) is filled from `consumes`.
   The v0.2 `services:` style may also set `needs`; names must be known and there must be no cycle.
 
