@@ -918,6 +918,45 @@ def test_refused_up_leaves_the_slug_free(orch, fake_provider: FakeProvider) -> N
     assert "main" in o.store.load().branches
 
 
+def test_up_route_visible_does_not_restart_traefik(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: [])
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    orch().up("feat/cart")
+    assert restarts == []
+
+
+def test_up_recreates_traefik_when_route_file_is_not_visible(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = [["shop--feat-cart.yml", "other.yml"], ["other.yml"]]
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: answers.pop(0))
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/cart")
+    assert restarts == [1]
+    assert any("Traefik does not see the route file; recreating it" in m for m in logs)
+    assert [r.status for r in o.ls(probe=False)] == ["up"]
+
+
+def test_up_fails_when_route_file_is_still_missing(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: ["shop--feat-cart.yml"])
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    o = orch()
+    with pytest.raises(WtError, match=r"shop--feat-cart\.yml.*wt doctor --fix"):
+        o.up("feat/cart")
+    assert restarts == [1]
+    assert [r.status for r in o.ls(probe=False)] == ["failed"]
+
+
 def test_consumes_url_reaches_the_consumer_env(
     make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
 ) -> None:
