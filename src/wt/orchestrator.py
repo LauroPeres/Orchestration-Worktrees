@@ -456,11 +456,14 @@ class Orchestrator:
                     if p.port is not None and (other, n) != (branch, name):
                         taken.add(p.port)
                 taken |= {p for n, p in bs.ports.items() if (other, n) != (branch, name)}
+            process = mine.processes.get(name) if mine else None
             if svc.run is not None and svc.port != "auto":
-                ports[name] = host.pick_port(name, taken, svc.port)
+                own_live = (
+                    process is not None and process.port == svc.port and host.alive(process)
+                )  # our own process already listens there (SPEC §14 "Ports")
+                ports[name] = svc.port if own_live else host.pick_port(name, taken, svc.port)
                 continue
             port = naming.host_port(index, self.loaded.service_index(name))
-            process = mine.processes.get(name) if mine else None
             ours = (
                 mine is not None
                 and mine.ports.get(name) == port
