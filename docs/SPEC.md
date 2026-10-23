@@ -157,10 +157,11 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | Version | Scope |
 |---|---|
 | v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
-| v0.2 | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
-| v0.3 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
-| v0.4 | Keycloak provider (SSO across branch subdomains) |
-| later | shared dependency caches, plugin entry points, TUI, native Windows |
+| v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
+| v0.3 | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
+| v0.4 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
+| v0.5 | Keycloak provider (SSO across branch subdomains) |
+| later | shared dependency caches, plugin entry points, native Windows |
 
 ## 11. Clean-room rules
 
@@ -233,7 +234,7 @@ other method keeps the §6 signature.
 
 **Active providers.** Only `postgres` runs. `kafka`, `redis` and `keycloak` under `shared:` stay
 as in v0.1: validated, ignored with a note in `up`, and their template names (`{{ kafka... }}`)
-fail with the "arrives in v0.3/v0.4" message.
+fail with the "arrives in v0.4/v0.5" message.
 
 **Provider hooks.** Per provider, `up` runs `ensure_server()` → `create(ctx)` → `verify(ctx)`
 before any service starts. `down` runs `destroy(ctx)` for each provider recorded for the branch,
@@ -371,7 +372,7 @@ raises `WtError("docker is not reachable ...")`, and `ls` shows `docker unavaila
 Layout, so URLs stay whole at 80 columns: columns `BRANCH STATUS UP SERVICE KIND URL HEALTH`
 (`UP` is `<running>/<total>`, e.g. `2/2`, counting every service of the branch: compose containers plus live `run:` processes; only `UP` and `HEALTH` may wrap, a URL never does); databases are listed in a `databases:` section after the table.
 
-**D13 (width, degraded).** When stdout is not a terminal (piped, redirected, CI), the console does not limit width: no wrapping and no cutting in `ls` or `up`, like `docker ps` piped. A terminal keeps the layout above. `ls` shows STATUS `degraded` instead of the stored `up` when docker is reachable and either not every service is running (`UP` below its total) or a health probe failed; without probing only the `UP` rule applies. Other stored statuses are shown as they are.
+**D13 (width, degraded).** When stdout is not a terminal (piped, redirected, CI), the console does not limit width: no wrapping and no cutting in `ls` or `up`, like `docker ps` piped. A terminal keeps the layout above. STATUS is live (v0.3, see §15 "ls status"): when docker is reachable and the stored status is `up` or `degraded`, STATUS is `up` if `UP` equals its total and no health probe failed, else `degraded`; without probing only the `UP` rule applies. `creating`, `removing` and `failed` are shown as stored.
 
 **logs.** For a `run:` service, a missing log file raises `WtError("no log yet for <svc> on <branch>")`.
 
@@ -391,3 +392,107 @@ which `bootstrap.sh` copies onto that branch and commits.
 in branch names. Safe values such as ports and URLs are unchanged. Only `run:` is quoted: `env`
 values, compose files and URLs are rendered as they are. Users must not add quotes around template
 values in `run:`.
+
+## 15. v0.3 implementation notes
+
+Decisions taken while planning v0.3. Change them here first if they need to change.
+
+**Catalog.** A user catalog (`~/.wt/catalog.yaml` by default) lists the repos and services of
+all projects. A worktree.yaml picks services from it with `uses:`. Format:
+
+```yaml
+repos:                         # name -> path; ~ expanded, relative = relative to this file
+  notes-back: ~/code/notes-back
+  notes-front: ~/code/notes-front
+services:
+  back:
+    repo: notes-back
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+    health: /healthz
+    infra:                     # what this service needs; merged into `shared`
+      postgres: {databases: [notes]}
+    env:
+      DATABASE_URL: "{{ postgres.url('notes') }}"
+  front:
+    repo: notes-front
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    consumes:                  # how the code consumes other services
+      back: API_URL            # the front reads the back's branch URL from $API_URL
+```
+
+worktree.yaml with a catalog:
+
+```yaml
+project: notes
+domain: notes.localhost
+catalog: ./catalog.yaml        # optional
+uses: [front]                  # back comes in because front consumes it
+```
+
+Rules:
+- A worktree.yaml has exactly one of `services:` (v0.2 style, unchanged) or `uses:`.
+- `uses` + every service reachable through `consumes` = the stack; their repos come from the
+  catalog; `infra` of all of them is merged into `shared` (union of databases; two different
+  `strategy`/`base_branch` values are an error); a local `shared:` is an error with `uses`.
+- `consumes: {dep: VAR}` adds `VAR: "{{ services.dep.url }}"` to the consumer's env (error if
+  `dep` has no route, or if `env` already sets VAR).
+- The env of a consumed service may use `{{ services.<consumer>.url }}` (for CORS).
+- Start order: infra (Traefik, providers) first, then services in dependency order: a
+  consumed service is started and healthy before its consumers (compose groups and host
+  processes sorted topologically; a cycle is an error).
+- The result is a normal `Config`, so the rest of wt does not change.
+- `wt catalog`: table of the catalog (service, repo, kind, infra, consumes, consumed by);
+  `wt catalog --check` validates it.
+
+- Catalog services accept every `Service` key, plus `infra` (keys of `shared`) and `consumes`.
+  Env var names in `consumes` match `^[A-Z_][A-Z0-9_]*$`.
+- Repo paths are made absolute when the catalog is resolved.
+- **Needs (decision a).** `Service.needs: list[str]` (default `[]`) is filled from `consumes`.
+  The v0.2 `services:` style may also set `needs`; names must be known and there must be no cycle.
+
+**Start order.** `up` builds one list of steps: a compose group per repo, and one step per
+`run:` service. Edges come from `needs`. Without `needs` the order is the v0.2 order: compose
+groups, then run services.
+
+**Healthy before consumers (decision b).** A step starts only after the steps it needs are
+healthy, up to `timeout`:
+- compose group: healthy when `docker compose up --wait` succeeded for it;
+- `run:` service with a `port`: healthy when the port accepts TCP; without a port: healthy when
+  the process is alive.
+
+Routes are still written once, after all services. The HTTP probe through Traefik stays in the
+final verify step. A cycle across steps (e.g. through groups) is a WtError before anything starts.
+
+**TUI (`wt tui`).** Module `src/wt/tui.py` on Textual (new dependency, `textual>=0.80`); command
+`wt tui` in `cli.py`.
+- Layout: left, a list of the branches of the current project with their status (from `ls()`);
+  right, the services of the selected branch (SERVICE KIND URL HEALTH, like `wt ls`); bottom, a
+  log pane.
+- Keys: arrows select; `u` up the selected branch; `n` up a new branch (input box); `d` down the
+  selected branch (confirm; `--force` only after a second confirm); `l` tail the selected service's
+  log in the log pane; `r` refresh; `q` quit.
+- Auto refresh every 2 s. `ls()` runs in a worker thread, so the UI never blocks.
+- `up` and `down` run in a worker thread, one at a time; keys are ignored with a notice while busy.
+  Errors are shown in the log pane; the app stays open.
+- **Output (decision c).** Compose and Traefik output reach the TUI through
+  `Orchestrator(..., out: Callable[[str], None] | None = None)`, passed to `proc.run(..., on_line=...)`.
+  `None` means the terminal, as today.
+- Tests: Textual `App.run_test()` pilot with a fake orchestrator, run with `asyncio.run(...)`
+  (no pytest-asyncio, no Docker).
+
+**Stale Traefik mounts.** After a Docker Desktop restart, Traefik can see empty
+`/etc/traefik/dynamic` and `/etc/traefik/certs`, so every route returns 404.
+- `doctor` check `traefik mounts`: compares the file names in the host `dynamic/` and `certs/`
+  folders with `docker exec <container> ls -1 /etc/traefik/dynamic` and
+  `ls -1 /etc/traefik/certs`. Any missing name → `fail` with the hint `wt doctor --fix`.
+- `doctor --fix` runs `docker restart <container>`, waits until it is running, and checks again.
+- `up`, after it writes its route file, checks that the file name is listed inside the container.
+  If not, it restarts Traefik once; if the name is still missing, `up` fails with a WtError.
+
+**ls status.** The `degraded` rule in D13 (§14) is replaced: when docker is reachable and the
+stored status is `up` or `degraded`, STATUS is `up` if `UP` equals its total and no health probe
+failed, else `degraded`. `creating`, `removing` and `failed` are shown as stored.
