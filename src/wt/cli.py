@@ -153,6 +153,46 @@ def down(
         console.print(f"[green]{branch} is down.[/]")
 
 
+@app.command()
+def add(
+    ctx: typer.Context,
+    branch: Annotated[str, typer.Argument(help="Git branch, e.g. feat/cart.")],
+) -> None:
+    """Create worktrees and reserve ports for BRANCH without starting anything."""
+    if Orchestrator(_load(ctx), log=_log).add(branch):
+        console.print(f"[green]{branch} is added (stopped).[/] Start it with `wt up {branch}`.")
+
+
+@app.command()
+def stop(
+    ctx: typer.Context,
+    branch: Annotated[str, typer.Argument(help="Git branch.")],
+) -> None:
+    """Stop BRANCH's services; worktrees, volumes, databases and ports are kept."""
+    Orchestrator(_load(ctx), log=_log).stop(branch)
+    console.print(f"[green]{branch} is stopped.[/]")
+
+
+@app.command()
+def remove(
+    ctx: typer.Context,
+    branch: Annotated[str, typer.Argument(help="Git branch.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Remove worktrees with uncommitted changes.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
+) -> None:
+    """Do `down` for BRANCH, then delete the git branch (unpushed commits are lost)."""
+    if not yes:
+        typer.confirm(
+            f"remove {branch}: deletes its containers, volumes, databases, worktrees and the "
+            "git branch; unpushed commits are lost. Remove?",
+            abort=True,
+        )
+    if Orchestrator(_load(ctx), log=_log).remove(branch, force=force):
+        console.print(f"[green]{branch} is removed.[/]")
+
+
 @app.command("ls")
 def ls_(
     ctx: typer.Context,

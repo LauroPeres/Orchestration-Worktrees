@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 from tests.conftest import COMPOSE, SHARED, FakeDocker, FakeProvider
+from tests.conftest import git as git_run
 from wt import compose, git, health, host, naming, proc, router, tls
 from wt.config import load_config
 from wt.errors import WtError
@@ -1158,3 +1159,130 @@ def test_cycle_across_compose_groups_is_an_error_before_anything_starts(
         o.up("main")
     assert start_events == [] and docker.ups == []
     assert "main" not in o.store.load().branches
+
+
+# ---- lifecycle: add / stop / remove (SPEC section 16) ----------------------------------------
+
+
+def test_add_creates_worktrees_and_ports_but_no_containers(
+    run_orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = run_orch()
+    assert o.add("feat/cart") is True
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.status == "stopped"
+    assert bs.repos["api"].created and Path(bs.repos["api"].path).is_dir()
+    assert set(bs.ports) == {"web"} and not bs.processes
+    assert docker.ups == [] and docker.downs == []
+    assert not (isolated_home / "traefik" / "dynamic").exists()
+    [row] = o.ls(probe=False)
+    assert row.status == "stopped" and row.ports == sorted(bs.ports.values())
+
+
+def test_add_twice_is_a_noop(orch, docker: FakeDocker) -> None:
+    o = orch()
+    assert o.add("feat/cart") is True
+    assert o.add("feat/cart") is False
+
+
+def test_add_runs_the_provider_preflight_only(orch, fake_provider: FakeProvider) -> None:
+    fake_provider.refuse = True
+    o = orch(shared=SHARED)
+    with pytest.raises(WtError, match="refused"):
+        o.add("feat/cart")
+    fake_provider.refuse = False
+    o.add("feat/cart")
+    assert fake_provider.events == []  # no ensure, create or verify
+
+
+def test_up_after_add_reuses_worktree_and_ports(run_orch, docker: FakeDocker) -> None:
+    o = run_orch()
+    o.add("feat/cart")
+    before = o.store.load().branches["feat/cart"]
+    o.up("feat/cart")
+    after = o.store.load().branches["feat/cart"]
+    assert after.status == "up"
+    assert after.ports == before.ports
+    assert after.repos["api"].path == before.repos["api"].path
+
+
+def test_stop_keeps_worktrees_and_ports_and_removes_the_route(
+    run_orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = run_orch()
+    o.up("feat/cart")
+    before = o.store.load().branches["feat/cart"]
+    o.stop("feat/cart")
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.status == "stopped" and not bs.processes and bs.route_file is None
+    assert docker.downs == ["wt-shop-feat-cart-api"]
+    assert bs.ports == before.ports
+    assert Path(bs.repos["api"].path).is_dir()
+    assert not list((isolated_home / "traefik" / "dynamic").iterdir())
+    assert not host.alive(before.processes["web"])
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up"
+
+
+def test_stop_unknown_branch_is_an_error(orch, docker: FakeDocker) -> None:
+    with pytest.raises(WtError, match="not found"):
+        orch().stop("feat/nope")
+
+
+def test_remove_deletes_the_git_branch(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    o = orch()
+    o.up("feat/cart")
+    assert o.remove("feat/cart") is True
+    assert o.store.load().branches == {}
+    assert "feat/cart" not in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def test_remove_refuses_dirty_worktree_without_force(
+    orch, docker: FakeDocker, isolated_home: Path, tmp_path: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    (isolated_home / "shop" / "worktrees" / "feat-cart" / "api" / "wip.txt").write_text("x")
+    with pytest.raises(WtError, match="untracked"):
+        o.remove("feat/cart")
+    assert o.remove("feat/cart", force=True) is True
+    assert "feat/cart" not in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def test_remove_unknown_branch_deletes_nothing(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    o = orch()
+    git_run(tmp_path / "shop-api", "branch", "feat/old")
+    assert o.remove("feat/old") is False
+    assert "feat/old" in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def test_remove_keeps_the_branch_checked_out_in_the_main_folder(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    o = orch()
+    o.up("main")
+    assert o.remove("main") is True
+    assert "main" in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def test_remove_keeps_the_postgres_base_branch(
+    orch, fake_provider: FakeProvider, tmp_path: Path
+) -> None:
+    o = orch(shared={"postgres": {"databases": ["shop"], "base_branch": "develop"}})
+    git_run(tmp_path / "shop-api", "branch", "develop")
+    o.up("develop")
+    assert o.remove("develop") is True
+    assert "develop" in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def test_remove_keeps_a_branch_checked_out_in_a_foreign_folder(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    o = orch()
+    foreign = tmp_path / "foreign"
+    git_run(tmp_path / "shop-api", "worktree", "add", "-b", "feat/x", str(foreign))
+    o.up("feat/x")
+    assert not o.store.load().branches["feat/x"].repos["api"].created
+    assert o.remove("feat/x") is True
+    assert foreign.is_dir()
+    assert "feat/x" in git_run(tmp_path / "shop-api", "branch", "--list")

@@ -52,6 +52,7 @@ class BranchStatus:
     services: list[ServiceReport] = field(default_factory=list)
     worktrees: dict[str, str] = field(default_factory=dict)
     databases: list[str] = field(default_factory=list)
+    ports: list[int] = field(default_factory=list)
     docker_ok: bool = True
 
 
@@ -202,26 +203,7 @@ class Orchestrator:
         names = self.names(branch)
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         with self._branch_lock(names):
-            # Ports are picked, templates rendered (a typo fails here, before anything is
-            # created) and the ports recorded under one lock, so two `up` never pick the same one.
-            with file_lock(f"ports-{self.cfg.project}"):
-                ports = self._resolve_ports(branch)
-                envs, commands = self._render(names, ports)
-                for provider in self.providers():
-                    provider.preflight(self.provider_context(names))
-                with self.store.edit() as state:
-                    for other, bs in state.branches.items():
-                        if other != branch and bs.slug == names.slug:
-                            raise WtError(
-                                f"branch {branch!r} and the running branch {other!r} map to "
-                                f"the same name {names.slug!r}; run `wt down {other}` first"
-                            )
-                    state.config_path = str(self.loaded.path)
-                    current = state.branches.setdefault(
-                        branch, BranchState(branch=branch, slug=names.slug)
-                    )
-                    current.status = "creating"
-                    current.ports = dict(ports)
+            envs, commands, ports = self._reserve(branch, names)
 
             try:
                 if ignored := ", ".join(
@@ -285,6 +267,78 @@ class Orchestrator:
             except Exception:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
+
+    def _reserve(
+        self, branch: str, names: Names
+    ) -> tuple[dict[str, dict[str, str]], dict[str, str], dict[str, int]]:
+        """Pre-flight for `up` and `add`; the caller holds the branch lock.
+
+        Ports are picked, templates rendered (a typo fails here, before anything is created)
+        and the ports recorded under one lock, so two callers never pick the same one.
+        """
+        with file_lock(f"ports-{self.cfg.project}"):
+            ports = self._resolve_ports(branch)
+            envs, commands = self._render(names, ports)
+            for provider in self.providers():
+                provider.preflight(self.provider_context(names))
+            with self.store.edit() as state:
+                for other, bs in state.branches.items():
+                    if other != branch and bs.slug == names.slug:
+                        raise WtError(
+                            f"branch {branch!r} and the running branch {other!r} map to "
+                            f"the same name {names.slug!r}; run `wt down {other}` first"
+                        )
+                state.config_path = str(self.loaded.path)
+                current = state.branches.setdefault(
+                    branch, BranchState(branch=branch, slug=names.slug)
+                )
+                current.status = "creating"
+                current.ports = dict(ports)
+        return envs, commands, ports
+
+    def add(self, branch: str) -> bool:
+        """Worktrees and reserved ports only, status `stopped`. False when already known."""
+        git.check_branch_name(branch)
+        names = self.names(branch)
+        self.start_plan()  # a cycle fails here, before anything is created
+        with self._branch_lock(names):
+            if branch in self.store.load().branches:
+                self.log(f"branch {branch} is already known; nothing to add")
+                return False
+            self._reserve(branch, names)
+            try:
+                self._up_worktrees(branch, names)
+            except Exception:
+                self._record(branch, lambda bs: setattr(bs, "status", "failed"))
+                raise
+            self._record(branch, lambda bs: setattr(bs, "status", "stopped"))
+            return True
+
+    def stop(self, branch: str) -> None:
+        """Stop processes and compose projects (no volumes) and drop the route; keep the rest."""
+        names = self.names(branch)
+        with self._branch_lock(names):
+            bs = self.store.load().branches.get(branch)
+            if bs is None:
+                raise WtError(f"branch {branch!r} not found (see `wt ls`)")
+            self._stop_services(branch, names, bs)
+
+            def stopped(b: BranchState) -> None:
+                b.status = "stopped"
+                b.route_file = None
+
+            self._record(branch, stopped)
+
+    def _stop_services(self, branch: str, names: Names, bs: BranchState | None) -> None:
+        self._down_processes(branch, bs)
+        projects = {names.compose_project(g.repo) for g in self.compose_groups()}
+        projects |= set(bs.compose_projects.values()) if bs else set()
+        for project in sorted(projects):
+            self.log(f"compose down [bold]{project}[/]")
+            compose.down(project)
+        router.remove_routes(router.route_file(names))
+        if bs and bs.route_file:
+            router.remove_routes(Path(bs.route_file))
 
     def _up_providers(self, branch: str, names: Names) -> None:
         ctx = self.provider_context(names)
@@ -599,84 +653,96 @@ class Orchestrator:
 
     def down(self, branch: str, *, force: bool = False) -> bool:
         """Remove everything for a branch. False when there was nothing to remove."""
-        names = self.names(branch)
-        with self._branch_lock(names):
-            state = self.store.load()
-            for other, other_bs in state.branches.items():
-                if other != branch and other_bs.slug == names.slug:
-                    raise WtError(
-                        f"branch {branch!r} and the running branch {other!r} map to "
-                        f"the same name {names.slug!r}; run `wt down {other}` instead"
-                    )
-            bs = state.branches.get(branch)
+        with self._branch_lock(self.names(branch)):
+            return self._down_locked(branch, force=force) is not None
 
-            # (main repo, worktree) pairs that wt created and must remove
-            removals: list[tuple[Path, Path]] = []
-            for repo in sorted(set(self.cfg.repos) | set(bs.repos if bs else [])):
-                recorded = bs.repos.get(repo) if bs else None
-                if recorded is not None:
-                    if recorded.created:
-                        removals.append((Path(recorded.source), Path(recorded.path)))
-                elif repo in self.cfg.repos and self.worktree_target(names, repo).exists():
-                    source, target = self.loaded.repo_path(repo), self.worktree_target(names, repo)
-                    if _is_worktree_of(source, target):
-                        removals.append((source, target))
-                    else:
-                        self.log(
-                            f"[yellow]warning:[/] {target} is not a worktree of repo {repo!r}; "
-                            "left in place, remove it by hand"
-                        )
-
-            leftovers = [router.route_file(names), *tls.cert_paths(names)]
-            if (
-                bs is None
-                and not removals
-                and not self.branch_dir(names).exists()
-                and not any(p.exists() for p in leftovers)
-            ):
-                self.log(f"branch {branch} not found; nothing to remove")
+    def remove(self, branch: str, *, force: bool = False) -> bool:
+        """`down`, then delete the git branch in every repo, except protected ones."""
+        with self._branch_lock(self.names(branch)):
+            sources = self._down_locked(branch, force=force)
+            if sources is None:
                 return False
+            pg = self.cfg.shared.postgres
+            base = pg.base_branch if pg is not None else "main"
+            for repo, source in sources.items():
+                if branch == base:
+                    self.log(f"keeping branch {branch!r} in repo {repo!r}: Postgres base branch")
+                elif any(t.branch == branch for t in git.list_worktrees(source)):
+                    self.log(f"keeping branch {branch!r} in repo {repo!r}: checked out elsewhere")
+                elif git.branch_exists(source, branch):
+                    self.log(f"deleting branch {branch!r} in repo {repo!r}")
+                    git.delete_branch(source, branch)
+            return True
 
-            if not force:
-                dirty = [str(p) for _, p in removals if p.exists() and git.is_dirty(p)]
-                if dirty:
-                    raise WtError(
-                        "uncommitted or untracked changes in:\n  "
-                        + "\n  ".join(dirty)
-                        + "\ncommit or stash them, or run `wt down --force` "
-                        "(the branch and its commits are always kept)"
+    def _down_locked(self, branch: str, *, force: bool) -> dict[str, Path] | None:
+        """The body of `down`; None when there was nothing to remove, else repo -> main folder."""
+        names = self.names(branch)
+        state = self.store.load()
+        for other, other_bs in state.branches.items():
+            if other != branch and other_bs.slug == names.slug:
+                raise WtError(
+                    f"branch {branch!r} and the running branch {other!r} map to "
+                    f"the same name {names.slug!r}; run `wt down {other}` instead"
+                )
+        bs = state.branches.get(branch)
+
+        # (main repo, worktree) pairs that wt created and must remove
+        removals: list[tuple[Path, Path]] = []
+        for repo in sorted(set(self.cfg.repos) | set(bs.repos if bs else [])):
+            recorded = bs.repos.get(repo) if bs else None
+            if recorded is not None:
+                if recorded.created:
+                    removals.append((Path(recorded.source), Path(recorded.path)))
+            elif repo in self.cfg.repos and self.worktree_target(names, repo).exists():
+                source, target = self.loaded.repo_path(repo), self.worktree_target(names, repo)
+                if _is_worktree_of(source, target):
+                    removals.append((source, target))
+                else:
+                    self.log(
+                        f"[yellow]warning:[/] {target} is not a worktree of repo {repo!r}; "
+                        "left in place, remove it by hand"
                     )
 
-            if bs:
-                self._record(branch, lambda b: setattr(b, "status", "removing"))
+        leftovers = [router.route_file(names), *tls.cert_paths(names)]
+        if (
+            bs is None
+            and not removals
+            and not self.branch_dir(names).exists()
+            and not any(p.exists() for p in leftovers)
+        ):
+            self.log(f"branch {branch} not found; nothing to remove")
+            return None
 
-            self._down_processes(branch, bs)
+        if not force:
+            dirty = [str(p) for _, p in removals if p.exists() and git.is_dirty(p)]
+            if dirty:
+                raise WtError(
+                    "uncommitted or untracked changes in:\n  "
+                    + "\n  ".join(dirty)
+                    + "\ncommit or stash them, or run `wt down --force` "
+                    "(the branch and its commits are always kept)"
+                )
 
-            projects = {names.compose_project(g.repo) for g in self.compose_groups()}
-            projects |= set(bs.compose_projects.values()) if bs else set()
-            for project in sorted(projects):
-                self.log(f"compose down [bold]{project}[/]")
-                compose.down(project)
+        if bs:
+            self._record(branch, lambda b: setattr(b, "status", "removing"))
 
-            router.remove_routes(router.route_file(names))
-            if bs and bs.route_file:
-                router.remove_routes(Path(bs.route_file))
-            tls.remove_cert(
-                [*tls.cert_paths(names), *(Path(p) for p in (bs.cert_files if bs else []))]
-            )
-            self._down_providers(branch, names, bs)
-            shutil.rmtree(self.branch_dir(names), ignore_errors=True)
+        self._stop_services(branch, names, bs)
+        tls.remove_cert([*tls.cert_paths(names), *(Path(p) for p in (bs.cert_files if bs else []))])
+        self._down_providers(branch, names, bs)
+        shutil.rmtree(self.branch_dir(names), ignore_errors=True)
 
-            for source, path in removals:
-                self.log(f"removing worktree {path}")
-                git.remove_worktree(source, path, force=force)
-            slug_dir = self.worktree_target(names, "x").parent
-            if slug_dir.is_dir() and not any(slug_dir.iterdir()):
-                slug_dir.rmdir()
+        for source, path in removals:
+            self.log(f"removing worktree {path}")
+            git.remove_worktree(source, path, force=force)
+        slug_dir = self.worktree_target(names, "x").parent
+        if slug_dir.is_dir() and not any(slug_dir.iterdir()):
+            slug_dir.rmdir()
 
-            with self.store.edit() as state:
-                state.branches.pop(branch, None)
-            return True
+        with self.store.edit() as state:
+            state.branches.pop(branch, None)
+        sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
+        sources.update({r: Path(s.source) for r, s in (bs.repos if bs else {}).items()})
+        return sources
 
     def _down_processes(self, branch: str, bs: BranchState | None) -> None:
         for name, ps in (bs.processes if bs else {}).items():
@@ -739,6 +805,7 @@ class Orchestrator:
                 total=len(containers) + len(bs.processes),
                 worktrees={r: s.path for r, s in bs.repos.items()},
                 databases=list(bs.providers.get("postgres", [])),
+                ports=sorted(bs.ports.values()),
                 docker_ok=docker_ok,
             )
             for name, svc in self.cfg.services.items():

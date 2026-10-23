@@ -58,7 +58,10 @@ wt up my-branch    # prints a SERVICE / URL / CHECK table
 wt ls              # branches, URLs, health, databases (--no-probe skips HTTP checks, --paths shows folders)
 wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
 wt tui                  # terminal UI: branches, services, up/down, logs
+wt add my-branch        # worktrees + reserved ports only, status "stopped"; nothing is started
+wt stop my-branch       # stops containers and processes; worktrees, volumes, databases, ports stay
 wt down my-branch       # --force also removes worktrees with uncommitted changes
+wt remove my-branch     # down + deletes the git branch (asks first; --yes, --force)
 ```
 
 Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
