@@ -74,6 +74,31 @@ def catalog_path(explicit: str | None, config_dir: Path | None) -> Path:
     return wt_home() / CATALOG_NAME
 
 
+@dataclass(frozen=True)
+class Row:
+    service: str
+    repo: str
+    kind: str  # compose | run
+    infra: list[str]
+    consumes: list[str]
+    consumed_by: list[str]
+
+
+def rows(cat: Catalog) -> list[Row]:
+    """One row per catalog service, sorted by name, for `wt catalog`."""
+    return [
+        Row(
+            service=name,
+            repo=svc.repo,
+            kind="compose" if svc.compose is not None else "run",
+            infra=svc.infra.configured(),
+            consumes=list(svc.consumes),
+            consumed_by=sorted(n for n, other in cat.services.items() if name in other.consumes),
+        )
+        for name, svc in sorted(cat.services.items())
+    ]
+
+
 def load_catalog(path: Path) -> LoadedCatalog:
     path = path.resolve()
     try:
