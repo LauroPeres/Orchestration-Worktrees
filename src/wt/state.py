@@ -55,6 +55,7 @@ class BranchState(BaseModel):
     processes: dict[str, ProcessState] = Field(default_factory=dict)  # service -> host process
     provider_base: dict[str, str] = Field(default_factory=dict)  # provider -> base branch at create
     index: int | None = None  # worktree index, unique across projects (see allocate_index)
+    uses: list[str] | None = None  # selected catalog services; None = the `uses:` of the yaml
 
 
 STATE_VERSION = 1
