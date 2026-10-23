@@ -99,6 +99,7 @@ class FakeDocker:
     traefik_running: bool = False
     ups: list[str] = field(default_factory=list)
     downs: list[str] = field(default_factory=list)
+    kept_downs: list[str] = field(default_factory=list)  # down without -v (stop)
     files: list[list[Path]] = field(default_factory=list)
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,6 +110,7 @@ class FakeDocker:
         monkeypatch.setattr(compose, "list_services", lambda f: ["api", "db"])
         monkeypatch.setattr(compose, "up", self.up)
         monkeypatch.setattr(compose, "down", self.downs.append)
+        monkeypatch.setattr(compose, "down_keep_volumes", self.kept_downs.append)
         monkeypatch.setattr(
             compose,
             "ps",
