@@ -29,6 +29,13 @@ class FakeOrch:
         self.ls_count = 0
         self.error: Exception | None = None
         self.gate: threading.Event | None = None
+        self.service_rows: list[RepoRow] = [
+            RepoRow("front", "healthy", 10001, "https://front.demo.localhost"),
+            RepoRow("back", "starting", 10002, None),
+            RepoRow("db", "stopped", None, None),
+        ]
+        self.service_calls: list[str] = []
+        self.services_error: Exception | None = None
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         self.ls_count += 1
@@ -58,7 +65,10 @@ class FakeOrch:
         return True
 
     def services(self, branch: str) -> list[RepoRow]:
-        return []
+        self.service_calls.append(branch)
+        if self.services_error is not None:
+            raise self.services_error
+        return self.service_rows
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
         return None
@@ -238,5 +248,91 @@ def test_cells_have_no_color_markup() -> None:
             table = app.query_one("#table", DataTable)
             for cell in table.get_row_at(0):
                 assert not cell.spans
+
+    asyncio.run(scenario())
+
+
+def services_cells(app: WtApp) -> list[list[str]]:
+    table = app.screen.query_one("#services", DataTable)
+    return [[str(c) for c in table.get_row_at(i)] for i in range(table.row_count)]
+
+
+def test_enter_opens_services_and_esc_goes_back() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.service_calls[0] == "feat-a"
+            table = app.screen.query_one("#services", DataTable)
+            assert [str(c.label) for c in table.columns.values()] == [
+                "NAME", "STATUS", "PORT", "URL",
+            ]  # fmt: skip
+            assert services_cells(app) == [
+                ["front", "healthy", "10001", "https://front.demo.localhost"],
+                ["back", "starting", "10002", "-"],
+                ["db", "stopped", "-", "-"],
+            ]
+            healthy, port = table.get_row_at(0)[1], table.get_row_at(0)[2]
+            assert healthy.style == "green" and port.style == "purple"
+            assert not table.get_row_at(1)[1].style
+            actions: Any = app.screen.query_one("#actions", Static).render()
+            assert actions.plain == "esc: back  q: quit"
+            await pilot.press("escape")
+            await settle(pilot)
+            assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
+
+    asyncio.run(scenario())
+
+
+def test_services_refresh_on_timer_and_error_on_message_line() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "enter")
+            await settle(pilot)
+            assert orch.service_calls == ["main"]
+            orch.services_error = WtError("boom")
+            await pilot.pause(2.3)
+            await settle(pilot)
+            assert len(orch.service_calls) > 1
+            assert str(app.screen.query_one("#message", Static).render()) == "boom"
+            assert len(services_cells(app)) == 3  # last rows stay
+
+    asyncio.run(scenario())
+
+
+def test_services_in_all_projects_uses_selected_project() -> None:
+    async def scenario() -> None:
+        shop, notes = FakeOrch("shop"), FakeOrch("notes", [status("main", "up")])
+        orchs = {"shop": shop, "notes": notes}
+
+        def discover() -> list[ProjectEntry]:
+            return [ProjectEntry(n, lambda o=o: o, "") for n, o in orchs.items()]  # type: ignore[misc]
+
+        app = WtApp(projects=discover)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "enter")  # notes/main, shop/feat-a, ...
+            await settle(pilot)
+            assert shop.service_calls == ["feat-a"] and notes.service_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_q_quits_from_services_screen() -> None:
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            await pilot.press("q")
+            await pilot.pause()
+        assert not app.is_running
 
     asyncio.run(scenario())
