@@ -374,7 +374,7 @@ def catalog(
         console.print(f"[green]catalog ok:[/] {escape(str(loaded.path))}")
         return
     table = Table(box=None, pad_edge=False)
-    for col in ("SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED BY"):
+    for col in ("SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED BY", "REMOTE"):
         table.add_column(col, overflow="fold", no_wrap=True)
     for row in rows(load_catalog(path).catalog):
         table.add_row(
@@ -384,6 +384,7 @@ def catalog(
             ", ".join(row.infra) or "-",
             ", ".join(row.consumes) or "-",
             ", ".join(row.consumed_by) or "-",
+            row.remote or "-",
         )
     console.print(table)
 
