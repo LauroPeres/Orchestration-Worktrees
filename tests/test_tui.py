@@ -3,50 +3,59 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
-from textual.widgets import DataTable, Label, ListItem, ListView, RichLog
+from textual.widgets import DataTable, Static
 
 from wt.errors import WtError
-from wt.orchestrator import BranchStatus, ServiceReport
-from wt.tui import ProjectEntry, WtApp
+from wt.orchestrator import BranchStatus
+from wt.tui import CONFIRM_REMOVE, ProjectEntry, WtApp
+
+
+def status(branch: str, state: str, ports: list[int] | None = None) -> BranchStatus:
+    row = BranchStatus(branch, state, 0, 0)
+    if ports is not None:
+        row.ports = ports  # type: ignore[attr-defined]
+    return row
 
 
 class FakeOrch:
-    def __init__(self, rows: list[BranchStatus] | None = None) -> None:
-        self.cfg: Any = SimpleNamespace(project="demo")
-        self.rows = rows or []
-        self.calls = 0
-        self.error: str | None = None
+    def __init__(self, project: str = "demo", rows: list[BranchStatus] | None = None) -> None:
+        self.cfg: Any = SimpleNamespace(project=project)
+        self.rows = (
+            rows
+            if rows is not None
+            else [status("feat-a", "up", [8001, 8002]), status("main", "stopped")]
+        )
+        self.calls: list[tuple[Any, ...]] = []
+        self.ls_count = 0
+        self.error: Exception | None = None
+        self.gate: threading.Event | None = None
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
-        self.calls += 1
-        if self.error:
-            raise WtError(self.error)
+        self.ls_count += 1
         return self.rows
 
+    def _act(self, *call: Any) -> None:
+        self.calls.append(call)
+        if self.gate is not None:
+            self.gate.wait(5)
+        if self.error is not None:
+            raise self.error
+
     def up(self, branch: str) -> object:
+        self._act("up", branch)
         return []
 
-    def down(self, branch: str, *, force: bool = False) -> bool:
+    def stop(self, branch: str) -> object:
+        self._act("stop", branch)
         return True
 
-    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
-        return ["true"]
+    def add(self, branch: str) -> object:
+        self._act("add", branch)
+        return True
 
-
-def rows() -> list[BranchStatus]:
-    return [
-        BranchStatus(
-            "feat-a",
-            "up",
-            2,
-            2,
-            [
-                ServiceReport("web", "ok", "200", "https://a.demo.localhost", "run"),
-                ServiceReport("api", "fail", "502", None, "compose"),
-            ],
-        ),
-        BranchStatus("main", "down", 0, 0, [ServiceReport("web", "skipped", "", None, "run")]),
-    ]
+    def remove(self, branch: str, *, force: bool = False) -> object:
+        self._act("remove", branch, force)
+        return True
 
 
 async def settle(pilot: Any) -> None:
@@ -55,91 +64,124 @@ async def settle(pilot: Any) -> None:
     await pilot.pause()
 
 
-def table_cells(app: WtApp) -> list[list[str]]:
-    table = app.query_one("#services", DataTable)
-    return [[str(c) for c in table.get_row_at(i)[:3]] for i in range(table.row_count)]
+def cells(app: WtApp) -> list[list[str]]:
+    table = app.query_one("#table", DataTable)
+    return [[str(c) for c in table.get_row_at(i)] for i in range(table.row_count)]
 
 
-def test_lists_branches_and_services_of_selection() -> None:
+def message(app: WtApp) -> str:
+    return str(app.query_one("#message", Static).render())
+
+
+def test_rows_and_columns() -> None:
     async def scenario() -> None:
-        app = WtApp(FakeOrch(rows()))
+        app = WtApp(FakeOrch())
         async with app.run_test() as pilot:
             await settle(pilot)
-            assert len(app.query_one("#branches", ListView)) == 2
-            assert app.selected_branch == "feat-a"
-            assert table_cells(app) == [
-                ["web", "run", "https://a.demo.localhost"],
-                ["api", "compose", "-"],
-            ]
-            await pilot.press("down")
-            await settle(pilot)
-            assert app.selected_branch == "main"
-            assert table_cells(app) == [["web", "run", "-"]]
+            table = app.query_one("#table", DataTable)
+            assert [str(c.label) for c in table.columns.values()] == ["NAME", "STATUS", "PORT"]
+            assert cells(app) == [["feat-a", "up", "8001, 8002"], ["main", "stopped", "-"]]
+            assert "u up  d down  a add  r remove  q quit" in str(
+                app.query_one("#actions", Static).render()
+            )
 
     asyncio.run(scenario())
 
 
-def test_r_refreshes_and_keeps_selection() -> None:
-    async def scenario() -> None:
-        orch = FakeOrch(rows())
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("down")
-            before = orch.calls
-            await pilot.press("r")
-            await settle(pilot)
-            assert orch.calls > before
-            assert app.selected_branch == "main"
-
-    asyncio.run(scenario())
-
-
-def test_new_branch_appears_on_refresh() -> None:
-    async def scenario() -> None:
-        orch = FakeOrch(rows()[:1])
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            orch.rows = rows()
-            await pilot.press("r")
-            await settle(pilot)
-            assert len(app.query_one("#branches", ListView)) == 2
-
-    asyncio.run(scenario())
-
-
-def test_error_goes_to_log_and_app_stays_open() -> None:
+def test_u_and_d_call_up_and_stop_of_selected() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
-        orch.error = "boom"
         app = WtApp(orch)
         async with app.run_test() as pilot:
             await settle(pilot)
-            log = app.query_one("#log", RichLog)
-            assert any("boom" in line.text for line in log.lines)
+            await pilot.press("u")
+            await settle(pilot)
+            await pilot.press("down", "d")
+            await settle(pilot)
+            assert orch.calls == [("up", "feat-a"), ("stop", "main")]
+            assert message(app) == "down main: done"
 
     asyncio.run(scenario())
 
 
-def test_auto_refresh_calls_ls_again(monkeypatch: Any) -> None:
-    monkeypatch.setattr("wt.tui.REFRESH_SECONDS", 0.05)
-
+def test_a_asks_for_name_and_cancel_does_nothing() -> None:
     async def scenario() -> None:
-        orch = FakeOrch(rows())
+        orch = FakeOrch()
         app = WtApp(orch)
         async with app.run_test() as pilot:
             await settle(pilot)
-            await asyncio.sleep(0.3)
+            await pilot.press("a", "escape")
             await settle(pilot)
-            assert orch.calls >= 2
+            assert orch.calls == []
+            await pilot.press("a", *"new-x", "enter")
+            await settle(pilot)
+            assert orch.calls == [("add", "new-x")]
+
+    asyncio.run(scenario())
+
+
+def test_r_confirms_then_removes_with_force() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("r")
+            await pilot.pause()
+            assert CONFIRM_REMOVE.format(branch="feat-a").startswith("remove feat-a: deletes")
+            await pilot.press("n")
+            await settle(pilot)
+            await pilot.press("r", "enter")  # Enter is "no" (default N)
+            await settle(pilot)
+            assert orch.calls == []
+            await pilot.press("r", "y")
+            await settle(pilot)
+            assert orch.calls == [("remove", "feat-a", True)]
+
+    asyncio.run(scenario())
+
+
+def test_busy_note_and_error_message() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.gate = threading.Event()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("u")
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            assert "busy" in message(app)
+            assert orch.calls == [("up", "feat-a")]
+            orch.error = WtError("boom")
+            orch.gate.set()
+            await settle(pilot)
+            assert message(app) == "boom"
+            assert app.is_running
+
+    asyncio.run(scenario())
+
+
+def test_refresh_after_action_and_on_timer() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            before = orch.ls_count
+            orch.rows = [status("feat-a", "up", [8001])]
+            await pilot.press("u")
+            await settle(pilot)
+            assert orch.ls_count > before
+            assert cells(app) == [["feat-a", "up", "8001"]]
 
     asyncio.run(scenario())
 
 
 def test_q_quits() -> None:
     async def scenario() -> None:
-        app = WtApp(FakeOrch(rows()))
+        app = WtApp(FakeOrch())
         async with app.run_test() as pilot:
             await settle(pilot)
             await pilot.press("q")
@@ -149,413 +191,39 @@ def test_q_quits() -> None:
     asyncio.run(scenario())
 
 
-class ActionOrch(FakeOrch):
-    def __init__(self) -> None:
-        super().__init__(rows())
-        self.actions: list[tuple[str, str, bool]] = []
-        self.down_errors: list[str] = []
-        self.gate: threading.Event | None = None
-        self.emit: Any = None
-
-    def up(self, branch: str) -> list[ServiceReport]:
-        if self.gate:
-            self.gate.wait(5)
-        if self.emit:
-            self.emit()
-        self.actions.append(("up", branch, False))
-        return []
-
-    def down(self, branch: str, *, force: bool = False) -> bool:
-        self.actions.append(("down", branch, force))
-        if self.down_errors and not force:
-            raise WtError(self.down_errors[0])
-        return True
-
-
-def log_text(app: WtApp) -> str:
-    return "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
-
-
-def test_u_ups_selected_branch() -> None:
+def test_all_projects_names_and_add_uses_selected_project() -> None:
     async def scenario() -> None:
-        orch = ActionOrch()
-        app = WtApp(orch)
+        shop, notes = FakeOrch("shop"), FakeOrch("notes", [status("main", "up", [9000])])
+        orchs = {"shop": shop, "notes": notes}
+
+        def discover() -> list[ProjectEntry]:
+            entries = [ProjectEntry(n, lambda o=o: o, "") for n, o in orchs.items()]  # type: ignore[misc]
+            return [*entries, ProjectEntry("gone", None, "config not found")]
+
+        app = WtApp(projects=discover)
         async with app.run_test() as pilot:
             await settle(pilot)
-            await pilot.press("down", "u")
-            await settle(pilot)
-            assert orch.actions == [("up", "main", False)]
-            assert "done" in log_text(app)
-
-    asyncio.run(scenario())
-
-
-def test_n_asks_for_name_and_cancel_does_nothing() -> None:
-    async def scenario() -> None:
-        orch = ActionOrch()
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("n", "escape")
-            await settle(pilot)
-            assert orch.actions == []
-            await pilot.press("n", *"feat-x", "enter")
-            await settle(pilot)
-            assert orch.actions == [("up", "feat-x", False)]
-
-    asyncio.run(scenario())
-
-
-def test_d_confirms_and_cancel_does_nothing() -> None:
-    async def scenario() -> None:
-        orch = ActionOrch()
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("d", "n")
-            await settle(pilot)
-            assert orch.actions == []
-            await pilot.press("d", "y")
-            await settle(pilot)
-            assert orch.actions == [("down", "feat-a", False)]
-
-    asyncio.run(scenario())
-
-
-def test_force_only_after_second_confirm() -> None:
-    async def scenario() -> None:
-        orch = ActionOrch()
-        orch.down_errors = ["uncommitted changes in repo api"]
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("d", "y")
-            await settle(pilot)
-            assert orch.actions == [("down", "feat-a", False)]
-            assert "uncommitted changes" in log_text(app)
-            await pilot.press("n")  # decline force
-            await settle(pilot)
-            assert orch.actions == [("down", "feat-a", False)]
-            await pilot.press("d", "y")
-            await settle(pilot)
-            await pilot.press("y")  # accept force
-            await settle(pilot)
-            assert orch.actions[-1] == ("down", "feat-a", True)
-
-    asyncio.run(scenario())
-
-
-def test_keys_ignored_while_busy_and_log_streams() -> None:
-    async def scenario() -> None:
-        orch = ActionOrch()
-        orch.gate = threading.Event()
-        app = WtApp(orch)
-
-        def emit() -> None:
-            app.log_threadsafe("[bold]hello[/]")
-            app.out_threadsafe("[x] raw")
-
-        orch.emit = emit
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("u")
-            await pilot.pause()
-            await pilot.press("u")
-            await pilot.pause()
-            assert "busy" in log_text(app)
-            orch.gate.set()
-            await settle(pilot)
-            assert orch.actions == [("up", "feat-a", False)]
-            text = log_text(app)
-            assert "hello" in text
-            assert "[x] raw" in text
-
-    asyncio.run(scenario())
-
-
-def test_unexpected_error_shown_and_app_stays_open() -> None:
-    async def scenario() -> None:
-        orch = ActionOrch()
-
-        def boom() -> None:
-            raise RuntimeError("kaput")
-
-        orch.emit = boom
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("u")
-            await settle(pilot)
-            assert "kaput" in log_text(app)
-            assert app.is_running
-
-    asyncio.run(scenario())
-
-
-class TailOrch(ActionOrch):
-    def __init__(self, command: list[str]) -> None:
-        super().__init__()
-        self.command = command
-        self.requests: list[tuple[str, str, bool]] = []
-
-    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
-        self.requests.append((branch, service, follow))
-        if self.command == ["error"]:
-            raise WtError("no log yet for web on feat-a")
-        return self.command
-
-
-async def wait_for(pilot: Any, predicate: Any) -> None:
-    for _ in range(100):
-        await pilot.pause()
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError("condition not reached")
-
-
-def test_l_tails_selected_service_into_log() -> None:
-    async def scenario() -> None:
-        orch = TailOrch(["sh", "-c", "echo one; echo two"])
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("l")
-            await wait_for(pilot, lambda: "two" in log_text(app))
-            assert "one" in log_text(app)
-            assert orch.requests == [("feat-a", "web", True)]
-            await pilot.press("tab", "down", "l")  # focus table, second service
-            await wait_for(pilot, lambda: orch.requests[-1] == ("feat-a", "api", True))
-
-    asyncio.run(scenario())
-
-
-def test_l_error_goes_to_log() -> None:
-    async def scenario() -> None:
-        app = WtApp(TailOrch(["error"]))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("l")
-            await wait_for(pilot, lambda: "no log yet" in log_text(app))
-
-    asyncio.run(scenario())
-
-
-def test_l_again_and_selection_change_kill_previous_tail() -> None:
-    async def scenario() -> None:
-        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("l")
-            await wait_for(pilot, lambda: "started" in log_text(app))
-            first = app._tail_proc
-            assert first is not None and first.poll() is None
-            await pilot.press("l")
-            await wait_for(pilot, lambda: first.poll() is not None)
-            await wait_for(pilot, lambda: app._tail_proc not in (None, first))
-            second = app._tail_proc
-            assert second is not None and second.poll() is None
-            await pilot.press("down")  # another branch
-            await wait_for(pilot, lambda: second.poll() is not None)
-            assert app._tail_proc is None
-
-    asyncio.run(scenario())
-
-
-def test_service_change_kills_tail_but_refresh_does_not() -> None:
-    async def scenario() -> None:
-        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("tab", "down", "l")
-            await wait_for(pilot, lambda: app._tail_proc is not None)
-            proc = app._tail_proc
-            assert proc is not None
-            await pilot.press("r")
-            await pilot.pause()
-            await wait_for(pilot, lambda: not app._loading)
-            assert app.selected_service == "api"
-            assert proc.poll() is None
-            await pilot.press("up")
-            await wait_for(pilot, lambda: proc.poll() is not None)
-
-    asyncio.run(scenario())
-
-
-def test_quit_kills_tail() -> None:
-    async def scenario() -> None:
-        app = WtApp(TailOrch(["sh", "-c", "echo started; sleep 30"]))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("l")
-            await wait_for(pilot, lambda: app._tail_proc is not None)
-            proc = app._tail_proc
-            assert proc is not None
-            await pilot.press("q")
-            await pilot.pause()
-        assert proc.wait(5) is not None
-
-    asyncio.run(scenario())
-
-
-# -- all projects (outside a project) ------------------------------------------------
-
-
-def make_projects(orchs: dict[str, ActionOrch | None], built: list[str] | None = None) -> Any:
-    def factory(name: str, orch: ActionOrch) -> Any:
-        def build() -> ActionOrch:
-            if built is not None:
-                built.append(name)
-            return orch
-
-        return build
-
-    def discover() -> list[ProjectEntry]:
-        return [
-            ProjectEntry(name, factory(name, o) if o else None, "" if o else "config not found")
-            for name, o in orchs.items()
-        ]
-
-    return discover
-
-
-def labels(app: WtApp) -> list[str]:
-    return [
-        str(item.query_one(Label).render())
-        for item in app.query_one("#branches", ListView).query(ListItem)
-    ]
-
-
-def test_multi_shows_project_tree_and_services() -> None:
-    async def scenario() -> None:
-        built: list[str] = []
-        app = WtApp(projects=make_projects({"shop": ActionOrch(), "notes": ActionOrch()}, built))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            text = labels(app)
-            assert [t.strip().split()[0] for t in text] == [
-                "notes", "feat-a", "main", "shop", "feat-a", "main",
+            assert [c[0] for c in cells(app)] == [
+                "gone", "notes/main", "shop/feat-a", "shop/main",
             ]  # fmt: skip
-            assert app.selected_branch is None  # a project header
-            await pilot.press("down")
-            assert app.selected_project == "notes"
-            assert app.selected_branch == "feat-a"
-            assert table_cells(app)[0][0] == "web"
-            assert sorted(built) == ["notes", "shop"]
+            await pilot.press("down", "down", "a", *"zz", "enter")
+            await settle(pilot)
+            assert shop.calls == [("add", "zz")]
+            await pilot.press("up", "up", "u")  # stale project row: no call
+            await settle(pilot)
+            assert "config not found" in message(app)
 
     asyncio.run(scenario())
 
 
-def test_multi_actions_use_selected_projects_orch() -> None:
+def test_cells_have_no_color_markup() -> None:
     async def scenario() -> None:
-        shop, notes = ActionOrch(), ActionOrch()
-        app = WtApp(projects=make_projects({"shop": shop, "notes": notes}))
+        app = WtApp(FakeOrch(rows=[status("[red]x[/]", "up")]))
         async with app.run_test() as pilot:
             await settle(pilot)
-            await pilot.press("down", "down", "down", "down", "u")  # shop / feat-a...
-            await settle(pilot)
-            assert app.selected_project == "shop"
-            assert shop.actions == [("up", "feat-a", False)]
-            assert notes.actions == []
-            await pilot.press("n", *"feat-x", "enter")
-            await settle(pilot)
-            assert shop.actions[-1] == ("up", "feat-x", False)
-            await pilot.press("d", "y")
-            await settle(pilot)
-            assert shop.actions[-1] == ("down", "feat-a", False)
-
-    asyncio.run(scenario())
-
-
-def test_multi_stale_project_is_greyed_without_actions() -> None:
-    async def scenario() -> None:
-        built: list[str] = []
-        live = ActionOrch()
-        app = WtApp(projects=make_projects({"gone": None, "live": live}, built))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            text = labels(app)
-            assert text[0].startswith("gone") and "config not found" in text[0]
-            assert len(text) == 4  # stale project shows no branches
-            assert built == ["live"]
-            await pilot.press("u", "d", "n")
-            await settle(pilot)
-            assert live.actions == []
-            assert "config not found" in log_text(app)
-
-    asyncio.run(scenario())
-
-
-def test_multi_project_error_shown_on_header_not_fatal() -> None:
-    async def scenario() -> None:
-        bad, good = ActionOrch(), ActionOrch()
-        bad.error = "boom"
-        app = WtApp(projects=make_projects({"bad": bad, "good": good}))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            text = labels(app)
-            assert text[0].startswith("bad") and "boom" in text[0]
-            assert text[1].startswith("good")
-            assert app.is_running
-
-    asyncio.run(scenario())
-
-
-def test_multi_selection_survives_refresh_and_no_projects_message() -> None:
-    async def scenario() -> None:
-        app = WtApp(projects=make_projects({"a": ActionOrch(), "b": ActionOrch()}))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("down", "down", "down", "down")
-            before = (app.selected_project, app.selected_branch)
-            await pilot.press("r")
-            await settle(pilot)
-            assert (app.selected_project, app.selected_branch) == before
-        empty = WtApp(projects=make_projects({}))
-        async with empty.run_test() as pilot:
-            await settle(pilot)
-            assert "no projects" in log_text(empty).lower()
-
-    asyncio.run(scenario())
-
-
-def test_status_dots_and_colors_render_for_each_status() -> None:
-    from wt.tui import DOT
-
-    statuses = {
-        "up": "#4ade80",
-        "degraded": "#facc15",
-        "failed": "#f87171",
-        "creating": "dim",
-        "down": "dim",
-    }
-    data = [BranchStatus(f"b-{s}", s, 0, 0) for s in statuses]
-
-    async def scenario() -> None:
-        app = WtApp(FakeOrch(data))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            items = list(app.query_one("#branches", ListView).query(ListItem))
-            assert len(items) == len(statuses)
-            for item in items:
-                content: Any = item.query_one(Label).render()
-                status = str(content).split()[-1]
-                assert str(content).endswith(f"{DOT} {status}")
-                assert [str(sp.style) for sp in content.spans] == [statuses[status]]
-            title = str(app.query_one("#titlebar").render())
-            assert "worktree" in title and "demo" in title and "1 branches up" in title
-            assert app.query_one("#services").border_title == "services · b-creating"
-
-    asyncio.run(scenario())
-
-
-def test_health_column_shows_colored_dots() -> None:
-    async def scenario() -> None:
-        app = WtApp(FakeOrch(rows()))
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            table = app.query_one("#services", DataTable)
-            cells = [table.get_row_at(i)[3] for i in range(table.row_count)]
-            assert "● ok" in str(cells[0]) and "● fail" in str(cells[1])
+            assert cells(app) == [["[red]x[/]", "up", "-"]]
+            table = app.query_one("#table", DataTable)
+            for cell in table.get_row_at(0):
+                assert not cell.spans
 
     asyncio.run(scenario())

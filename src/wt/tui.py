@@ -1,38 +1,32 @@
-"""Terminal UI: branches, services of the selected branch and a log pane (SPEC §15)."""
+"""Terminal UI: one monochrome table, one row per worktree (SPEC §16)."""
 
-import contextlib
-import os
-import signal
-import subprocess
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
 
-from rich.markup import escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Input, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import DataTable, Input, Label, Static
 
 from wt.config import Config
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus
 
 REFRESH_SECONDS = 2.0
-TAIL_LINES = 200
-DOT = "\u25cf"
-STATUS_COLORS = {"up": "#4ade80", "degraded": "#facc15", "failed": "#f87171"}
-HEALTH_COLORS = {"ok": "#4ade80", "fail": "#f87171", "skipped": "dim"}
-HEALTH = {k: f"[{c}]{DOT} {k}[/]" for k, c in HEALTH_COLORS.items()}
+ACTIONS = "u up  d down  a add  r remove  q quit"
+CONFIRM_REMOVE = (
+    "remove {branch}: deletes its containers, volumes, databases, worktrees and the git "
+    "branch; unpushed commits are lost. Remove? y/N"
+)
 
 
 class OrchestratorLike(Protocol):
-    """The part of `Orchestrator` the TUI reads."""
+    """The part of `Orchestrator` the TUI uses."""
 
     cfg: Config
 
@@ -40,9 +34,11 @@ class OrchestratorLike(Protocol):
 
     def up(self, branch: str) -> object: ...
 
-    def down(self, branch: str, *, force: bool = False) -> bool: ...
+    def stop(self, branch: str) -> object: ...
 
-    def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]: ...
+    def add(self, branch: str) -> object: ...
+
+    def remove(self, branch: str, *, force: bool = False) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -56,7 +52,7 @@ class ProjectEntry:
 
 @dataclass(frozen=True)
 class Row:
-    """A line of the left pane: a project header (`status` None) or one of its branches."""
+    """A table line: one worktree, or a project that has no usable data (`status` None)."""
 
     project: str
     status: BranchStatus | None = None
@@ -64,40 +60,25 @@ class Row:
     stale: bool = False
 
     @property
-    def key(self) -> tuple[str, str | None]:
-        return (self.project, self.status.branch if self.status else None)
+    def key(self) -> str:
+        return f"{self.project}\0{self.status.branch if self.status else ''}"
 
 
-def row_label(row: Row, *, tree: bool) -> str:
-    if row.status is not None:
-        return ("  " if tree else "") + branch_label(row.status)
-    name = escape(row.project)
-    if row.stale:
-        return f"[dim]{name}  {escape(row.note)}[/]"
-    return f"[bold]{name}[/]" + (f"  [red]{escape(row.note)}[/]" if row.note else "")
-
-
-def _kill_group(tail: subprocess.Popen[str]) -> None:
-    """Kill the tail process and the children it started."""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(tail.pid, signal.SIGKILL)
-
-
-def branch_label(row: BranchStatus) -> str:
-    color = STATUS_COLORS.get(row.status, "dim")
-    return f"{escape(row.branch):<20}[{color}]{DOT} {escape(row.status)}[/]"
+def _ports(status: BranchStatus) -> str:
+    ports = getattr(status, "ports", [])
+    return ", ".join(str(p) for p in ports) or "-"
 
 
 class ConfirmScreen(ModalScreen[bool]):
-    """Yes/no question; dismisses with True on `y`/Enter, False on `n`/Escape."""
+    """Yes/no question; dismisses with True on `y`, False on `n`/`Enter`/`Escape`."""
 
     CSS = """
-    ConfirmScreen { align: center middle; }
-    #dialog { width: 60; height: auto; border: thick $primary; padding: 1 2; background: $surface; }
+    ConfirmScreen { align: center bottom; background: transparent; }
+    #dialog { width: 100%; height: auto; border: solid; padding: 0 1; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("y,enter", "answer(True)", "Yes"),
-        Binding("n,escape", "answer(False)", "No"),
+        Binding("y", "answer(True)", "Yes"),
+        Binding("n,enter,escape", "answer(False)", "No"),
     ]
 
     def __init__(self, question: str) -> None:
@@ -107,7 +88,6 @@ class ConfirmScreen(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text(self.question))
-            yield Label("[dim]y/Enter = yes, n/Esc = no[/]")
 
     def action_answer(self, value: bool) -> None:
         self.dismiss(value)
@@ -117,8 +97,8 @@ class InputScreen(ModalScreen[str | None]):
     """Single-line prompt; dismisses with the text, or None on Escape."""
 
     CSS = """
-    InputScreen { align: center middle; }
-    #dialog { width: 60; height: auto; border: thick $primary; padding: 1 2; background: $surface; }
+    InputScreen { align: center bottom; background: transparent; }
+    #dialog { width: 100%; height: auto; border: solid; padding: 0 1; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
 
@@ -140,30 +120,22 @@ class InputScreen(ModalScreen[str | None]):
 
 
 class WtApp(App[None]):
-    """`wt ls` view, up/down actions and a service log tail (SPEC §15)."""
+    """Table of worktrees with up/down/add/remove actions (SPEC §16)."""
 
     TITLE = "wt"
     CSS = """
-    #titlebar { height: 1; padding: 0 1; background: $boost; }
-    #main { height: 1fr; }
-    #branches, #services, #log { border: round $accent; border-title-color: $accent; }
-    #branches:focus, #services:focus, #log:focus { border: round $success; }
-    #branches { width: 36; }
-    #services { width: 1fr; }
-    #log { height: 10; }
-    ListView > ListItem.-highlight { background: $primary 50%; text-style: bold; }
-    ListView:focus > ListItem.-highlight { background: $primary 70%; }
-    DataTable > .datatable--cursor { background: $primary 50%; text-style: bold; }
-    DataTable > .datatable--header { text-style: bold; color: $accent; }
-    Footer { background: $boost; }
+    Screen { background: transparent; }
+    #table { height: 1fr; background: transparent; }
+    DataTable > .datatable--header { text-style: bold; background: transparent; }
+    DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
+    #actions, #message { height: 1; background: transparent; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("u", "up_selected", "Up"),
-        Binding("n", "up_new", "New"),
-        Binding("d", "down_selected", "Down"),
-        Binding("l", "tail_log", "Logs"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("q", "quit", "Quit"),
+        Binding("u", "up_selected", "Up", show=False),
+        Binding("d", "down_selected", "Down", show=False),
+        Binding("a", "add_new", "Add", show=False),
+        Binding("r", "remove_selected", "Remove", show=False),
+        Binding("q", "quit", "Quit", show=False),
     ]
 
     def __init__(
@@ -172,7 +144,7 @@ class WtApp(App[None]):
         *,
         projects: Callable[[], list[ProjectEntry]] | None = None,
     ) -> None:
-        """One project (`orch`), or a project tree from `projects` (called on every refresh)."""
+        """One project (`orch`), or all projects from `projects` (called on every refresh)."""
         super().__init__()
         if (orch is None) == (projects is None):
             raise ValueError("pass either orch or projects")
@@ -180,72 +152,40 @@ class WtApp(App[None]):
         self._discover = projects
         self._entries: dict[str, ProjectEntry] = {}
         self.rows: list[Row] = []
-        self._said_empty = False
         self._loading = False
         self._busy = False
-        self._tail_lock = threading.Lock()
-        self._tail_gen = 0
-        self._tail_proc: subprocess.Popen[str] | None = None
-        self._tail_target: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
-        yield Static(id="titlebar")
-        with Horizontal(id="main"):
-            yield ListView(id="branches")
-            yield DataTable(id="services", cursor_type="row")
-        yield RichLog(id="log", markup=True, wrap=True)
-        yield Footer()
+        yield DataTable(id="table", cursor_type="row")
+        yield Static(Text(ACTIONS), id="actions")
+        yield Static("", id="message")
 
     def on_mount(self) -> None:
-        self.sub_title = self.orch.cfg.project if self.orch else "all projects"
-        self._update_titles()
-        branches = self.query_one("#branches", ListView)
-        branches.border_title = "branches" if self.orch else "projects"
-        branches.focus()
-        table = self.query_one("#services", DataTable)
-        table.border_title = "services"
-        table.add_columns("SERVICE", "KIND", "URL", "HEALTH")
-        log = self.query_one("#log", RichLog)
-        log.border_title = "log"
-        log.write("[dim]No log yet.[/]")
+        self.query_one("#table", DataTable).add_columns("NAME", "STATUS", "PORT")
+        self.query_one("#table", DataTable).focus()
         self.set_interval(REFRESH_SECONDS, self.action_refresh)
         self.action_refresh()
 
-    def _update_titles(self) -> None:
-        """Colored title line and the services panel title (`services · <branch>`)."""
-        project = self.orch.cfg.project if self.orch else "all projects"
-        up = sum(1 for r in self.rows if r.status is not None and r.status.status == "up")
-        line = Text.assemble(
-            ("worktree", "bold magenta"),
-            (" \u00b7 ", "dim"),
-            (project, "bold cyan"),
-            (" \u00b7 ", "dim"),
-            (f"{up} branches up", "#4ade80" if up else "dim"),
-        )
-        self.query_one("#titlebar", Static).update(line)
-        branch = self.selected_branch
-        self.query_one("#services", DataTable).border_title = (
-            f"services \u00b7 {escape(branch)}" if branch else "services"
-        )
-
-    # -- helpers for later actions ------------------------------------------------
+    # -- helpers --------------------------------------------------------------------
 
     @property
     def selected_row(self) -> Row | None:
-        index = self.query_one("#branches", ListView).index
-        if index is None or index >= len(self.rows):
+        table = self.query_one("#table", DataTable)
+        if table.row_count == 0 or table.cursor_row >= len(self.rows):
             return None
-        return self.rows[index]
+        return self.rows[table.cursor_row]
 
-    @property
-    def selected_branch(self) -> str | None:
-        row = self.selected_row
-        return row.status.branch if row and row.status else None
+    def say(self, text: str) -> None:
+        """Show `text` (plain, no markup) on the message line."""
+        self.query_one("#message", Static).update(Text(text))
 
-    @property
-    def selected_project(self) -> str | None:
-        row = self.selected_row
-        return row.project if row else None
+    def log_threadsafe(self, message: str) -> None:
+        """For `Orchestrator.log` (markup): callable from a worker thread."""
+        self.call_from_thread(self.say, Text.from_markup(message).plain)
+
+    def out_threadsafe(self, line: str) -> None:
+        """For `Orchestrator.out` (plain lines): callable from a worker thread."""
+        self.call_from_thread(self.say, line)
 
     def _orch_for(self, project: str) -> OrchestratorLike:
         """The project's orchestrator (built lazily in the all-projects view); may raise."""
@@ -256,186 +196,90 @@ class WtApp(App[None]):
             raise WtError(f"{project}: {entry.note if entry else 'unknown project'}")
         return entry.orch()
 
-    def _target(self) -> str | None:
-        """The project an action applies to, or None (with a message) when it has none."""
-        row = self.selected_row
-        if row is None:
-            self.write_log("[yellow]nothing selected[/]")
-            return None
-        if row.stale:
-            self.write_log(f"[yellow]{escape(row.project)}: {escape(row.note)}[/]")
-            return None
-        return row.project
-
-    def write_log(self, text: str) -> None:
-        self.query_one("#log", RichLog).write(text)
-
-    def log_threadsafe(self, message: str) -> None:
-        """For `Orchestrator.log` (markup): callable from a worker thread."""
-        self.call_from_thread(self.write_log, message)
-
-    def out_threadsafe(self, line: str) -> None:
-        """For `Orchestrator.out` (plain compose/Traefik lines): callable from a worker thread."""
-        self.call_from_thread(self._write_plain, line)
-
-    def _write_plain(self, line: str) -> None:
-        self.query_one("#log", RichLog).write(Text(line))
-
-    # -- actions --------------------------------------------------------------------
-
     def _guard(self) -> bool:
-        """True when an action may start; otherwise tell the user and return False."""
         if self._busy:
-            self.write_log("[yellow]busy: wait for the running action to finish[/]")
+            self.say("busy: wait for the running action to finish")
             return False
         return True
 
-    def action_up_selected(self) -> None:
-        branch, project = self.selected_branch, self._target()
-        if branch is not None and project is not None and self._guard():
-            self._start(f"up {branch}", lambda: self._orch_for(project).up(branch))
+    def _selected_worktree(self) -> Row | None:
+        """The selected row when an action on its branch is possible; else say why."""
+        row = self.selected_row
+        if row is None:
+            self.say("nothing selected")
+        elif row.status is None:
+            self.say(f"{row.project}: {row.note}")
+        else:
+            return row
+        return None
 
-    def action_up_new(self) -> None:
-        if not self._guard() or (project := self._target()) is None:
+    # -- actions --------------------------------------------------------------------
+
+    def action_up_selected(self) -> None:
+        row = self._selected_worktree()
+        if row is not None and row.status is not None and self._guard():
+            branch = row.status.branch
+            self._start(f"up {branch}", lambda: self._orch_for(row.project).up(branch))
+
+    def action_down_selected(self) -> None:
+        row = self._selected_worktree()
+        if row is not None and row.status is not None and self._guard():
+            branch = row.status.branch
+            self._start(f"down {branch}", lambda: self._orch_for(row.project).stop(branch))
+
+    def action_add_new(self) -> None:
+        row = self.selected_row
+        if row is None:
+            self.say("nothing selected")
             return
+        if row.stale:
+            self.say(f"{row.project}: {row.note}")
+            return
+        if not self._guard():
+            return
+        project = row.project
 
         def got(name: str | None) -> None:
             if name and self._guard():
-                self._start(f"up {name}", lambda: self._orch_for(project).up(name))
+                self._start(f"add {name}", lambda: self._orch_for(project).add(name))
 
-        self.push_screen(InputScreen("New branch name"), got)
+        self.push_screen(InputScreen("New worktree name"), got)
 
-    def action_down_selected(self) -> None:
-        branch, project = self.selected_branch, self._target()
-        if branch is None or project is None or not self._guard():
+    def action_remove_selected(self) -> None:
+        row = self._selected_worktree()
+        if row is None or row.status is None or not self._guard():
             return
+        branch = row.status.branch
 
         def confirmed(yes: bool | None) -> None:
             if yes and self._guard():
                 self._start(
-                    f"down {branch}",
-                    lambda: self._orch_for(project).down(branch),
-                    on_error=lambda: self._offer_force(project, branch),
+                    f"remove {branch}",
+                    lambda: self._orch_for(row.project).remove(branch, force=True),
                 )
 
-        self.push_screen(ConfirmScreen(f"Bring down {branch}?"), confirmed)
+        self.push_screen(ConfirmScreen(CONFIRM_REMOVE.format(branch=branch)), confirmed)
 
-    def _offer_force(self, project: str, branch: str) -> None:
-        def confirmed(yes: bool | None) -> None:
-            if yes and self._guard():
-                self._start(
-                    f"down --force {branch}",
-                    lambda: self._orch_for(project).down(branch, force=True),
-                )
-
-        self.push_screen(ConfirmScreen(f"down {branch} failed. Retry with --force?"), confirmed)
-
-    def _start(
-        self, label: str, call: Callable[[], object], on_error: Callable[[], None] | None = None
-    ) -> None:
+    def _start(self, label: str, call: Callable[[], object]) -> None:
         self._busy = True
-        self.write_log(f"[bold]{escape(label)}[/]")
-        self._run_action(label, call, on_error)
+        self.say(label)
+        self._run_action(label, call)
 
     @work(thread=True, group="action", exit_on_error=False)
-    def _run_action(
-        self, label: str, call: Callable[[], object], on_error: Callable[[], None] | None
-    ) -> None:
+    def _run_action(self, label: str, call: Callable[[], object]) -> None:
         try:
             call()
         except WtError as exc:
-            self.call_from_thread(self._action_done, f"[red]{escape(str(exc))}[/]", on_error)
+            self.call_from_thread(self._action_done, str(exc))
         except Exception as exc:  # keep the app open whatever the orchestrator raises
-            message = f"[red]{escape(type(exc).__name__)}: {escape(str(exc))}[/]"
-            self.call_from_thread(self._action_done, message, on_error)
+            self.call_from_thread(self._action_done, f"{type(exc).__name__}: {exc}")
         else:
-            self.call_from_thread(self._action_done, f"[green]{escape(label)}: done[/]", None)
+            self.call_from_thread(self._action_done, f"{label}: done")
 
-    def _action_done(self, message: str, on_error: Callable[[], None] | None) -> None:
+    def _action_done(self, message: str) -> None:
         self._busy = False
-        self.write_log(message)
+        self.say(message)
         self.action_refresh()
-        if on_error is not None:
-            on_error()
-
-    # -- log tail -------------------------------------------------------------------
-
-    @property
-    def selected_service(self) -> str | None:
-        table = self.query_one("#services", DataTable)
-        if table.row_count == 0:
-            return None
-        return str(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
-
-    def action_tail_log(self) -> None:
-        branch, service = self.selected_branch, self.selected_service
-        project = self.selected_project
-        if branch is None or service is None or project is None:
-            self.write_log("[yellow]select a service first[/]")
-            return
-        self._stop_tail()
-        with self._tail_lock:
-            self._tail_target = (branch, service)
-            gen = self._tail_gen
-        self.write_log(f"[bold]logs {escape(branch)} / {escape(service)}[/]")
-        self._run_tail(project, branch, service, gen)
-
-    def _stop_tail(self) -> None:
-        """Kill the running tail (if any) and make its thread's late output a no-op."""
-        with self._tail_lock:
-            self._tail_gen += 1
-            self._tail_target = None
-            tail, self._tail_proc = self._tail_proc, None
-        if tail is not None and tail.poll() is None:
-            _kill_group(tail)
-
-    def _tail_say(self, gen: int, message: str, *, plain: bool = False) -> None:
-        if gen != self._tail_gen:
-            return
-        with contextlib.suppress(RuntimeError):  # app already gone
-            self.call_from_thread(self._write_plain if plain else self.write_log, message)
-
-    @work(thread=True, group="tail", exit_on_error=False)
-    def _run_tail(self, project: str, branch: str, service: str, gen: int) -> None:
-        try:
-            args = self._orch_for(project).log_command(
-                branch, service, follow=True, tail=TAIL_LINES
-            )
-            tail = subprocess.Popen(
-                args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,  # so the kill reaches children of a shell command
-            )
-        except WtError as exc:
-            self._tail_say(gen, f"[red]{escape(str(exc))}[/]")
-            return
-        except OSError as exc:
-            self._tail_say(gen, f"[red]{escape(str(exc))}[/]")
-            return
-        with self._tail_lock:
-            if gen != self._tail_gen:
-                _kill_group(tail)
-                tail.wait()
-                return
-            self._tail_proc = tail
-        assert tail.stdout is not None
-        try:
-            for line in tail.stdout:
-                self._tail_say(gen, line.rstrip("\r\n"), plain=True)
-        finally:
-            tail.stdout.close()
-            tail.wait()
-
-    async def action_quit(self) -> None:
-        self._stop_tail()
-        await super().action_quit()
-
-    def on_unmount(self) -> None:
-        self._stop_tail()
 
     # -- refresh --------------------------------------------------------------------
 
@@ -461,7 +305,6 @@ class WtApp(App[None]):
             except WtError as exc:
                 result.append(Row(entry.name, note=str(exc).splitlines()[0]))
                 continue
-            result.append(Row(entry.name))
             result.extend(Row(entry.name, s) for s in statuses)
         return result
 
@@ -472,81 +315,31 @@ class WtApp(App[None]):
         except WtError as exc:
             self.call_from_thread(self._load_failed, str(exc))
         else:
-            self.call_from_thread(self._apply_rows, rows)  # type: ignore[arg-type]
+            self.call_from_thread(self._apply_rows, rows)
 
     def _load_failed(self, message: str) -> None:
         self._loading = False
-        self.write_log(f"[red]{escape(message)}[/]")
+        if not self._busy:
+            self.say(message)
 
-    async def _apply_rows(self, rows: list[Row]) -> None:
+    def _apply_rows(self, rows: list[Row]) -> None:
         try:
-            view = self.query_one("#branches", ListView)
-            tree = self.orch is None
+            table = self.query_one("#table", DataTable)
             previous = self.selected_row
-            items = list(view.query(ListItem))
-            same = [r.key for r in rows] == [r.key for r in self.rows] and len(items) == len(rows)
             self.rows = rows
-            if same:
-                for item, row in zip(items, rows, strict=True):
-                    item.query_one(Label).update(row_label(row, tree=tree))
-            else:
-                await view.clear()
-                await view.extend(ListItem(Label(row_label(r, tree=tree))) for r in rows)
-                keys = [r.key for r in rows]
-                if previous is not None and previous.key in keys:
-                    view.index = keys.index(previous.key)
+            table.clear()
+            multi = self.orch is None
+            for r in rows:
+                if r.status is not None:
+                    name = f"{r.project}/{r.status.branch}" if multi else r.status.branch
+                    cells = (name, r.status.status, _ports(r.status))
                 else:
-                    view.index = 0 if rows else None
-            if not rows and tree and not self._said_empty:
-                self._said_empty = True
-                self.write_log(
-                    "[dim]No projects with branches yet. Run `wt up <branch>` in one.[/]"
-                )
-            self._show_services()
+                    cells = (r.project, r.note, "-")
+                table.add_row(*(Text(c) for c in cells), key=r.key)
+            keys = [r.key for r in rows]
+            if previous is not None and previous.key in keys:
+                table.move_cursor(row=keys.index(previous.key))
         except NoMatches:
             pass  # the app is closing: its widgets are gone before this late refresh arrived
         finally:
-            # Cleared only now: a refresh that starts while the list is being rebuilt would see
-            # the new rows but not the new items yet.
             self._loading = False
-
-    @on(ListView.Highlighted, "#branches")
-    def _highlighted(self) -> None:
-        if self._tail_target is not None and self._tail_target[0] != self.selected_branch:
-            self._stop_tail()
-        self._show_services()
-
-    @on(DataTable.RowHighlighted, "#services")
-    def _row_highlighted(self) -> None:
-        if self._tail_target is not None and self._tail_target != (
-            self.selected_branch,
-            self.selected_service,
-        ):
-            self._stop_tail()
-
-    def _show_services(self) -> None:
-        table = self.query_one("#services", DataTable)
-        keep = self.selected_service
-        table.clear()
-        selected = self.selected_row
-        row = selected.status if selected else None
-        if self.orch is None:
-            self.sub_title = "all projects"
-        elif row is not None and not row.docker_ok:
-            self.sub_title = f"{self.orch.cfg.project} (docker unavailable)"
-        else:
-            self.sub_title = self.orch.cfg.project
-        self._update_titles()
-        if row is None:
-            return
-        for svc in row.services:
-            table.add_row(
-                svc.service,
-                svc.kind,
-                svc.url or "-",
-                f"{HEALTH[svc.outcome]} [dim]{escape(svc.detail)}[/]",
-                key=svc.service,
-            )
-        if keep is not None:
-            with contextlib.suppress(Exception):  # service gone: stay on the first row
-                table.move_cursor(row=table.get_row_index(keep))
