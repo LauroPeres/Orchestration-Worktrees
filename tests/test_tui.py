@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,12 @@ class FakeOrch:
         if self.error:
             raise WtError(self.error)
         return self.rows
+
+    def up(self, branch: str) -> object:
+        return []
+
+    def down(self, branch: str, *, force: bool = False) -> bool:
+        return True
 
 
 def rows() -> list[BranchStatus]:
@@ -135,5 +142,148 @@ def test_q_quits() -> None:
             await pilot.press("q")
             await pilot.pause()
         assert not app.is_running
+
+    asyncio.run(scenario())
+
+
+class ActionOrch(FakeOrch):
+    def __init__(self) -> None:
+        super().__init__(rows())
+        self.actions: list[tuple[str, str, bool]] = []
+        self.down_errors: list[str] = []
+        self.gate: threading.Event | None = None
+        self.emit: Any = None
+
+    def up(self, branch: str) -> list[ServiceReport]:
+        if self.gate:
+            self.gate.wait(5)
+        if self.emit:
+            self.emit()
+        self.actions.append(("up", branch, False))
+        return []
+
+    def down(self, branch: str, *, force: bool = False) -> bool:
+        self.actions.append(("down", branch, force))
+        if self.down_errors and not force:
+            raise WtError(self.down_errors[0])
+        return True
+
+
+def log_text(app: WtApp) -> str:
+    return "\n".join(line.text for line in app.query_one("#log", RichLog).lines)
+
+
+def test_u_ups_selected_branch() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "u")
+            await settle(pilot)
+            assert orch.actions == [("up", "main", False)]
+            assert "done" in log_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_n_asks_for_name_and_cancel_does_nothing() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("n", "escape")
+            await settle(pilot)
+            assert orch.actions == []
+            await pilot.press("n", *"feat-x", "enter")
+            await settle(pilot)
+            assert orch.actions == [("up", "feat-x", False)]
+
+    asyncio.run(scenario())
+
+
+def test_d_confirms_and_cancel_does_nothing() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("d", "n")
+            await settle(pilot)
+            assert orch.actions == []
+            await pilot.press("d", "y")
+            await settle(pilot)
+            assert orch.actions == [("down", "feat-a", False)]
+
+    asyncio.run(scenario())
+
+
+def test_force_only_after_second_confirm() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+        orch.down_errors = ["uncommitted changes in repo api"]
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("d", "y")
+            await settle(pilot)
+            assert orch.actions == [("down", "feat-a", False)]
+            assert "uncommitted changes" in log_text(app)
+            await pilot.press("n")  # decline force
+            await settle(pilot)
+            assert orch.actions == [("down", "feat-a", False)]
+            await pilot.press("d", "y")
+            await settle(pilot)
+            await pilot.press("y")  # accept force
+            await settle(pilot)
+            assert orch.actions[-1] == ("down", "feat-a", True)
+
+    asyncio.run(scenario())
+
+
+def test_keys_ignored_while_busy_and_log_streams() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+        orch.gate = threading.Event()
+        app = WtApp(orch)
+
+        def emit() -> None:
+            app.log_threadsafe("[bold]hello[/]")
+            app.out_threadsafe("[x] raw")
+
+        orch.emit = emit
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("u")
+            await pilot.pause()
+            await pilot.press("u")
+            await pilot.pause()
+            assert "busy" in log_text(app)
+            orch.gate.set()
+            await settle(pilot)
+            assert orch.actions == [("up", "feat-a", False)]
+            text = log_text(app)
+            assert "hello" in text
+            assert "[x] raw" in text
+
+    asyncio.run(scenario())
+
+
+def test_unexpected_error_shown_and_app_stays_open() -> None:
+    async def scenario() -> None:
+        orch = ActionOrch()
+
+        def boom() -> None:
+            raise RuntimeError("kaput")
+
+        orch.emit = boom
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("u")
+            await settle(pilot)
+            assert "kaput" in log_text(app)
+            assert app.is_running
 
     asyncio.run(scenario())

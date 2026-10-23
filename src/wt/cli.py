@@ -253,7 +253,13 @@ def tui(ctx: typer.Context) -> None:
     """Open the terminal UI (branches, services, logs)."""
     from wt.tui import WtApp  # imported here so other commands start fast
 
-    WtApp(Orchestrator(_load(ctx), log=_log)).run()
+    orch = Orchestrator(
+        _load(ctx),
+        log=lambda message: tui_app.log_threadsafe(message),
+        out=lambda line: tui_app.out_threadsafe(line),
+    )
+    tui_app = WtApp(orch)
+    tui_app.run()
 
 
 def main() -> None:
