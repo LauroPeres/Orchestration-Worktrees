@@ -9,6 +9,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, RichLog
 
@@ -271,6 +272,8 @@ class WtApp(App[None]):
                 names = [r.branch for r in rows]
                 view.index = names.index(previous) if previous in names else (0 if rows else None)
             self._show_services()
+        except NoMatches:
+            pass  # the app is closing: its widgets are gone before this late refresh arrived
         finally:
             # Cleared only now: a refresh that starts while the list is being rebuilt would see
             # the new rows but not the new items yet.
