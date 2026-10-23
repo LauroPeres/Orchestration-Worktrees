@@ -1021,7 +1021,13 @@ def test_consumes_url_reaches_the_consumer_env(
         """\
 repos: {r: ./shop-api}
 services:
-  back: {repo: r, compose: docker-compose.yml, compose_service: api, port: 8000, subdomain: api}
+  back:
+    repo: r
+    compose: docker-compose.yml
+    compose_service: api
+    port: 8000
+    subdomain: api
+    remote: https://api.stg.example
   front:
     repo: r
     compose: docker-compose.yml
@@ -1033,7 +1039,7 @@ services:
     )
     path = tmp_path / "worktree.yaml"
     path.write_text(
-        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front]\n"
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front, back]\n"
     )
     Orchestrator(load_config(path), log=lambda m: None).up("feat/x")
     override = docker.files[0][1].read_text()
