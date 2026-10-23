@@ -23,8 +23,14 @@ class CatalogService(Service):
         default_factory=dict, description="service name -> env var that receives its URL"
     )
 
+    remote: str | None = Field(
+        default=None, description="URL consumers get when this service is not selected"
+    )
+
     @model_validator(mode="after")
     def _check_consumes(self) -> Self:
+        if self.remote is not None and not re.match(r"^https?://\S+$", self.remote):
+            raise ValueError("remote: must be an http:// or https:// URL")
         for var in self.consumes.values():
             if not re.match(ENV_VAR, var):
                 raise ValueError(f"consumes: {var!r} is not an environment variable name")
@@ -53,6 +59,13 @@ class Catalog(Strict):
                     raise ValueError(f"service {name!r} cannot consume itself")
                 if dep not in self.services:
                     raise ValueError(f"service {name!r} consumes unknown service {dep!r}")
+        for name, svc in self.services.items():
+            for dep in svc.consumes:
+                if self.services[dep].remote is None:
+                    raise ValueError(
+                        f"service {dep!r} is consumed by {name!r} and needs 'remote:' "
+                        "(the URL used when it is not selected)"
+                    )
         return self
 
 
@@ -120,21 +133,6 @@ def load_catalog(path: Path) -> LoadedCatalog:
     return LoadedCatalog(catalog=catalog, path=path, repos=repos)
 
 
-def _closure(uses: list[str], catalog: Catalog) -> list[str]:
-    """`uses` plus everything reachable through `consumes`, in discovery order."""
-    order: list[str] = []
-    queue = list(uses)
-    while queue:
-        name = queue.pop(0)
-        if name in order:
-            continue
-        if name not in catalog.services:
-            raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
-        order.append(name)
-        queue.extend(catalog.services[name].consumes)
-    return order
-
-
 def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     owner: dict[tuple[str, str], str] = {}
@@ -160,8 +158,11 @@ def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any
     return merged
 
 
-def resolve(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
-    """Turn a worktree.yaml that has `uses:` into the dict of a normal Config."""
+def resolve(raw: dict[str, Any], config_path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
+
+    Also returns the remote URL of every catalog service that is not selected ("" if none).
+    """
     if "services" in raw:
         raise WtError("set exactly one of 'services' or 'uses', not both")
     uses = raw.get("uses")
@@ -173,22 +174,28 @@ def resolve(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
         raise WtError("'repos' cannot be set with 'uses'; repos come from the catalog")
     loaded = load_catalog(catalog_path(raw.get("catalog"), config_path.parent))
     catalog = loaded.catalog
-    chosen = {name: catalog.services[name] for name in _closure(uses, catalog)}
-    cycle = find_cycle({n: list(s.consumes) for n, s in chosen.items()})
+    for name in uses:
+        if name not in catalog.services:
+            raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
+    chosen = {name: catalog.services[name] for name in dict.fromkeys(uses)}
+    cycle = find_cycle({n: [d for d in s.consumes if d in chosen] for n, s in chosen.items()})
     if cycle:
         raise WtError("cycle through catalog consumes: " + " -> ".join(cycle))
     services: dict[str, Any] = {}
     for name, svc in chosen.items():
-        data = svc.model_dump(exclude={"infra", "consumes"}, exclude_unset=True)
+        data = svc.model_dump(exclude={"infra", "consumes", "remote"}, exclude_unset=True)
         env = dict(data.get("env", {}))
         needs = list(data.get("needs", []))
         for dep, var in svc.consumes.items():
+            if var in env:
+                raise WtError(f"service {name!r}: env already sets {var} (used by consumes)")
+            if dep not in chosen:
+                env[var] = catalog.services[dep].remote or ""
+                continue
             if chosen[dep].subdomain is None:
                 raise WtError(
                     f"service {name!r} consumes {dep!r}, which has no 'subdomain' (no route)"
                 )
-            if var in env:
-                raise WtError(f"service {name!r}: env already sets {var} (used by consumes)")
             env[var] = f"{{{{ services.{dep}.url }}}}"
             if dep not in needs:
                 needs.append(dep)
@@ -203,4 +210,5 @@ def resolve(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
     shared = _merge_infra(chosen)
     if shared:
         out["shared"] = shared
-    return out
+    remotes = {n: s.remote or "" for n, s in catalog.services.items() if n not in chosen}
+    return out, remotes

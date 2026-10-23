@@ -1,7 +1,7 @@
 """Load and validate worktree.yaml."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Self
 
@@ -159,6 +159,7 @@ class LoadedConfig:
     config: Config
     path: Path
     catalog: Path | None = None
+    remotes: dict[str, str] = field(default_factory=dict)
 
     @property
     def root(self) -> Path:
@@ -196,18 +197,19 @@ def load_config(path: Path) -> LoadedConfig:
     if not isinstance(raw, dict):
         raise WtError(f"{path} must contain a YAML mapping")
     catalog: Path | None = None
+    remotes: dict[str, str] = {}
     if ("services" in raw) == ("uses" in raw):
         raise WtError(f"invalid {path.name}: set exactly one of 'services' or 'uses'")
     if "uses" in raw:
         from wt.catalog import catalog_path, resolve  # catalog imports this module
 
         catalog = catalog_path(raw.get("catalog"), path.parent)
-        raw = resolve(raw, path)
+        raw, remotes = resolve(raw, path)
     try:
         config = Config.model_validate(raw)
     except ValidationError as exc:
         raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
-    return LoadedConfig(config=config, path=path, catalog=catalog)
+    return LoadedConfig(config=config, path=path, catalog=catalog, remotes=remotes)
 
 
 STARTER = """\
