@@ -10,7 +10,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.css.query import NoMatches
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Input, Label, Static
 
 from wt.config import Config
@@ -71,7 +71,9 @@ class Row:
 
 
 GREEN = "green"
-GREEN_STATES = {"up"}
+GREEN_STATES = {"up", "healthy"}
+PURPLE = "purple"
+SERVICES_ACTIONS = "esc: back  q: quit"
 
 
 def actions_text(actions: str = ACTIONS) -> Text:
@@ -87,6 +89,81 @@ def actions_text(actions: str = ACTIONS) -> Text:
 
 def state_text(state: str) -> Text:
     return Text(state, style=GREEN if state in GREEN_STATES else "")
+
+
+class ServicesScreen(Screen[None]):
+    """Repos of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
+
+    CSS = """
+    ServicesScreen { background: transparent; }
+    #services { height: auto; max-height: 1fr; border: solid $foreground; background: transparent; }
+    #services:focus { border: solid $foreground; background-tint: transparent; }
+    DataTable > .datatable--header { text-style: bold; background: transparent; }
+    DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
+    #actions, #message { height: 1; background: transparent; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "app.pop_screen", "Back", show=False),
+        Binding("q", "app.quit", "Quit", show=False),
+    ]
+
+    def __init__(self, orch: Callable[[], OrchestratorLike], branch: str) -> None:
+        super().__init__()
+        self._orch = orch
+        self.branch = branch
+        self._loading = False
+
+    def compose(self) -> ComposeResult:
+        yield DataTable(id="services", cursor_type="row")
+        yield Static(actions_text(SERVICES_ACTIONS), id="actions")
+        yield Static("", id="message")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#services", DataTable)
+        table.add_columns("NAME", "STATUS", "PORT", "URL")
+        table.focus()
+        self.set_interval(REFRESH_SECONDS, self.refresh_rows)
+        self.refresh_rows()
+
+    def say(self, text: str) -> None:
+        self.query_one("#message", Static).update(Text(text))
+
+    def refresh_rows(self) -> None:
+        if not self._loading:
+            self._loading = True
+            self._load()
+
+    @work(thread=True, group="services", exit_on_error=False)
+    def _load(self) -> None:
+        try:
+            rows = self._orch().services(self.branch)
+        except WtError as exc:
+            self.app.call_from_thread(self._failed, str(exc))
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            self.app.call_from_thread(self._failed, f"{type(exc).__name__}: {exc}")
+        else:
+            self.app.call_from_thread(self._apply, rows)
+
+    def _failed(self, message: str) -> None:
+        self._loading = False
+        if self.is_attached:
+            self.say(message)
+
+    def _apply(self, rows: list[RepoRow]) -> None:
+        try:
+            table = self.query_one("#services", DataTable)
+            cursor = table.cursor_row
+            table.clear()
+            for r in rows:
+                port = Text(str(r.port), style=PURPLE) if r.port is not None else Text("-")
+                table.add_row(Text(r.name), state_text(r.status), port, Text(r.url or "-"))
+            if rows:
+                table.move_cursor(row=min(cursor, len(rows) - 1))
+            self.say("")
+        except NoMatches:
+            pass  # the screen was popped before this late refresh arrived
+        finally:
+            self._loading = False
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -182,23 +259,28 @@ class WtApp(App[None]):
         yield Static("", id="message")
 
     def on_mount(self) -> None:
-        self.query_one("#table", DataTable).add_columns("NAME", "STATUS")
-        self.query_one("#table", DataTable).focus()
+        self._main.query_one("#table", DataTable).add_columns("NAME", "STATUS")
+        self._main.query_one("#table", DataTable).focus()
         self.set_interval(REFRESH_SECONDS, self.action_refresh)
         self.action_refresh()
 
     # -- helpers --------------------------------------------------------------------
 
     @property
+    def _main(self) -> Screen[object]:
+        """The main screen, also while the services screen or a modal is on top."""
+        return self.screen_stack[0]
+
+    @property
     def selected_row(self) -> Row | None:
-        table = self.query_one("#table", DataTable)
+        table = self._main.query_one("#table", DataTable)
         if table.row_count == 0 or table.cursor_row >= len(self.rows):
             return None
         return self.rows[table.cursor_row]
 
     def say(self, text: str) -> None:
         """Show `text` (plain, no markup) on the message line."""
-        self.query_one("#message", Static).update(Text(text))
+        self._main.query_one("#message", Static).update(Text(text))
 
     def log_threadsafe(self, message: str) -> None:
         """For `Orchestrator.log` (markup): callable from a worker thread."""
@@ -233,6 +315,13 @@ class WtApp(App[None]):
         else:
             return row
         return None
+
+    @on(DataTable.RowSelected, "#table")
+    def _open_services(self) -> None:
+        row = self._selected_worktree()
+        if row is not None and row.status is not None:
+            project = row.project
+            self.push_screen(ServicesScreen(lambda: self._orch_for(project), row.status.branch))
 
     # -- actions --------------------------------------------------------------------
 
@@ -345,7 +434,7 @@ class WtApp(App[None]):
 
     def _apply_rows(self, rows: list[Row]) -> None:
         try:
-            table = self.query_one("#table", DataTable)
+            table = self._main.query_one("#table", DataTable)
             previous = self.selected_row
             self.rows = rows
             table.clear()
