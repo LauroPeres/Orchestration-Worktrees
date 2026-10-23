@@ -451,6 +451,15 @@ Rules:
 - Catalog services accept every `Service` key, plus `infra` (keys of `shared`) and `consumes`.
   Env var names in `consumes` match `^[A-Z_][A-Z0-9_]*$`.
 - Repo paths are made absolute when the catalog is resolved.
+- A local `repos:` together with `uses` is an error (repos come from the catalog). A worktree.yaml
+  with neither `services:` nor `uses:` is an error.
+- `catalog:` is read by `load_config` and is not part of the resolved `Config`.
+- Infra merge conflicts are checked only on explicitly set fields; list fields (`databases`,
+  `groups`) are unioned.
+- Service order follows discovery: the `uses` entries, then their dependencies.
+- `env` and `needs` set on a catalog service are kept; the `consumes` variable is added to `env`
+  and the dependency to `needs`.
+- A cycle through `consumes` is an error ("cycle through catalog consumes: a -> b -> a").
 - **Needs (decision a).** `Service.needs: list[str]` (default `[]`) is filled from `consumes`.
   The v0.2 `services:` style may also set `needs`; names must be known and there must be no cycle.
 
@@ -463,6 +472,10 @@ healthy, up to `timeout`:
 - compose group: healthy when `docker compose up --wait` succeeded for it;
 - `run:` service with a `port`: healthy when the port accepts TCP; without a port: healthy when
   the process is alive.
+
+wt waits for a `run:` service to be healthy only when another step needs it; a service nobody
+needs is not waited on (v0.2 behavior). A needed step that is not healthy in time fails `up`
+with "service 'x' is not healthy: ..." and its consumers are not started.
 
 Routes are still written once, after all services. The HTTP probe through Traefik stays in the
 final verify step. A cycle across steps (e.g. through groups) is a WtError before anything starts.
