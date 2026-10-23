@@ -11,8 +11,9 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import SHARED, FakeDocker, FakeProvider
+from tests.conftest import COMPOSE, SHARED, FakeDocker, FakeProvider
 from wt import compose, git, health, host, naming, proc, router, tls
+from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import Check
@@ -860,6 +861,45 @@ def test_ls_status_is_degraded_when_not_all_services_run(
     assert row.status == "degraded"
 
 
+def _store_status(o: Any, status: str) -> None:
+    with o.store.edit() as state:
+        state.branches["feat/cart"].status = status
+
+
+def test_ls_status_degraded_recovers_to_up(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _store_status(o, "degraded")
+    assert [r.status for r in o.ls()] == ["up"]
+    assert [r.status for r in o.ls(probe=False)] == ["up"]
+    monkeypatch.setattr(health, "probe", lambda *a, **k: health.Check(False, "HTTP 502"))
+    assert [r.status for r in o.ls()] == ["degraded"]
+
+
+def test_ls_status_other_states_are_shown_as_stored(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    for status in ("failed", "creating", "removing"):
+        _store_status(o, status)
+        assert [r.status for r in o.ls()] == [status]
+
+
+def test_ls_status_keeps_stored_when_docker_is_unreachable(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _store_status(o, "degraded")
+
+    def boom(p: str) -> list[compose.Container]:
+        raise WtError("docker down")
+
+    monkeypatch.setattr(compose, "ps", boom)
+    assert [r.status for r in o.ls()] == ["degraded"]
+
+
 def test_up_and_down_hold_the_provider_lock(
     orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -915,3 +955,69 @@ def test_refused_up_leaves_the_slug_free(orch, fake_provider: FakeProvider) -> N
     fake_provider.refuse = False
     o.up("main")
     assert "main" in o.store.load().branches
+
+
+def test_up_route_visible_does_not_restart_traefik(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: [])
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    orch().up("feat/cart")
+    assert restarts == []
+
+
+def test_up_recreates_traefik_when_route_file_is_not_visible(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answers = [["shop--feat-cart.yml", "other.yml"], ["other.yml"]]
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: answers.pop(0))
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/cart")
+    assert restarts == [1]
+    assert any("Traefik does not see the route file; recreating it" in m for m in logs)
+    assert [r.status for r in o.ls(probe=False)] == ["up"]
+
+
+def test_up_fails_when_route_file_is_still_missing(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restarts: list[int] = []
+    monkeypatch.setattr(router, "missing_in_container", lambda: ["shop--feat-cart.yml"])
+    monkeypatch.setattr(router, "restart", lambda *a, **k: restarts.append(1))
+    o = orch()
+    with pytest.raises(WtError, match=r"shop--feat-cart\.yml.*wt doctor --fix"):
+        o.up("feat/cart")
+    assert restarts == [1]
+    assert [r.status for r in o.ls(probe=False)] == ["failed"]
+
+
+def test_consumes_url_reaches_the_consumer_env(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(
+        """\
+repos: {r: ./shop-api}
+services:
+  back: {repo: r, compose: docker-compose.yml, compose_service: api, port: 8000, subdomain: api}
+  front:
+    repo: r
+    compose: docker-compose.yml
+    compose_service: db
+    port: 80
+    subdomain: ""
+    consumes: {back: API_URL}
+"""
+    )
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\nuses: [front]\n"
+    )
+    Orchestrator(load_config(path), log=lambda m: None).up("feat/x")
+    override = docker.files[0][1].read_text()
+    assert "API_URL: https://api.feat-x.shop.localhost" in override
