@@ -1,4 +1,6 @@
 import os
+import random
+import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -6,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, health, host, providers, router, tls
+from wt import compose, health, host, naming, providers, router, tls
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
@@ -31,6 +33,31 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key, value in GIT_ENV.items():
         monkeypatch.setenv(key, value)
     return home
+
+
+PORT_WINDOW = 1000  # room for worktree indexes 0..9 of 100 services
+
+
+def _window_is_free(base: int) -> bool:
+    for port in range(base, base + PORT_WINDOW):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return False
+        except OSError:
+            continue
+    return True
+
+
+@pytest.fixture(autouse=True)
+def private_port_base(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Move the host-port formula to a free private window, so tests never meet a real stack."""
+    rng = random.Random()
+    for _ in range(50):
+        base = rng.randrange(15000, 60000 - PORT_WINDOW)
+        if _window_is_free(base):
+            break
+    monkeypatch.setattr(naming, "PORT_BASE", base)
+    return base
 
 
 _LEAKED: list[str] = []

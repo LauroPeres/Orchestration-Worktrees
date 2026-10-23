@@ -2,16 +2,19 @@ import pytest
 
 from wt.errors import WtError
 from wt.naming import (
-    AUTO_PORT_RANGE,
     MAX_SLUG,
     PORT_BASE,
     PORT_STRIDE,
     Names,
-    auto_port,
     fit,
     host_port,
     slugify,
 )
+
+
+@pytest.fixture(autouse=True)
+def private_port_base() -> None:
+    """Override the conftest fixture: the formula tests use the real PORT_BASE."""
 
 
 @pytest.mark.parametrize(
@@ -57,13 +60,6 @@ def test_names() -> None:
     assert n.compose_project("api") == "wt-shop-feat-cart-api"
     assert n.network_alias("api") == "wt-shop-feat-cart-api"
     assert n.router("api") == "shop--feat-cart--api"
-
-
-def test_auto_port_is_stable_and_in_range() -> None:
-    port = auto_port("shop", "feat/cart", "web")
-    assert port == auto_port("shop", "feat/cart", "web")
-    assert AUTO_PORT_RANGE[0] <= port < AUTO_PORT_RANGE[1]
-    assert port != auto_port("shop", "feat/other", "web")
 
 
 @pytest.mark.parametrize("branch", ["feat/x", "feat-x", "Feat_X"])

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from wt import host, naming
+from wt import host
 from wt.errors import WtError
 from wt.state import ProcessState
 
@@ -95,39 +95,9 @@ def test_stop_dead_process_is_a_noop(tmp_path: Path, started: list[ProcessState]
     host.stop(ps)
 
 
-def test_pick_port_prefers_the_stable_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    expected = naming.auto_port("shop", "main", "web")
-    monkeypatch.setattr(host, "port_free", lambda p: True)
-    assert host.pick_port("shop", "main", "web", set()) == expected
-
-
-def test_pick_port_probes_past_a_bound_socket(monkeypatch: pytest.MonkeyPatch) -> None:
-    base = free_port()
-    monkeypatch.setattr(naming, "auto_port", lambda *a: base)
-    with socket.socket() as s:
-        s.bind(("0.0.0.0", base))
-        s.listen()
-        port = host.pick_port("shop", "main", "web", set())
-    assert port != base
-    assert base < port <= base + 100
-
-
-def test_pick_port_skips_taken_ports(monkeypatch: pytest.MonkeyPatch) -> None:
-    base = free_port()
-    monkeypatch.setattr(naming, "auto_port", lambda *a: base)
-    monkeypatch.setattr(host, "port_free", lambda p: True)
-    assert host.pick_port("shop", "main", "web", {base, base + 1}) == base + 2
-
-
-def test_pick_port_gives_up_after_100_tries(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(host, "port_free", lambda p: False)
-    with pytest.raises(WtError, match="no free port"):
-        host.pick_port("shop", "main", "web", set())
-
-
 def test_explicit_port_is_used_as_is() -> None:
     port = free_port()
-    assert host.pick_port("shop", "main", "web", set(), requested=port) == port
+    assert host.pick_port("web", set(), port) == port
 
 
 def test_explicit_port_in_use_fails() -> None:
@@ -136,13 +106,13 @@ def test_explicit_port_in_use_fails() -> None:
         s.listen()
         port = int(s.getsockname()[1])
         with pytest.raises(WtError, match=f"port {port} .* in use"):
-            host.pick_port("shop", "main", "web", set(), requested=port)
+            host.pick_port("web", set(), port)
 
 
 def test_explicit_port_taken_by_another_service_fails() -> None:
     port = free_port()
     with pytest.raises(WtError, match="another service"):
-        host.pick_port("shop", "main", "web", {port}, requested=port)
+        host.pick_port("web", {port}, port)
 
 
 def test_recycled_pid_in_another_group_is_not_ours(

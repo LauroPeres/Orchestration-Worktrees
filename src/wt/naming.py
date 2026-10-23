@@ -9,7 +9,6 @@ from wt.errors import WtError
 
 MAX_SLUG = 40  # leaves room for prefixes in DNS labels (63) and Postgres identifiers (63)
 MAX_LABEL = 63
-AUTO_PORT_RANGE = (20000, 40000)
 PORT_BASE = 10000
 PORT_STRIDE = 100  # services per worktree
 MAX_PORT = 65535
@@ -41,13 +40,6 @@ def slugify(branch: str) -> str:
     if len(slug) > MAX_SLUG:
         slug = fit(slug, MAX_SLUG)
     return slug
-
-
-def auto_port(project: str, branch: str, service: str) -> int:
-    """A stable port in AUTO_PORT_RANGE for (project, branch, service)."""
-    low, high = AUTO_PORT_RANGE
-    digest = int(_short_hash(f"{project}\0{branch}\0{service}", 8), 16)
-    return low + digest % (high - low)
 
 
 def host_port(worktree_index: int, service_index: int) -> int:
