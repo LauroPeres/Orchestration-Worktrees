@@ -20,7 +20,7 @@ def test_unknown_name_is_an_error() -> None:
 
 
 def test_upcoming_provider_hint() -> None:
-    with pytest.raises(WtError, match=r"kafka provider arrives in v0\.3"):
+    with pytest.raises(WtError, match=r"kafka provider arrives in v0\.4"):
         render("{{ kafka.topic('orders') }}", {}, "env.TOPIC")
 
 
