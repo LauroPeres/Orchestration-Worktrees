@@ -233,7 +233,8 @@ base branch and the state handle. `Provider.template_vars` takes a second argume
 `kind: "compose" | "run"`, so a provider can give a different address per service kind. Every
 other method keeps the §6 signature.
 
-**Active providers.** Only `postgres` runs. `kafka`, `redis` and `keycloak` under `shared:` stay
+**Active providers.** Only `postgres` runs (changed by §18: `redis` runs from v0.4, `kafka` too).
+`kafka`, `redis` and `keycloak` under `shared:` stay
 as in v0.1: validated, ignored with a note in `up`, and their template names (`{{ kafka... }}`)
 fail with the "arrives in v0.4/v0.5" message.
 

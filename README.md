@@ -20,7 +20,8 @@ wt ships no services of its own: you describe your stack (any repos, any languag
 > routes and local TLS, a Postgres provider that gives every branch its own cloned databases,
 > a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch example is in
 > [examples/shop](examples/shop/README.md), and a two-repo one in
-> [examples/notes](examples/notes/README.md). Kafka and Redis come in v0.4.
+> [examples/notes](examples/notes/README.md). Redis (`shared.redis`, see below) and Kafka come
+> in v0.4.
 
 ## Requirements
 
@@ -182,7 +183,30 @@ gets the database `shop__feat_cart`.
   `docker rm -f wt-postgres && docker volume rm wt-postgres-data && rm -r ~/.wt/postgres`.
 - A branch whose database names equal the base branch's (for example `Main` with the base
   `main`) is refused by `up` before anything is created. Rename the branch.
-- Kafka, Redis and Keycloak under `shared:` are validated but ignored until later versions.
+- Kafka and Keycloak under `shared:` are validated but ignored until later versions.
+
+## Redis per branch (`shared.redis`)
+
+```yaml
+shared:
+  redis:
+    prefix: true            # default; false shares every key between branches
+```
+
+wt runs one shared `wt-redis` container (`redis:7-alpine`, data in the `wt-redis-data` volume,
+published on `127.0.0.1:56379`). Branch `feat/cart` gets the key prefix `feat-cart:`.
+
+- `{{ redis.url }}` is the connection URL and `{{ redis.prefix }}` the key prefix of the branch.
+  Compose services get `redis://wt-redis:6379` on the shared `wt` network; host processes get
+  `redis://127.0.0.1:56379`.
+- Isolation is by key prefix. wt does not rename keys: your app must write every key that starts
+  with `{{ redis.prefix }}`.
+- `prefix: false` turns isolation off. Branches then share every key, and the Redis check
+  reports a warning.
+- `down` deletes only that branch's keys (every key under its prefix, found with SCAN and removed
+  with UNLINK). Other prefixes, and the shared server, are not touched.
+- Overrides: `WT_REDIS_PORT` (host port, default `56379`) and `WT_REDIS_IMAGE` (default
+  `redis:7-alpine`).
 
 ## User catalog (`uses:`)
 
@@ -303,9 +327,11 @@ Outside a project it lists the worktrees of every project wt knows. The repos' o
 | `WT_TRAEFIK_IMAGE` | `traefik:v3.5` | Traefik image |
 | `WT_POSTGRES_IMAGE` | `postgres:17-alpine` | Postgres image |
 | `WT_POSTGRES_PORT` | `55432` | host port of the shared Postgres |
+| `WT_REDIS_PORT` | `56379` | host port of the shared Redis |
+| `WT_REDIS_IMAGE` | `redis:7-alpine` | image of the shared Redis |
 | `WT_INSTANCE` | `wt` | prefix of the shared Docker objects (isolates test runs) |
 
-A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`) that is not a number from 1
+A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`, `WT_REDIS_PORT`) that is not a number from 1
 to 65535 makes wt stop with an error that names the variable.
 
 ## WSL2

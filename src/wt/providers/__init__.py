@@ -5,9 +5,13 @@ from collections.abc import Callable
 from wt.config import Config
 from wt.providers.base import Provider
 from wt.providers.postgres import PostgresProvider
+from wt.providers.redis import RedisProvider
 
 Log = Callable[[str], None]
-REGISTRY: dict[str, Callable[[Config, Log], Provider]] = {"postgres": PostgresProvider}
+REGISTRY: dict[str, Callable[[Config, Log], Provider]] = {
+    "postgres": PostgresProvider,
+    "redis": RedisProvider,
+}
 
 
 def active(cfg: Config, log: Log) -> list[Provider]:

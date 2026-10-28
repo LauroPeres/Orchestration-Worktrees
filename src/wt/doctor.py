@@ -9,7 +9,7 @@ from typing import Literal
 from wt import compose, host, proc, router, tls
 from wt.config import LoadedConfig
 from wt.errors import WtError
-from wt.providers import postgres
+from wt.providers import postgres, redis
 from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
@@ -250,6 +250,22 @@ def check_postgres(databases: list[str], *, fix: bool) -> list[Check]:
     return checks
 
 
+def check_redis(*, fix: bool) -> Check:
+    """Shared Redis: the container is running (started by `--fix`)."""
+    name = redis.container()
+    running = _container_running(name)
+    if not running and fix:
+        try:
+            with file_lock("redis"):
+                redis.ensure_server()
+        except WtError as exc:
+            return Check("redis", "fail", str(exc).splitlines()[0])
+        running = _container_running(name)
+    if running:
+        return Check("redis", "ok", f"{name} running")
+    return Check("redis", "fail", f"{name} not running", "run `wt doctor --fix`")
+
+
 def _container_running(name: str) -> bool:
     result = proc.run(["docker", "inspect", "-f", "{{.State.Running}}", name], check=False)
     return result.ok and result.stdout.strip() == "true"
@@ -332,6 +348,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
         checks.append(check_resolution(loaded.config.domain))
         if docker_ok and loaded.config.shared.postgres is not None:
             checks += check_postgres(loaded.config.shared.postgres.databases, fix=fix)
+        if docker_ok and loaded.config.shared.redis is not None:
+            checks.append(check_redis(fix=fix))
         checks += check_ports(loaded.config.project)
     else:
         checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))
