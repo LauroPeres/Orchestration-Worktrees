@@ -16,12 +16,11 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.3.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
-> routes and local TLS, a Postgres provider that gives every branch its own cloned databases,
-> a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch example is in
-> [examples/shop](examples/shop/README.md), and a two-repo one in
-> [examples/notes](examples/notes/README.md). Redis (`shared.redis`) and Kafka
-> (`shared.kafka`) are the v0.4 providers, described below.
+> **Status: v0.4.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> routes and local TLS, Postgres, Redis and Kafka providers that give every branch its own
+> database, key prefix and consumer group, a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch
+> example is in [examples/shop](examples/shop/README.md), and a two-repo one in
+> [examples/notes](examples/notes/README.md).
 
 ## Requirements
 

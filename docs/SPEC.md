@@ -159,7 +159,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
-| v0.4 (in progress, §18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
+| v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 | Keycloak provider (SSO across branch subdomains) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
