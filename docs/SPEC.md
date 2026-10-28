@@ -564,7 +564,8 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
   message line with the last log line or error of the running action.
 - `u` = `up` of the selected row. `d` = `stop` (services down, worktree kept). `a` = an input box
   for the new worktree name, then `add` in the current project (outside a project: the project of
-  the selected row). `r` = a confirm box (`remove <branch>: deletes its containers, volumes,
+  the selected row, or, when the table is empty, the only usable project; with several, `a` says to run
+  `wt tui` inside one). `r` = a confirm box (`remove <branch>: deletes its containers, volumes,
   databases, worktrees and the git branch; unpushed commits are lost. Remove? y/N`), then `remove`
   with `--force`. Arrows select, `q` quits.
 - One action at a time, in a worker thread; keys pressed while busy show a note on the message
