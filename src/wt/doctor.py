@@ -9,7 +9,7 @@ from typing import Literal
 from wt import compose, host, proc, router, tls
 from wt.config import LoadedConfig
 from wt.errors import WtError
-from wt.providers import kafka, postgres, redis
+from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
@@ -282,6 +282,22 @@ def check_kafka(*, fix: bool) -> Check:
     return Check("kafka", "fail", f"{name} not running", "run `wt doctor --fix`")
 
 
+def check_keycloak(*, fix: bool) -> Check:
+    """Shared Keycloak: the container is running (started by `--fix`)."""
+    name = keycloak.container()
+    running = _container_running(name)
+    if not running and fix:
+        try:
+            with file_lock("keycloak"):
+                keycloak.ensure_server()
+        except WtError as exc:
+            return Check("keycloak", "fail", str(exc).splitlines()[0])
+        running = _container_running(name)
+    if running:
+        return Check("keycloak", "ok", f"{name} running")
+    return Check("keycloak", "fail", f"{name} not running", "run `wt doctor --fix`")
+
+
 def _container_running(name: str) -> bool:
     result = proc.run(["docker", "inspect", "-f", "{{.State.Running}}", name], check=False)
     return result.ok and result.stdout.strip() == "true"
@@ -368,6 +384,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
             checks.append(check_redis(fix=fix))
         if docker_ok and loaded.config.shared.kafka is not None:
             checks.append(check_kafka(fix=fix))
+        if docker_ok and loaded.config.shared.keycloak is not None:
+            checks.append(check_keycloak(fix=fix))
         checks += check_ports(loaded.config.project)
     else:
         checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))
