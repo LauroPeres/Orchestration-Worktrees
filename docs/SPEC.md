@@ -159,7 +159,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
-| v0.4 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
+| v0.4 (in progress, §18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 | Keycloak provider (SSO across branch subdomains) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
@@ -660,3 +660,37 @@ port rules of §13 (compose isolation) and §14 (ports).
    line are green, PORT values are purple, STATUS `healthy` and `up` are green, everything else is
    plain. This replaces "no colors" in §16.
 9. **`examples/notes`.** `uses: [front, back]`. `back` gets `remote: https://api.staging.notes.example`.
+
+## 18. v0.4: Redis and Kafka providers, shop worker
+
+Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config shapes of §4 stay
+(`shared.redis.prefix`, `shared.kafka.groups` and `topic_prefix`).
+
+**Decisions**
+- **Both providers** register in `providers/__init__.py`. Their `{{ redis... }}` and `{{ kafka... }}`
+  names stop failing with the "arrives in v0.4" message. They use no new Python dependency: every
+  operation is a `docker exec` of the CLI tools inside the server container.
+- **Redis server.** Container `wt-redis` (official `redis` image, alpine tag) on the shared `wt`
+  network, published on `127.0.0.1:56379`. State lives in a named volume.
+- **Redis isolation.** Key prefix `<branch-slug>:`. Resources = `[prefix]`. Template vars:
+  `redis.url` (`redis://wt-redis:6379` for `compose`, `redis://127.0.0.1:56379` for `run`) and
+  `redis.prefix`. `verify`: PING, then SET/GET/DEL of a probe key under the prefix. `destroy`:
+  delete every key under the prefix (SCAN + UNLINK through `redis-cli`); other prefixes are never
+  touched. `prefix: false` means no isolation: allowed, and `verify` returns a warning.
+- **Kafka server.** Single-node KRaft container `wt-kafka` (official `apache/kafka` image) on the
+  `wt` network, with one listener for containers (`wt-kafka:9092`) and one for host processes on
+  `127.0.0.1:59092`. Topic auto-creation stays on, so apps create their own topics.
+- **Kafka isolation.** Consumer group `<group>-<branch-slug>` for each name in `groups`; with
+  `topic_prefix: true`, topics are named `<branch-slug>.<topic>`. Resources = the group names (and
+  the prefix). Template vars: `kafka.bootstrap` (by `kind`, as above), `kafka.group('name')` (a
+  name not in `groups` is a WtError) and `kafka.topic('name')`. `verify`: the broker answers
+  and, with a prefix, a probe topic can be created and deleted. `destroy`: delete the branch's
+  consumer groups and every topic with the branch prefix; safe when none exist.
+- **doctor.** One check per configured provider (container running, answers), and `--fix` starts
+  it, as for Postgres.
+- **`examples/shop`** gets a `worker` (host process): the api publishes a `cart` event, the worker
+  consumes it with `kafka.group('worker')` and counts events per branch in Redis under
+  `redis.prefix`. Its own requirements file holds the client libraries; `wt` itself does not.
+- **README.** An architecture diagram in Mermaid (no GIF, no image file) and a Benchmarks section
+  with numbers measured from `examples/shop` on the author's machine, with the exact command. A
+  number that cannot be measured is left out (CLAUDE.md "Numbers").
