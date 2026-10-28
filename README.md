@@ -16,9 +16,10 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 `worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.4.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
-> routes and local TLS, Postgres, Redis and Kafka providers that give every branch its own
-> database, key prefix and consumer group, a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch
+> **Status: v0.5.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
+> own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
+> terminal UI (`wt tui`). A complete two-branch
 > example is in [examples/shop](examples/shop/README.md), and a two-repo one in
 > [examples/notes](examples/notes/README.md).
 
@@ -527,7 +528,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
 | v0.4 | Kafka + Redis providers ✔, worker in the example ✔, README architecture diagram ✔, benchmarks ✔ |
-| v0.5 | Keycloak provider (SSO across branch subdomains) |
+| v0.5 | Keycloak provider ✔ (shared realm, one client per branch; the shop has a Sign in link) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
