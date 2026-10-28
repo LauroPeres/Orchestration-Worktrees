@@ -182,7 +182,6 @@ gets the database `shop__feat_cart`.
   `docker rm -f wt-postgres && docker volume rm wt-postgres-data && rm -r ~/.wt/postgres`.
 - A branch whose database names equal the base branch's (for example `Main` with the base
   `main`) is refused by `up` before anything is created. Rename the branch.
-- Keycloak under `shared:` is validated but ignored until v0.5.
 
 ## Redis per branch (`shared.redis`)
 
@@ -233,6 +232,37 @@ group `worker-feat-cart` and, with `topic_prefix: true`, the topic `feat-cart.it
   not touched. With `topic_prefix` off, `down` deletes only the groups.
 - Overrides: `WT_KAFKA_PORT` (host port, default `59092`) and `WT_KAFKA_IMAGE` (default
   `apache/kafka:3.9.1`).
+
+## Keycloak per branch (`shared.keycloak`)
+
+```yaml
+shared:
+  keycloak:
+    realm: shop             # one realm shared by every branch
+    client: web             # each branch gets its own client: web-<slug>
+```
+
+`realm` and `client` may use letters, digits, `.`, `_` and `-`.
+
+wt runs one shared `wt-keycloak` container (`quay.io/keycloak/keycloak:26.8.1` in `start-dev`
+mode, data in the `wt-keycloak-data` volume, published on `127.0.0.1:58080`).
+
+- `up` creates the realm once, if it is missing. wt never deletes the realm.
+- `up` creates one public client per branch, `<client>-<slug>` (for example `web-feat-cart`).
+  Its redirect URIs are `<url>/*` and its web origins are `<url>`, one pair for each selected
+  routed service of the branch. `<url>` is the service URL, with the HTTPS port unless it is 443.
+- `down` deletes only that branch's client. The realm and its users stay.
+- wt creates no users. Open the admin console at `http://localhost:58080`, log in as `admin`
+  with the password in `~/.wt/keycloak/password`, and add users there.
+- Template values, resolved per branch:
+  - `{{ keycloak.url }}`: `http://localhost:58080`, the address the browser uses.
+  - `{{ keycloak.issuer }}`: `http://localhost:58080/realms/<realm>`. It is the same for every
+    branch, so one login works across the branch subdomains.
+  - `{{ keycloak.realm }}` and `{{ keycloak.client_id }}`: the realm and this branch's client.
+  - `{{ keycloak.internal_url }}`: `http://wt-keycloak:8080` for compose services on the `wt`
+    network, where `localhost` is not the server. For `run:` services it is the same as `url`.
+- Overrides: `WT_KEYCLOAK_PORT` (host port, default `58080`) and `WT_KEYCLOAK_IMAGE` (default
+  `quay.io/keycloak/keycloak:26.8.1`).
 
 ## User catalog (`uses:`)
 
@@ -410,11 +440,13 @@ flowchart TB
 | `WT_REDIS_IMAGE` | `redis:7-alpine` | image of the shared Redis |
 | `WT_KAFKA_PORT` | `59092` | host port of the shared Kafka |
 | `WT_KAFKA_IMAGE` | `apache/kafka:3.9.1` | image of the shared Kafka |
+| `WT_KEYCLOAK_PORT` | `58080` | host port of the shared Keycloak |
+| `WT_KEYCLOAK_IMAGE` | `quay.io/keycloak/keycloak:26.8.1` | image of the shared Keycloak |
 | `WT_INSTANCE` | `wt` | prefix of the shared Docker objects (isolates test runs) |
 
 A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`, `WT_REDIS_PORT`,
-`WT_KAFKA_PORT`) that is not a number from 1 to 65535 makes wt stop with an error that names
-the variable.
+`WT_KAFKA_PORT`, `WT_KEYCLOAK_PORT`) that is not a number from 1 to 65535 makes wt stop with an
+error that names the variable.
 
 ## WSL2
 
