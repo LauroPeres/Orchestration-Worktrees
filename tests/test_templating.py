@@ -19,9 +19,12 @@ def test_unknown_name_is_an_error() -> None:
         render("{{ nope }}", {"url": ""}, "env.A")
 
 
-def test_upcoming_provider_hint() -> None:
-    with pytest.raises(WtError, match=r"keycloak provider arrives in v0\.5"):
-        render("{{ keycloak.realm }}", {}, "env.TOPIC")
+def test_upcoming_provider_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wt import providers
+
+    monkeypatch.delitem(providers.REGISTRY, "postgres")
+    with pytest.raises(WtError, match=r"postgres provider arrives in v0\.2"):
+        render("{{ postgres.url('shop') }}", {}, "env.A")
 
 
 def test_sandbox_blocks_internals() -> None:

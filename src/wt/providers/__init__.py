@@ -5,12 +5,14 @@ from collections.abc import Callable
 from wt.config import Config
 from wt.providers.base import Provider
 from wt.providers.kafka import KafkaProvider
+from wt.providers.keycloak import KeycloakProvider
 from wt.providers.postgres import PostgresProvider
 from wt.providers.redis import RedisProvider
 
 Log = Callable[[str], None]
 REGISTRY: dict[str, Callable[[Config, Log], Provider]] = {
     "kafka": KafkaProvider,
+    "keycloak": KeycloakProvider,
     "postgres": PostgresProvider,
     "redis": RedisProvider,
 }
