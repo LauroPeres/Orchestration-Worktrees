@@ -54,8 +54,8 @@ def test_up_twice_is_safe(orch, docker: FakeDocker) -> None:
 
 
 def test_template_error_creates_nothing(orch, docker: FakeDocker, isolated_home: Path) -> None:
-    o = orch(env={"DB": "{{ kafka.topic('x') }}"})
-    with pytest.raises(WtError, match=r"v0\.4"):
+    o = orch(env={"DB": "{{ keycloak.realm }}"})
+    with pytest.raises(WtError, match=r"v0\.5"):
         o.up("feat/cart")
     assert o.store.load().branches == {}
     assert not (isolated_home / "shop" / "worktrees").exists()
@@ -518,11 +518,11 @@ def test_override_file_is_private(orch, fake_provider: FakeProvider, docker: Fak
 
 def test_note_only_for_unregistered_providers(orch, fake_provider: FakeProvider) -> None:
     logs: list[str] = []
-    o = orch(shared={**SHARED, "kafka": {"groups": ["g"]}})
+    o = orch(shared={**SHARED, "keycloak": {"realm": "r", "client": "c"}})
     o.log = logs.append
     o.up("feat/cart")
     notes = [m for m in logs if "not available" in m]
-    assert len(notes) == 1 and "kafka" in notes[0] and "postgres" not in notes[0]
+    assert len(notes) == 1 and "keycloak" in notes[0] and "postgres" not in notes[0]
 
 
 def test_no_note_when_all_providers_are_registered(orch, fake_provider: FakeProvider) -> None:

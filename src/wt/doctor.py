@@ -9,7 +9,7 @@ from typing import Literal
 from wt import compose, host, proc, router, tls
 from wt.config import LoadedConfig
 from wt.errors import WtError
-from wt.providers import postgres, redis
+from wt.providers import kafka, postgres, redis
 from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
@@ -266,6 +266,22 @@ def check_redis(*, fix: bool) -> Check:
     return Check("redis", "fail", f"{name} not running", "run `wt doctor --fix`")
 
 
+def check_kafka(*, fix: bool) -> Check:
+    """Shared Kafka: the container is running (started by `--fix`)."""
+    name = kafka.container()
+    running = _container_running(name)
+    if not running and fix:
+        try:
+            with file_lock("kafka"):
+                kafka.ensure_server()
+        except WtError as exc:
+            return Check("kafka", "fail", str(exc).splitlines()[0])
+        running = _container_running(name)
+    if running:
+        return Check("kafka", "ok", f"{name} running")
+    return Check("kafka", "fail", f"{name} not running", "run `wt doctor --fix`")
+
+
 def _container_running(name: str) -> bool:
     result = proc.run(["docker", "inspect", "-f", "{{.State.Running}}", name], check=False)
     return result.ok and result.stdout.strip() == "true"
@@ -350,6 +366,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
             checks += check_postgres(loaded.config.shared.postgres.databases, fix=fix)
         if docker_ok and loaded.config.shared.redis is not None:
             checks.append(check_redis(fix=fix))
+        if docker_ok and loaded.config.shared.kafka is not None:
+            checks.append(check_kafka(fix=fix))
         checks += check_ports(loaded.config.project)
     else:
         checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))

@@ -20,8 +20,8 @@ wt ships no services of its own: you describe your stack (any repos, any languag
 > routes and local TLS, a Postgres provider that gives every branch its own cloned databases,
 > a user catalog (`uses:`), and a terminal UI (`wt tui`). A complete two-branch example is in
 > [examples/shop](examples/shop/README.md), and a two-repo one in
-> [examples/notes](examples/notes/README.md). Redis (`shared.redis`, see below) and Kafka come
-> in v0.4.
+> [examples/notes](examples/notes/README.md). Redis (`shared.redis`) and Kafka
+> (`shared.kafka`) are the v0.4 providers, described below.
 
 ## Requirements
 
@@ -183,7 +183,7 @@ gets the database `shop__feat_cart`.
   `docker rm -f wt-postgres && docker volume rm wt-postgres-data && rm -r ~/.wt/postgres`.
 - A branch whose database names equal the base branch's (for example `Main` with the base
   `main`) is refused by `up` before anything is created. Rename the branch.
-- Kafka and Keycloak under `shared:` are validated but ignored until later versions.
+- Keycloak under `shared:` is validated but ignored until v0.5.
 
 ## Redis per branch (`shared.redis`)
 
@@ -207,6 +207,33 @@ published on `127.0.0.1:56379`). Branch `feat/cart` gets the key prefix `feat-ca
   with UNLINK). Other prefixes, and the shared server, are not touched.
 - Overrides: `WT_REDIS_PORT` (host port, default `56379`) and `WT_REDIS_IMAGE` (default
   `redis:7-alpine`).
+
+## Kafka per branch (`shared.kafka`)
+
+```yaml
+shared:
+  kafka:
+    groups: [worker]        # consumer groups; each one is named per branch
+    topic_prefix: true      # default false; prefixes topics with the branch slug
+```
+
+wt runs one shared `wt-kafka` container (single-node `apache/kafka`, data in the
+`wt-kafka-data` volume, published on `127.0.0.1:59092`). Branch `feat/cart` gets the consumer
+group `worker-feat-cart` and, with `topic_prefix: true`, the topic `feat-cart.items` for `items`.
+
+- `{{ kafka.bootstrap }}` is the bootstrap address. Compose services get `wt-kafka:9092` on the
+  shared `wt` network; host processes get `127.0.0.1:59092`.
+- `{{ kafka.group('worker') }}` is the group name of a name listed in `groups`. Any other name
+  is an error.
+- `{{ kafka.topic('items') }}` is the topic name: `feat-cart.items` with `topic_prefix`, plain
+  `items` without it.
+- Isolation is by naming. Each branch's services must use the names the templates give them.
+- Topics are created automatically when first used.
+- `down` deletes that branch's consumer groups and its topics with the `feat-cart.` prefix. The
+  match is exact, so `feat-cart-x.*` topics are kept. Other branches and the shared server are
+  not touched. With `topic_prefix` off, `down` deletes only the groups.
+- Overrides: `WT_KAFKA_PORT` (host port, default `59092`) and `WT_KAFKA_IMAGE` (default
+  `apache/kafka:3.9.1`).
 
 ## User catalog (`uses:`)
 
@@ -329,10 +356,13 @@ Outside a project it lists the worktrees of every project wt knows. The repos' o
 | `WT_POSTGRES_PORT` | `55432` | host port of the shared Postgres |
 | `WT_REDIS_PORT` | `56379` | host port of the shared Redis |
 | `WT_REDIS_IMAGE` | `redis:7-alpine` | image of the shared Redis |
+| `WT_KAFKA_PORT` | `59092` | host port of the shared Kafka |
+| `WT_KAFKA_IMAGE` | `apache/kafka:3.9.1` | image of the shared Kafka |
 | `WT_INSTANCE` | `wt` | prefix of the shared Docker objects (isolates test runs) |
 
-A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`, `WT_REDIS_PORT`) that is not a number from 1
-to 65535 makes wt stop with an error that names the variable.
+A port variable (`WT_HTTP_PORT`, `WT_HTTPS_PORT`, `WT_POSTGRES_PORT`, `WT_REDIS_PORT`,
+`WT_KAFKA_PORT`) that is not a number from 1 to 65535 makes wt stop with an error that names
+the variable.
 
 ## WSL2
 
