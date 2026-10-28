@@ -35,7 +35,7 @@ wt doctor                  # check docker, git, ports, certs, hosts resolution
 After `wt up feat/cart`:
 
 - `https://feat-cart.shop.localhost` → that branch's frontend
-- `https://api.feat-cart.shop.localhost` → that branch's API
+- its own database `shop__feat_cart`, consumer group `orders-feat-cart`, Redis prefix `feat-cart:`
 - its own database `shop__feat_cart`, consumer group `orders__feat_cart`, Redis prefix `feat_cart:`
 - `main` keeps running, untouched.
 
@@ -121,7 +121,7 @@ Built-in providers:
 |---|---|---|
 | postgres | one database per branch | `CREATE DATABASE … TEMPLATE` from main; fallback dump/restore; verify after clone |
 | kafka | one consumer group per branch (+ optional topic prefix) | same group across branches = messages silently split |
-| redis | key prefix per branch (or DB index) | avoids one branch serving another's cache |
+| redis | key prefix per branch | avoids one branch serving another's cache |
 | keycloak | redirect URIs per branch | optional; SSO across subdomains |
 
 Third-party providers can be added later via entry points (e.g. MySQL, RabbitMQ).
@@ -694,3 +694,24 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
 - **README.** An architecture diagram in Mermaid (no GIF, no image file) and a Benchmarks section
   with numbers measured from `examples/shop` on the author's machine, with the exact command. A
   number that cannot be measured is left out (CLAUDE.md "Numbers").
+- **Names and env.** Containers `<instance>-redis` and `<instance>-kafka` and named volumes
+  `<instance>-redis-data`, `<instance>-kafka-data` follow `WT_INSTANCE` like Postgres. Overrides:
+  `WT_REDIS_IMAGE` (default `redis:7-alpine`), `WT_REDIS_PORT` (56379), `WT_KAFKA_IMAGE` (default
+  a pinned `apache/kafka` tag), `WT_KAFKA_PORT` (59092).
+- **Kafka listeners.** `INTERNAL://<container>:9092` for compose services; `EXTERNAL` on container
+  port 19092, published as `127.0.0.1:<WT_KAFKA_PORT>:19092` and advertised as
+  `127.0.0.1:<WT_KAFKA_PORT>`; controller on 9093; `KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`.
+- **Names.** Redis prefix `<slug>:`; Kafka group `<group>-<slug>`; topic `<slug>.<name>` when
+  `topic_prefix`, else `<name>`. A name not in `groups` given to `kafka.group()` is a WtError.
+- **No base branch.** Redis and Kafka have none: `down` of any branch (the base too) cleans its own
+  slice. With `prefix: false`, `redis.prefix` is `""`, `destroy` deletes nothing and `verify`
+  warns. With `topic_prefix: false`, `destroy` deletes only the groups.
+- **Destroy is exact.** Deleting branch `feat` never touches `feat-x:*` keys or `feat-x.*` topics:
+  the Redis pattern ends with `:`, and Kafka topics are matched on the exact prefix in Python,
+  not with a broker-side pattern.
+- **Locks and waits.** `file_lock("redis")` / `file_lock("kafka")`, also used by doctor.
+  `ensure_server` waits up to 90 s: `redis-cli PING` answers PONG; Kafka answers
+  `kafka-broker-api-versions.sh --bootstrap-server localhost:9092`.
+- **Template values.** `redis.url` is `redis://<container>:6379/0` for `compose` and
+  `redis://127.0.0.1:<WT_REDIS_PORT>/0` for `run`; `kafka.bootstrap` is `<container>:9092` for
+  `compose` and `127.0.0.1:<WT_KAFKA_PORT>` for `run`.
