@@ -38,12 +38,13 @@ def cfg(**shared: object) -> Config:
     )
 
 
-def test_registry_has_only_postgres_so_far() -> None:
-    assert set(providers.REGISTRY) == {"postgres"}
+def test_registry_has_postgres_and_redis_so_far() -> None:
+    assert set(providers.REGISTRY) == {"postgres", "redis"}
     assert [p.name for p in providers.active(cfg(postgres={"databases": ["shop"]}), print)] == [
         "postgres"
     ]
     assert providers.active(cfg(), print) == []
+    assert [p.name for p in providers.active(cfg(redis={}), print)] == ["redis"]
 
 
 def test_active_returns_only_registered_and_configured(monkeypatch: pytest.MonkeyPatch) -> None:

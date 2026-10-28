@@ -6,7 +6,7 @@ import pytest
 from wt import compose, doctor, host, proc, router
 from wt.config import STARTER, LoadedConfig, load_config
 from wt.errors import WtError
-from wt.providers import postgres
+from wt.providers import postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
 
 OK = proc.Result(0, "", "")
@@ -245,6 +245,62 @@ def test_postgres_closed_databases_fail_then_fix(monkeypatch: pytest.MonkeyPatch
     assert fake.repaired == 1
 
 
+class RedisFake:
+    """Stands in for the container and the server start."""
+
+    def __init__(self, *, running: bool) -> None:
+        self.running = running
+        self.ensured = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def run(args: list[str], **kw: object) -> proc.Result:
+            return proc.Result(0, "true\n" if self.running else "false\n", "")
+
+        def ensure() -> None:
+            self.ensured += 1
+            self.running = True
+
+        monkeypatch.setattr(proc, "run", run)
+        monkeypatch.setattr(redis, "ensure_server", ensure)
+
+
+def test_redis_running_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = RedisFake(running=True)
+    fake.install(monkeypatch)
+    check = doctor.check_redis(fix=False)
+    assert check.level == "ok"
+    assert fake.ensured == 0
+
+
+def test_redis_down_fails_with_hint_without_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = RedisFake(running=False)
+    fake.install(monkeypatch)
+    check = doctor.check_redis(fix=False)
+    assert check.level == "fail"
+    assert "wt doctor --fix" in check.hint
+    assert fake.ensured == 0
+
+
+def test_redis_fix_starts_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = RedisFake(running=False)
+    fake.install(monkeypatch)
+    check = doctor.check_redis(fix=True)
+    assert fake.ensured == 1
+    assert check.level == "ok"
+
+
+def test_redis_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    RedisFake(running=False).install(monkeypatch)
+
+    def boom() -> None:
+        raise WtError("compose failed\nmore")
+
+    monkeypatch.setattr(redis, "ensure_server", boom)
+    check = doctor.check_redis(fix=True)
+    assert check.level == "fail"
+    assert check.detail == "compose failed"
+
+
 def _loaded(make_repo, with_postgres: bool) -> LoadedConfig:
     shared = "shared:\n  postgres:\n    databases: [shop]\n" if with_postgres else ""
     repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
@@ -271,6 +327,30 @@ def test_run_checks_only_checks_postgres_when_configured(
     names = [c.name for c in doctor.run_checks(loaded, None, fix=False)]
     assert ("pg" in names) is with_postgres
     assert calls == ([["shop"]] if with_postgres else [])
+
+
+@pytest.mark.parametrize("with_redis", [False, True])
+def test_run_checks_only_checks_redis_when_configured(
+    monkeypatch: pytest.MonkeyPatch, make_repo, with_redis: bool
+) -> None:
+    shared = "shared:\n  redis:\n    prefix: true\n" if with_redis else ""
+    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
+    loaded = load_config(repo / "worktree.yaml")
+    calls: list[bool] = []
+    monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
+    monkeypatch.setattr(doctor, "check_tls", lambda fix: doctor.Check("mkcert", "ok", ""))
+    monkeypatch.setattr(doctor, "check_routing", lambda fix: [])
+    monkeypatch.setattr(doctor, "check_resolution", lambda d: doctor.Check("resolver", "ok", ""))
+
+    def fake_redis(*, fix: bool) -> doctor.Check:
+        calls.append(fix)
+        return doctor.Check("redis", "ok", "")
+
+    monkeypatch.setattr(doctor, "check_redis", fake_redis)
+    names = [c.name for c in doctor.run_checks(loaded, None, fix=True)]
+    assert ("redis" in names) is with_redis
+    assert calls == ([True] if with_redis else [])
 
 
 def _record_process(port: int | None) -> None:
