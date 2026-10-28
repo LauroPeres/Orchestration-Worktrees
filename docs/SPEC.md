@@ -711,7 +711,9 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
 - **Destroy is exact.** Deleting branch `feat` never touches `feat-x:*` keys or `feat-x.*` topics:
   the Redis pattern ends with `:`, and Kafka topics are matched on the exact prefix in Python,
   not with a broker-side pattern. `destroy` also cleans the prefix or group names recorded in the
-  branch state when the config no longer enables them (only names wt recorded itself).
+  branch state when the config no longer enables them (only names wt recorded itself). A Kafka
+  group that still has a live consumer is not deleted (the tool exits 0 and prints
+  `GroupNotEmptyException`): `destroy` logs a warning naming the group and does not abort `down`.
 - **Locks and waits.** `file_lock("redis")` / `file_lock("kafka")`, also used by doctor.
   `ensure_server` waits for the server (Redis 60 s, Kafka 90 s, each for `up --wait` and again for
   readiness): `redis-cli PING` answers PONG; Kafka answers
