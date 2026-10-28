@@ -100,3 +100,11 @@ A key prints nothing until its first event.
 `wt down feat/cart` removes only the `feat-cart:` Redis keys, the `worker-feat-cart` consumer group
 and the `feat-cart.*` topics. The `main` keys, group and topics stay. Redis and Kafka have no base
 branch, so `wt down main` cleans `main`'s slice the same way.
+
+## 7. Sign in (Keycloak)
+
+The web page shows a "Sign in" link to the shared Keycloak. It uses the branch's own client
+(`web-main`, `web-feat-cart`) and sends the page's own address as the redirect URI, so it opens the
+Keycloak login form only because `wt up` registered that redirect URI for that branch. Nothing is
+enforced: the page keeps no session and handles no token. Add users in the Keycloak console (see
+[Keycloak per branch](../../README.md#keycloak-per-branch-sharedkeycloak)).

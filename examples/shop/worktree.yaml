@@ -32,6 +32,10 @@ services:
     env:
       API_URL: "{{ services.api.url }}"
       BRANCH: "{{ branch }}"
+      PUBLIC_URL: "{{ services.web.url }}"   # this page's own address, for the sign-in redirect
+      KEYCLOAK_URL: "{{ keycloak.url }}"
+      KEYCLOAK_REALM: "{{ keycloak.realm }}"
+      KEYCLOAK_CLIENT_ID: "{{ keycloak.client_id }}"
 shared:
   postgres:
     databases: [shop]
@@ -41,3 +45,4 @@ shared:
     groups: [worker]
     topic_prefix: true
   redis: {}
+  keycloak: { realm: shop, client: web }

@@ -6,6 +6,9 @@ import shutil
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -16,7 +19,7 @@ from wt import compose, health, router
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
-from wt.providers import kafka, postgres, redis
+from wt.providers import kafka, keycloak, postgres, redis
 
 pytestmark = pytest.mark.docker
 
@@ -63,6 +66,7 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrat
     monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
     monkeypatch.setenv("WT_REDIS_PORT", str(free_port()))
     monkeypatch.setenv("WT_KAFKA_PORT", str(free_port()))
+    monkeypatch.setenv("WT_KEYCLOAK_PORT", str(free_port()))
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/local/bin")  # no mkcert: self-signed path
 
     stack = tmp_path / "stack"
@@ -85,8 +89,17 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrat
             postgres.container(),
             redis.container(),
             kafka.container(),
+            keycloak.container(),
         )
-        docker("volume", "rm", "-f", postgres.volume(), redis.volume(), kafka.volume())
+        docker(
+            "volume",
+            "rm",
+            "-f",
+            postgres.volume(),
+            redis.volume(),
+            kafka.volume(),
+            keycloak.volume(),
+        )
         docker("network", "rm", compose.network_name())
         # Compose names built images `<compose project>-<service>`, and the project embeds the
         # unique instance name, so this only matches images this test built.
@@ -106,7 +119,11 @@ def up(orch: Orchestrator, branch: str, monkeypatch: pytest.MonkeyPatch) -> None
         monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
         monkeypatch.setenv("WT_REDIS_PORT", str(free_port()))
         monkeypatch.setenv("WT_KAFKA_PORT", str(free_port()))
-        docker("rm", "-f", "-v", postgres.container(), redis.container(), kafka.container())
+        monkeypatch.setenv("WT_KEYCLOAK_PORT", str(free_port()))
+        docker(
+            "rm", "-f", "-v",
+            postgres.container(), redis.container(), kafka.container(), keycloak.container(),
+        )  # fmt: skip
         reports = orch.up(branch, timeout=180)
     assert {r.service: r.outcome for r in reports} == {"api": "ok", "web": "ok", "worker": "ok"}, (
         reports
@@ -119,6 +136,28 @@ def redis_cli(*args: str) -> str:
 
 def kafka_list(script: str) -> list[str]:
     return kafka.tool(script, "--list").stdout.split()
+
+
+def keycloak_clients() -> dict[str, list[str]]:
+    out = keycloak.kcadm("get", "clients", "-r", "shop", "--fields", "clientId,redirectUris")
+    return {r["clientId"]: r["redirectUris"] for r in json.loads(out.stdout)}
+
+
+def http_get(url: str) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return int(resp.status), resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def page_body(host: str) -> str:
+    conn = health._LoopbackHTTPS(host, router.https_port(), 10.0)
+    try:
+        conn.request("GET", "/", headers={"Host": host})
+        return conn.getresponse().read().decode()
+    finally:
+        conn.close()
 
 
 def wait_counter(key: str, expected: str, timeout: float = 60.0) -> str:
@@ -161,7 +200,34 @@ def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.Monk
     assert "worker-feat-cart" in kafka_list("kafka-consumer-groups.sh")
     assert "feat-cart.items" in kafka_list("kafka-topics.sh")
 
+    # Keycloak: one client per branch, each with its own redirect URI, and a working login page.
+    port = router.https_port()
+    cart_web = f"https://feat-cart.{domain}:{port}"
+    clients = keycloak_clients()
+    assert set(clients["web-main"]) == {
+        f"https://main.{domain}:{port}/*",
+        f"https://api.main.{domain}:{port}/*",
+    }
+    assert f"{cart_web}/*" in clients["web-feat-cart"]
+    query = urllib.parse.urlencode(
+        {
+            "client_id": "web-feat-cart",
+            "redirect_uri": cart_web + "/",
+            "response_type": "code",
+            "scope": "openid",
+        }
+    )
+    status, login = http_get(f"{keycloak.url()}/realms/shop/protocol/openid-connect/auth?{query}")
+    assert status == 200
+    assert "kc-form-login" in login or 'name="username"' in login
+    assert "client_id=web-feat-cart" in page_body(f"feat-cart.{domain}")
+
     shop.down("feat/cart")
+    clients = keycloak_clients()
+    assert "web-feat-cart" not in clients
+    assert "web-main" in clients
+    realms = json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout)
+    assert "shop" in [r["realm"] for r in realms]
     assert not health.probe(cart_api, "/healthz", router.https_port()).ok
     assert health.probe(main_api, "/healthz", router.https_port()).ok
     assert health.probe(f"main.{domain}", "/", router.https_port()).ok
