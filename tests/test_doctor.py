@@ -6,7 +6,7 @@ import pytest
 from wt import compose, doctor, host, proc, router
 from wt.config import STARTER, LoadedConfig, load_config
 from wt.errors import WtError
-from wt.providers import postgres, redis
+from wt.providers import kafka, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
 
 OK = proc.Result(0, "", "")
@@ -301,6 +301,62 @@ def test_redis_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     assert check.detail == "compose failed"
 
 
+class KafkaFake:
+    """Stands in for the container and the server start."""
+
+    def __init__(self, *, running: bool) -> None:
+        self.running = running
+        self.ensured = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def run(args: list[str], **kw: object) -> proc.Result:
+            return proc.Result(0, "true\n" if self.running else "false\n", "")
+
+        def ensure() -> None:
+            self.ensured += 1
+            self.running = True
+
+        monkeypatch.setattr(proc, "run", run)
+        monkeypatch.setattr(kafka, "ensure_server", ensure)
+
+
+def test_kafka_running_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = KafkaFake(running=True)
+    fake.install(monkeypatch)
+    check = doctor.check_kafka(fix=False)
+    assert check.level == "ok"
+    assert fake.ensured == 0
+
+
+def test_kafka_down_fails_with_hint_without_fix(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = KafkaFake(running=False)
+    fake.install(monkeypatch)
+    check = doctor.check_kafka(fix=False)
+    assert check.level == "fail"
+    assert "wt doctor --fix" in check.hint
+    assert fake.ensured == 0
+
+
+def test_kafka_fix_starts_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = KafkaFake(running=False)
+    fake.install(monkeypatch)
+    check = doctor.check_kafka(fix=True)
+    assert fake.ensured == 1
+    assert check.level == "ok"
+
+
+def test_kafka_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    KafkaFake(running=False).install(monkeypatch)
+
+    def boom() -> None:
+        raise WtError("compose failed\nmore")
+
+    monkeypatch.setattr(kafka, "ensure_server", boom)
+    check = doctor.check_kafka(fix=True)
+    assert check.level == "fail"
+    assert check.detail == "compose failed"
+
+
 def _loaded(make_repo, with_postgres: bool) -> LoadedConfig:
     shared = "shared:\n  postgres:\n    databases: [shop]\n" if with_postgres else ""
     repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
@@ -351,6 +407,30 @@ def test_run_checks_only_checks_redis_when_configured(
     names = [c.name for c in doctor.run_checks(loaded, None, fix=True)]
     assert ("redis" in names) is with_redis
     assert calls == ([True] if with_redis else [])
+
+
+@pytest.mark.parametrize("with_kafka", [False, True])
+def test_run_checks_only_checks_kafka_when_configured(
+    monkeypatch: pytest.MonkeyPatch, make_repo, with_kafka: bool
+) -> None:
+    shared = "shared:\n  kafka:\n    groups: [worker]\n" if with_kafka else ""
+    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
+    loaded = load_config(repo / "worktree.yaml")
+    calls: list[bool] = []
+    monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
+    monkeypatch.setattr(doctor, "check_tls", lambda fix: doctor.Check("mkcert", "ok", ""))
+    monkeypatch.setattr(doctor, "check_routing", lambda fix: [])
+    monkeypatch.setattr(doctor, "check_resolution", lambda d: doctor.Check("resolver", "ok", ""))
+
+    def fake_kafka(*, fix: bool) -> doctor.Check:
+        calls.append(fix)
+        return doctor.Check("kafka", "ok", "")
+
+    monkeypatch.setattr(doctor, "check_kafka", fake_kafka)
+    names = [c.name for c in doctor.run_checks(loaded, None, fix=True)]
+    assert ("kafka" in names) is with_kafka
+    assert calls == ([True] if with_kafka else [])
 
 
 def _record_process(port: int | None) -> None:

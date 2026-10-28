@@ -20,8 +20,8 @@ def test_unknown_name_is_an_error() -> None:
 
 
 def test_upcoming_provider_hint() -> None:
-    with pytest.raises(WtError, match=r"kafka provider arrives in v0\.4"):
-        render("{{ kafka.topic('orders') }}", {}, "env.TOPIC")
+    with pytest.raises(WtError, match=r"keycloak provider arrives in v0\.5"):
+        render("{{ keycloak.realm }}", {}, "env.TOPIC")
 
 
 def test_sandbox_blocks_internals() -> None:
