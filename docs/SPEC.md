@@ -160,7 +160,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
-| v0.5 | Keycloak provider (SSO across branch subdomains) |
+| v0.5 (in progress, §19) | Keycloak provider (SSO across branch subdomains) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
 ## 11. Clean-room rules
@@ -233,7 +233,7 @@ base branch and the state handle. `Provider.template_vars` takes a second argume
 `kind: "compose" | "run"`, so a provider can give a different address per service kind. Every
 other method keeps the §6 signature.
 
-**Active providers.** Only `postgres` runs (changed by §18: `redis` runs from v0.4, `kafka` too).
+**Active providers.** Only `postgres` runs (changed by §18 and §19: `redis` and `kafka` run from v0.4, `keycloak` from v0.5).
 `kafka`, `redis` and `keycloak` under `shared:` stay
 as in v0.1: validated, ignored with a note in `up`, and their template names (`{{ kafka... }}`)
 fail with the "arrives in v0.4/v0.5" message.
@@ -721,3 +721,52 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
 - **Template values.** `redis.url` is `redis://<container>:6379/0` for `compose` and
   `redis://127.0.0.1:<WT_REDIS_PORT>/0` for `run`; `kafka.bootstrap` is `<container>:9092` for
   `compose` and `127.0.0.1:<WT_KAFKA_PORT>` for `run`.
+
+## 19. v0.5: Keycloak provider (one shared realm, one client per branch)
+
+Decided at the start of v0.5 (2026-10-28). Builds on §6, §14 and §18. The config shape of §4
+stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A-Za-z0-9._-]+$`.
+
+**Decisions**
+- **Server.** Container `<instance>-keycloak` (`wt-keycloak`) from the official
+  `quay.io/keycloak/keycloak`, pinned to `26.8.1` (`WT_KEYCLOAK_IMAGE` overrides), running
+  `start-dev` with the named volume `<instance>-keycloak-data` (H2 file database) on the shared
+  `wt` network, published on `127.0.0.1:58080` (`WT_KEYCLOAK_PORT`). The bootstrap admin is `admin`
+  with a password generated once into `~/.wt/keycloak/password` (mode 0600) and passed as
+  `KC_BOOTSTRAP_ADMIN_USERNAME` / `KC_BOOTSTRAP_ADMIN_PASSWORD`. `KC_HOSTNAME` is
+  `http://localhost:<port>`, `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true` and `KC_HTTP_ENABLED=true`.
+- **Operations.** Everything goes through `kcadm.sh` inside the container (the image has bash but
+  no `curl`); no new Python dependency. Each call is one `docker exec <container> bash -c
+  '<script>' kcadm <args...>` whose script logs in with `$KC_BOOTSTRAP_ADMIN_*` from the
+  container environment into a unique temporary config file (removed on exit) and then runs
+  `kcadm.sh "$@"`. User values are positional arguments, never part of the script, and the admin
+  password never appears on the host command line.
+- **Readiness.** No compose healthcheck. `ensure_server` waits for `up --wait` (running), then
+  polls a `kcadm` login (`get realms/master`) for up to 120 s (a fresh start logs in after about
+  17 s). If the password file is gone but the volume is not, the login keeps failing and the
+  error names `~/.wt/keycloak/password` and the volume.
+- **Realm.** `ensure_server` creates the shared realm if missing (`realm=<realm> enabled=true
+  sslRequired=none`; `create realms` exits 1 with "already exists", which counts as done). wt
+  never deletes the realm and never creates users, roles or identity providers; the user adds
+  users in the console at `http://localhost:<port>` with the generated admin password.
+- **Client per branch.** `clientId = <client>-<branch-slug>`: a public client, standard flow, PKCE
+  allowed but not enforced (apps should still send it). `redirectUris` is `<url>/*` and
+  `webOrigins` is `<url>` for every routed service of the branch that is selected (§17), where
+  `<url>` is the service URL including the HTTPS port when it is not 443. `create` is idempotent:
+  it looks the client up by exact `clientId` (matched in Python, never by prefix) and then
+  creates or updates it. The id of a new client is on stdout, quoted (`Created new client with
+  id '<uuid>'`).
+- **Verify and destroy.** `verify`: the client exists with exactly the rendered redirect URIs and
+  the realm answers. `destroy`: delete only this branch's client; branch `feat` never touches
+  `feat-x`. The realm and its users stay. Resources are recorded as `["<realm>/<clientId>"]` so
+  `down` works even after `shared.keycloak` leaves the config.
+- **Template values.** `keycloak.url` (`http://localhost:<port>`), `keycloak.issuer`
+  (`<url>/realms/<realm>`, the same for every branch: one login works across the branch
+  subdomains), `keycloak.realm`, `keycloak.client_id` and `keycloak.internal_url`
+  (`http://<container>:8080` for `compose`, the same as `url` for `run`).
+- **Provider context.** `BranchContext` gets `urls: tuple[str, ...] = ()`, filled by the
+  orchestrator with the URL of every selected routed service, so providers see the HTTPS port.
+- **doctor.** One check for the Keycloak container, `--fix` starts it, under `file_lock("keycloak")`.
+- **`examples/shop`** gets `shared.keycloak: {realm: shop, client: web}` and a "Sign in" link on the
+  web page built from `KEYCLOAK_URL`, `KEYCLOAK_REALM` and `KEYCLOAK_CLIENT_ID`. It enforces
+  nothing; it proves the per-branch client and redirect URI.
