@@ -12,6 +12,18 @@ services:
       DATABASE_URL: "{{ postgres.url('shop') }}"
       BRANCH: "{{ branch }}"
       WEB_ORIGIN: "{{ services.web.url }}"   # for CORS
+      KAFKA_BOOTSTRAP: "{{ kafka.bootstrap }}"
+      KAFKA_TOPIC: "{{ kafka.topic('items') }}"
+  worker:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: worker
+    env:
+      KAFKA_BOOTSTRAP: "{{ kafka.bootstrap }}"
+      KAFKA_GROUP: "{{ kafka.group('worker') }}"
+      KAFKA_TOPIC: "{{ kafka.topic('items') }}"
+      REDIS_URL: "{{ redis.url }}"
+      REDIS_PREFIX: "{{ redis.prefix }}"
   web:
     repo: web
     run: python3 server.py --port {{ port }}
@@ -25,3 +37,7 @@ shared:
     databases: [shop]
     strategy: template
     verify: true
+  kafka:
+    groups: [worker]
+    topic_prefix: true
+  redis: {}

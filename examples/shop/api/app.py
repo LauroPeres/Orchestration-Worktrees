@@ -1,11 +1,14 @@
 """Tiny shop API: items in Postgres. Fictional example for wt."""
 
+import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import psycopg
+from confluent_kafka import Producer
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
@@ -14,6 +17,24 @@ from pydantic import BaseModel
 DATABASE_URL = os.environ["DATABASE_URL"]
 BRANCH = os.environ.get("BRANCH", "unknown")
 WEB_ORIGIN = os.environ.get("WEB_ORIGIN", "")
+KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "")
+KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "")
+
+log = logging.getLogger("shop.api")
+producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP}) if KAFKA_BOOTSTRAP else None
+
+
+def publish_event(name: str) -> None:
+    """Publish an item event; a failure is logged and never breaks the request."""
+    if producer is None or not KAFKA_TOPIC:
+        return
+    try:
+        payload = json.dumps({"item": name, "branch": BRANCH})
+        producer.produce(KAFKA_TOPIC, payload.encode())
+        if producer.flush(5) > 0:
+            log.warning("event not delivered to %s", KAFKA_TOPIC)
+    except Exception:
+        log.exception("could not publish event")
 
 
 def connect() -> psycopg.Connection:
@@ -75,4 +96,5 @@ def create_item(item: NewItem) -> dict:
         row = conn.execute(
             "INSERT INTO items (name) VALUES (%s) RETURNING id, name", (item.name,)
         ).fetchone()
+    publish_event(item.name)
     return row or {}

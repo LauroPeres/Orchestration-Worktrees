@@ -5,6 +5,7 @@ import json
 import shutil
 import socket
 import subprocess
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,7 @@ from wt import compose, health, router
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
-from wt.providers import postgres
+from wt.providers import kafka, postgres, redis
 
 pytestmark = pytest.mark.docker
 
@@ -60,6 +61,8 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrat
     monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
     monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
     monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
+    monkeypatch.setenv("WT_REDIS_PORT", str(free_port()))
+    monkeypatch.setenv("WT_KAFKA_PORT", str(free_port()))
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/local/bin")  # no mkcert: self-signed path
 
     stack = tmp_path / "stack"
@@ -74,8 +77,16 @@ def shop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Orchestrat
         for branch in list(orch.store.load().branches):
             with contextlib.suppress(WtError):
                 orch.down(branch, force=True)
-        docker("rm", "-f", "-v", router.container(), postgres.container())
-        docker("volume", "rm", "-f", postgres.volume())
+        docker(
+            "rm",
+            "-f",
+            "-v",
+            router.container(),
+            postgres.container(),
+            redis.container(),
+            kafka.container(),
+        )
+        docker("volume", "rm", "-f", postgres.volume(), redis.volume(), kafka.volume())
         docker("network", "rm", compose.network_name())
         # Compose names built images `<compose project>-<service>`, and the project embeds the
         # unique instance name, so this only matches images this test built.
@@ -93,9 +104,30 @@ def up(orch: Orchestrator, branch: str, monkeypatch: pytest.MonkeyPatch) -> None
         monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
         monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
         monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
-        docker("rm", "-f", "-v", postgres.container())
+        monkeypatch.setenv("WT_REDIS_PORT", str(free_port()))
+        monkeypatch.setenv("WT_KAFKA_PORT", str(free_port()))
+        docker("rm", "-f", "-v", postgres.container(), redis.container(), kafka.container())
         reports = orch.up(branch, timeout=180)
-    assert {r.service: r.outcome for r in reports} == {"api": "ok", "web": "ok"}, reports
+    assert {r.service: r.outcome for r in reports} == {"api": "ok", "web": "ok", "worker": "ok"}, (
+        reports
+    )
+
+
+def redis_cli(*args: str) -> str:
+    return docker("exec", redis.container(), "redis-cli", *args).stdout.strip()
+
+
+def kafka_list(script: str) -> list[str]:
+    return kafka.tool(script, "--list").stdout.split()
+
+
+def wait_counter(key: str, expected: str, timeout: float = 60.0) -> str:
+    deadline = time.monotonic() + timeout
+    value = redis_cli("GET", key)
+    while value != expected and time.monotonic() < deadline:
+        time.sleep(1)
+        value = redis_cli("GET", key)
+    return value
 
 
 def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,7 +153,23 @@ def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.Monk
     for slug in ("main", "feat-cart"):
         assert health.probe(f"{slug}.{domain}", "/", router.https_port()).detail == "HTTP 200"
 
+    # Events: each POST reaches the branch's worker through its own topic and group.
+    request(cart_api, "POST", "/items", {"name": "plug", "quantity": 1})
+    request(main_api, "POST", "/items", {"name": "lamp"})
+    assert wait_counter("main:events", "1") == "1"
+    assert wait_counter("feat-cart:events", "2") == "2"
+    assert "worker-feat-cart" in kafka_list("kafka-consumer-groups.sh")
+    assert "feat-cart.items" in kafka_list("kafka-topics.sh")
+
     shop.down("feat/cart")
     assert not health.probe(cart_api, "/healthz", router.https_port()).ok
     assert health.probe(main_api, "/healthz", router.https_port()).ok
     assert health.probe(f"main.{domain}", "/", router.https_port()).ok
+
+    assert redis_cli("KEYS", "feat-cart:*") == ""
+    assert redis_cli("GET", "main:events") == "1"
+    assert "worker-feat-cart" not in kafka_list("kafka-consumer-groups.sh")
+    assert "worker-main" in kafka_list("kafka-consumer-groups.sh")
+    topics = kafka_list("kafka-topics.sh")
+    assert not [t for t in topics if t.startswith("feat-cart.")]
+    assert "main.items" in topics

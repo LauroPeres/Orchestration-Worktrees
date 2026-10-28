@@ -689,9 +689,10 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
   consumer groups and every topic with the branch prefix; safe when none exist.
 - **doctor.** One check per configured provider (container running, answers), and `--fix` starts
   it, as for Postgres.
-- **`examples/shop`** gets a `worker` (host process): the api publishes a `cart` event, the worker
+- **`examples/shop`** gets a `worker`, a compose service of the `api` repo (so it joins the `wt`
+  network and reaches `wt-kafka` and `wt-redis`). `POST /items` publishes an item event; the worker
   consumes it with `kafka.group('worker')` and counts events per branch in Redis under
-  `redis.prefix`. Its own requirements file holds the client libraries; `wt` itself does not.
+  `redis.prefix`. The client libraries are installed in the api Dockerfile; `wt` itself has none.
 - **README.** An architecture diagram in Mermaid (no GIF, no image file) and a Benchmarks section
   with numbers measured from `examples/shop` on the author's machine, with the exact command. A
   number that cannot be measured is left out (CLAUDE.md "Numbers").

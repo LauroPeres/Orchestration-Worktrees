@@ -6,3 +6,12 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  worker:
+    build: .
+    command: ["python", "worker.py"]
+    healthcheck:
+      # No HTTP port: the worker touches this file every poll; unhealthy if it goes stale.
+      test: ["CMD", "sh", "-c", "test -n \"$(find /tmp/worker-heartbeat -mmin -1 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
