@@ -38,18 +38,21 @@ def cfg(**shared: object) -> Config:
     )
 
 
-def test_registry_has_postgres_redis_and_kafka_so_far() -> None:
-    assert set(providers.REGISTRY) == {"postgres", "redis", "kafka"}
+def test_registry_has_the_builtin_providers() -> None:
+    assert set(providers.REGISTRY) == {"postgres", "redis", "kafka", "keycloak"}
     assert [p.name for p in providers.active(cfg(postgres={"databases": ["shop"]}), print)] == [
         "postgres"
     ]
     assert providers.active(cfg(), print) == []
     assert [p.name for p in providers.active(cfg(redis={}), print)] == ["redis"]
+    keycloak = cfg(keycloak={"realm": "r", "client": "c"})
+    assert [p.name for p in providers.active(keycloak, print)] == ["keycloak"]
 
 
 def test_active_returns_only_registered_and_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(providers.REGISTRY, "postgres", lambda c, log: Dummy())
     assert providers.active(cfg(), print) == []
+    monkeypatch.delitem(providers.REGISTRY, "keycloak")
     assert providers.active(cfg(keycloak={"realm": "r", "client": "c"}), print) == []
     found = providers.active(
         cfg(postgres={"databases": ["shop"]}, keycloak={"realm": "r", "client": "c"}), print

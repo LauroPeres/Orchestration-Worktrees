@@ -92,6 +92,9 @@ def test_starter_examples_validate_when_uncommented(tmp_path: Path) -> None:
         (with_service(typo=1), "typo"),
         ({**BASE, "project": "Shop"}, "project"),
         ({**BASE, "domain": "localhost"}, "domain"),
+        ({**BASE, "shared": {"keycloak": {"realm": "a/b", "client": "web"}}}, "realm"),
+        ({**BASE, "shared": {"keycloak": {"realm": "shop", "client": "we b"}}}, "client"),
+        ({**BASE, "shared": {"keycloak": {"realm": "", "client": "web"}}}, "realm"),
     ],
 )
 def test_rejects_invalid(tmp_path: Path, data: dict[str, Any], message: str) -> None:
@@ -157,3 +160,19 @@ def test_needs_unknown() -> None:
 def test_needs_cycle_message() -> None:
     with pytest.raises(ValueError, match="a -> b -> a"):
         Config.model_validate(_needs(a=["b"], b=["a"]))
+
+
+@pytest.mark.parametrize("bad", ["-x", ".", "..", ".hidden"])
+def test_keycloak_realm_and_client_reject_dash_or_dot_first(tmp_path: Path, bad: str) -> None:
+    for key in ("realm", "client"):
+        keycloak = {"realm": "shop", "client": "web", key: bad}
+        data = {**BASE, "shared": {"keycloak": keycloak}}
+        with pytest.raises(WtError, match=key):
+            load_config(write(tmp_path, data))
+
+
+def test_keycloak_realm_and_client_accept_dots_dashes_and_case(tmp_path: Path) -> None:
+    data = {**BASE, "shared": {"keycloak": {"realm": "Shop.v1_x-2", "client": "Web-App"}}}
+    cfg = load_config(write(tmp_path, data)).config
+    assert cfg.shared.keycloak is not None
+    assert cfg.shared.keycloak.realm == "Shop.v1_x-2"

@@ -18,6 +18,10 @@ PROJECT = r"^[a-z][a-z0-9-]{0,30}$"
 LABEL = r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)?$"  # one DNS label, or "" for the root
 DOMAIN = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
 
+# realm and client id: no "/" (recorded as "<realm>/<id>"), no leading "-" or "." (not an option
+# or a "." / ".." path segment for kcadm)
+KEYCLOAK_NAME = r"^[A-Za-z0-9_][A-Za-z0-9._-]*$"
+
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -73,8 +77,8 @@ class Redis(Strict):
 
 
 class Keycloak(Strict):
-    realm: str
-    client: str
+    realm: str = Field(pattern=KEYCLOAK_NAME)
+    client: str = Field(pattern=KEYCLOAK_NAME)
 
 
 class Shared(Strict):
