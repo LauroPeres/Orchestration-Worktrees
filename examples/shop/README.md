@@ -34,9 +34,10 @@ wt up main
 wt up feat/cart
 ```
 
-Each `wt up` starts the API in Docker, the Postgres database cloned from the template, and the web
-page as a host process. The `feat/cart` database is cloned from `main`, so the first `wt up` of a
-branch may briefly drop the connections of the base branch's app during the clone.
+Each `wt up` starts the API and the worker in Docker, the Postgres database cloned from the template,
+and the web page as a host process. The shared Kafka and Redis containers (`wt-kafka`, `wt-redis`)
+start with the first `wt up`. The `feat/cart` database is cloned from `main`, so the first `wt up` of
+a branch may briefly drop the connections of the base branch's app during the clone.
 
 ## 3. Open the URLs
 
@@ -61,8 +62,41 @@ also means it listens on every network interface of your machine, not only on lo
 
 ```bash
 wt ls                # both branches with their URLs, health, kinds and databases
-wt down feat/cart    # removes its containers, process, route, certificate, database and worktrees
+wt down feat/cart    # removes its containers, process, route, certificate, database,
+                     # worktrees, Kafka group and topics, and Redis keys
 ```
 
 After `wt down feat/cart`, `https://main.shop.localhost` still works. You can run `wt up feat/cart`
 again to bring it back.
+
+## 6. Events and the worker
+
+Each `POST /items` publishes an event to the Kafka topic `<slug>.items`, for example `main.items`
+or `feat-cart.items`. A Kafka failure is logged and does not fail the request.
+
+The `worker` service is a compose service of the `api` repo (same image, `python worker.py`). It
+joins the consumer group `worker-<slug>` and, for each event, does two things in Redis:
+
+- `INCR <slug>:events`, the counter
+- `SET <slug>:last`, the name of the last item
+
+Add an item on each branch (add `-k` to `curl` if you use the self-signed certificate):
+
+```bash
+curl -X POST https://api.main.shop.localhost/items -H 'Content-Type: application/json' -d '{"name": "lamp"}'
+curl -X POST https://api.feat-cart.shop.localhost/items -H 'Content-Type: application/json' -d '{"name": "lamp"}'
+```
+
+Read the counters. Each branch has its own prefix (`main:` and `feat-cart:`):
+
+```bash
+docker exec wt-redis redis-cli GET main:events
+docker exec wt-redis redis-cli GET feat-cart:events
+docker exec wt-redis redis-cli GET feat-cart:last
+```
+
+A key prints nothing until its first event.
+
+`wt down feat/cart` removes only the `feat-cart:` Redis keys, the `worker-feat-cart` consumer group
+and the `feat-cart.*` topics. The `main` keys, group and topics stay. Redis and Kafka have no base
+branch, so `wt down main` cleans `main`'s slice the same way.
