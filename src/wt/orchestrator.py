@@ -180,7 +180,8 @@ class Orchestrator:
     def provider_context(self, names: Names) -> BranchContext:
         pg = self.cfg.shared.postgres
         base = pg.base_branch if pg is not None else "main"
-        return BranchContext(names, names.branch, base, self.store)
+        urls = tuple(u for s in self.cfg.services.values() if (u := self.service_url(names, s)))
+        return BranchContext(names, names.branch, base, self.store, urls)
 
     def template_context(
         self, names: Names, svc: Service, ports: dict[str, int] | None = None

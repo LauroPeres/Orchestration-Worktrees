@@ -15,6 +15,7 @@ class BranchContext:
     branch: str
     base_branch: str
     state: StateStore
+    urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
