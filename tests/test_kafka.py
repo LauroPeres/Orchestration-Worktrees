@@ -246,6 +246,24 @@ def test_destroy_tolerates_missing_group(fake: FakeProc) -> None:
     provider().destroy(ctx())
 
 
+def test_destroy_warns_when_a_consumer_is_still_connected(fake: FakeProc) -> None:
+    fake.on(
+        "kafka-consumer-groups.sh",
+        proc.Result(
+            0,
+            "Error: Deletion of some consumer groups failed:\n"
+            "* Group 'worker-feat-cart' could not be deleted due to: "
+            "java.util.concurrent.ExecutionException: "
+            "org.apache.kafka.common.errors.GroupNotEmptyException: The group is not empty.\n",
+            "",
+        ),
+    )
+    messages: list[str] = []
+    KafkaProvider(config(), messages.append).destroy(ctx())
+    assert len(messages) == 1
+    assert "worker-feat-cart" in messages[0] and "consumer is still connected" in messages[0]
+
+
 def test_destroy_raises_on_other_group_errors(fake: FakeProc) -> None:
     fake.on("kafka-consumer-groups.sh", proc.Result(1, "", "connection refused"))
     with pytest.raises(proc.CommandError):

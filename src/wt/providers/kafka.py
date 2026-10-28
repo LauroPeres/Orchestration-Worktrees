@@ -192,7 +192,13 @@ class KafkaProvider:
 
     def _delete_group(self, group: str) -> None:
         result = tool("kafka-consumer-groups.sh", "--delete", "--group", group, check=False)
-        if not result.ok and "does not exist" not in f"{result.stdout}{result.stderr}":
+        output = f"{result.stdout}{result.stderr}"
+        if "GroupNotEmpty" in output:
+            # The tool exits 0 here; a live consumer keeps the group, so warn, never abort `down`.
+            self.log(
+                f"warning: consumer group {group} was not deleted: a consumer is still connected"
+            )
+        elif not result.ok and "does not exist" not in output:
             raise proc.CommandError(
                 ["kafka-consumer-groups.sh", "--delete", "--group", group], result
             )

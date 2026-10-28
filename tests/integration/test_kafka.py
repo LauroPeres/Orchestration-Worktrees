@@ -181,3 +181,49 @@ def test_without_topic_prefix_destroy_deletes_only_groups(server: str) -> None:
     assert "orders-feat-cart" not in groups()
     assert "shared-topic" in topics()
     kafka.tool("kafka-topics.sh", "--delete", "--topic", "shared-topic")
+
+
+def test_destroy_warns_while_a_consumer_holds_the_group(server: str) -> None:
+    provider, ctx = make("feat/held", topic_prefix=False)
+    messages: list[str] = []
+    provider.log = messages.append
+    group = provider.group("orders", ctx)
+    topic = "held-topic"
+    kafka.tool("kafka-topics.sh", "--create", "--topic", topic, check=True)
+    consumer = subprocess.Popen(
+        [
+            "docker",
+            "exec",
+            kafka.container(),
+            f"{kafka.BIN}/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            kafka.BOOTSTRAP,
+            "--topic",
+            topic,
+            "--group",
+            group,
+            "--timeout-ms",
+            "20000",  # exits by itself once idle: docker exec cannot kill the in-container JVM
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while group not in groups() and time.monotonic() < deadline:
+            time.sleep(1)
+        assert group in groups()
+        time.sleep(3)
+        provider.destroy(ctx)
+        assert group in groups()
+        assert any(group in m and "consumer is still connected" in m for m in messages)
+    finally:
+        consumer.wait(timeout=60)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        provider.destroy(ctx)
+        if group not in groups():
+            break
+        time.sleep(2)
+    assert group not in groups()
+    kafka.tool("kafka-topics.sh", "--delete", "--topic", topic)
