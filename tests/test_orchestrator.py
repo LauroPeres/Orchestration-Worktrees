@@ -183,6 +183,37 @@ def test_custom_https_port_in_urls(
     assert reports[0].url == "https://api.feat-cart.shop.localhost:8443"
 
 
+def test_provider_context_urls_default_port(orch) -> None:
+    o = orch()
+    ctx = o.provider_context(o.names("feat/cart"))
+    assert ctx.urls == ("https://api.feat-cart.shop.localhost",)
+
+
+def test_provider_context_urls_include_custom_port(orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WT_HTTPS_PORT", "8443")
+    o = orch()
+    ctx = o.provider_context(o.names("feat/cart"))
+    assert ctx.urls == ("https://api.feat-cart.shop.localhost:8443",)
+
+
+def test_provider_context_urls_skip_unrouted_services(orch) -> None:
+    o = orch()  # `db` has no subdomain
+    ctx = o.provider_context(o.names("feat/cart"))
+    assert all("db." not in u for u in ctx.urls) and len(ctx.urls) == 1
+
+
+def test_provider_context_urls_skip_unselected_services(
+    catalog_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = catalog_orch
+    names = o.names("feat/x")
+    assert len(o.provider_context(names).urls) == 2
+    o.up("feat/x")
+    _set_uses(o, "feat/x", ["db"])
+    narrowed = o._for("feat/x")
+    assert narrowed.provider_context(names).urls == ("https://dbx.feat-x.shop.localhost",)
+
+
 def test_logs_errors(orch, docker: FakeDocker) -> None:
     o = orch()
     with pytest.raises(WtError, match="unknown service"):
