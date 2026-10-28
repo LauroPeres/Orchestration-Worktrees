@@ -344,6 +344,59 @@ Outside a project it lists the worktrees of every project wt knows. The repos' o
   containers and volumes. A folder at a worktree path that is not a git worktree is left in
   place with a warning.
 
+Overview of two branches of [examples/shop](examples/shop/README.md) running side by side. Each
+branch has its own worktrees, containers, database, Redis key prefix, Kafka consumer group and
+subdomain; the shared servers are the same for both.
+
+```mermaid
+flowchart TB
+  cli["wt CLI (typer)"] --> orch["Orchestrator<br/>config, naming, state"]
+  orch --> routes["Traefik route files<br/>~/.wt/traefik/dynamic/"]
+  routes --> traefik["wt-traefik"]
+
+  subgraph shared ["shared, one set per machine"]
+    traefik
+    pg["wt-postgres"]
+    redis["wt-redis"]
+    kafka["wt-kafka"]
+  end
+
+  subgraph b_main ["branch main: api.main.shop.localhost"]
+    mw["git worktrees per repo"]
+    mc["compose: api, worker"]
+    mh["run: web (host process)"]
+    mdb["database shop__main"]
+    mr["Redis keys main:*"]
+    mk["Kafka group worker-main"]
+  end
+
+  subgraph b_cart ["branch feat/cart: api.feat-cart.shop.localhost"]
+    cw["git worktrees per repo"]
+    cc["compose: api, worker"]
+    ch["run: web (host process)"]
+    cdb["database shop__feat_cart"]
+    cr["Redis keys feat-cart:*"]
+    ck["Kafka group worker-feat-cart"]
+  end
+
+  orch --> mw
+  orch --> mc
+  orch --> mh
+  orch --> cw
+  orch --> cc
+  orch --> ch
+  traefik --> mc
+  traefik --> mh
+  traefik --> cc
+  traefik --> ch
+  mdb --> pg
+  mr --> redis
+  mk --> kafka
+  cdb --> pg
+  cr --> redis
+  ck --> kafka
+```
+
 ## Settings
 
 | Variable | Default | Purpose |
@@ -401,6 +454,40 @@ uv run pytest -m docker      # integration tests against a real Docker daemon
 uv run ruff check && uv run ruff format --check && uv run mypy
 ```
 
+## Benchmarks
+
+Measured on the author's machine with `examples/shop` (Postgres, Redis, Kafka, an API and a worker in
+Docker, and a web page as a host process), using a throwaway `WT_HOME`, `WT_INSTANCE` and free
+ports.
+
+- Machine: AMD Ryzen 7 7435HS (16 threads), 15 GiB RAM,
+  Linux 7.2.11-arch1-1 (native, not WSL2), Docker 29.9.2 on the host kernel.
+
+| Step | Runs (s) | Median (s) |
+|---|---|---|
+| `wt up feat/cart`, cold | 32.32, 38.02, 38.21 | 38.02 |
+| `wt up feat/cart`, warm | 11.97, 13.16, 14.09 | 13.16 |
+| `wt down feat/cart` | 8.55, 6.83, 6.79 | 6.83 |
+| `wt up feat/cart` with `main` already up | 12.37, 12.21, 12.30 | 12.30 |
+
+Commands, run from the directory made by `examples/shop/bootstrap.sh <dir>`, each timed as one
+wall-clock run of the `wt` process:
+
+```bash
+wt up feat/cart      # cold: no shared servers, no shop images built
+wt down feat/cart
+wt up feat/cart      # warm: shared servers and images present
+wt down feat/cart    # timed in the first round
+wt up main           # not timed
+wt up feat/cart      # timed: adding a second branch while main is up
+```
+
+Cold means the Postgres, Redis, Kafka and Traefik containers did not exist and the shop images
+were built from scratch. The base images (`postgres`, `redis`, `apache/kafka`, `traefik`) were
+already pulled and the Postgres volume was kept between cold runs 2 and 3. `mkcert` was not on the
+`PATH` for these runs, so the certificates were self-signed. One machine, native Linux,
+warm Docker image cache: expect different numbers elsewhere, especially on a first pull.
+
 ## Roadmap
 
 | Version | Scope |
@@ -408,7 +495,7 @@ uv run ruff check && uv run ruff format --check && uv run mypy
 | v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
 | v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
-| v0.4 | Kafka + Redis providers, worker in the example, README with diagram and GIF, benchmarks |
+| v0.4 | Kafka + Redis providers ✔, worker in the example ✔, README architecture diagram ✔, benchmarks ✔ |
 | v0.5 | Keycloak provider (SSO across branch subdomains) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
