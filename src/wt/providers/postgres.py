@@ -8,14 +8,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from wt import compose, proc
 from wt.config import Config
 from wt.config import Postgres as PostgresConfig
 from wt.errors import WtError
 from wt.naming import Names, fit, temp_name
 from wt.paths import env_port, instance, wt_home
+from wt.providers import server
 from wt.providers.base import BranchContext, Check, Kind, Resources
 from wt.state import atomic_write, file_lock
 
@@ -201,26 +200,7 @@ def repair_connections(databases: list[str]) -> None:
 
 
 def ensure_server(databases: list[str], timeout: int = 60) -> None:
-    folder = server_dir()
-    compose_file = folder / "compose.yml"
-    atomic_write(compose_file, yaml.safe_dump(compose_doc(), sort_keys=False))
-    compose.ensure_network()
-    proc.run(
-        [
-            "docker",
-            "compose",
-            "-p",
-            container(),
-            "-f",
-            str(compose_file),
-            "up",
-            "-d",
-            "--wait",
-            "--wait-timeout",
-            str(timeout),
-        ],
-        cwd=folder,
-    )
+    server.up(container(), server_dir(), compose_doc(), timeout)
     wait_ready(timeout)
     repair_connections(databases)
 
