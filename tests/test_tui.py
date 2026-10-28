@@ -462,3 +462,105 @@ def test_the_repos_own_checkout_is_not_listed() -> None:
             assert [c[0] for c in cells(app)] == ["feat-a"]
 
     asyncio.run(scenario())
+
+
+def test_add_works_on_an_empty_table_in_a_single_project() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch(rows=[BranchStatus("main", "up", 1, 1, main_checkout=True)])
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert cells(app) == []
+            assert message(app) == "no worktrees yet: press a to add"
+            await pilot.press("a", *"new-x", "enter")
+            await settle(pilot)
+            assert orch.calls == [("add", "new-x")]
+
+    asyncio.run(scenario())
+
+
+def test_add_on_an_empty_table_with_one_usable_project() -> None:
+    async def scenario() -> None:
+        shop = FakeOrch("shop", [])
+
+        def discover() -> list[ProjectEntry]:
+            return [ProjectEntry("shop", lambda: shop, "")]
+
+        app = WtApp(projects=discover)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert cells(app) == []
+            await pilot.press("a", *"zz", "enter")
+            await settle(pilot)
+            assert shop.calls == [("add", "zz")]
+
+    asyncio.run(scenario())
+
+
+def test_add_on_an_empty_table_without_a_usable_project_says_so() -> None:
+    async def scenario() -> None:
+        app = WtApp(projects=lambda: [])
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a")
+            await settle(pilot)
+            assert message(app) == "no project to add to"
+            assert app.screen_stack[-1] is app.screen_stack[0]
+
+    asyncio.run(scenario())
+
+
+def test_several_usable_projects_on_an_empty_table_give_no_hint_and_a_clear_message() -> None:
+    async def scenario() -> None:
+        shop, blog = FakeOrch("shop", []), FakeOrch("blog", [])
+
+        def discover() -> list[ProjectEntry]:
+            return [
+                ProjectEntry("shop", lambda: shop, ""),
+                ProjectEntry("blog", lambda: blog, ""),
+            ]
+
+        app = WtApp(projects=discover)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert cells(app) == []
+            assert message(app) != "no worktrees yet: press a to add"
+            await pilot.press("a")
+            await settle(pilot)
+            assert message(app) == "several projects: run wt tui inside one to add"
+            assert shop.calls == [] and blog.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_no_empty_hint_without_a_usable_project() -> None:
+    async def scenario() -> None:
+        app = WtApp(projects=lambda: [])
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert message(app) != "no worktrees yet: press a to add"
+
+    asyncio.run(scenario())
+
+
+def test_the_empty_hint_shows_once_per_empty_spell() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch(rows=[])
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert message(app) == "no worktrees yet: press a to add"
+            app.say("something else")
+            app.action_refresh()
+            await settle(pilot)
+            assert message(app) == "something else"  # not repeated while still empty
+            orch.rows = [status("feat-a", "up", [8001])]
+            app.action_refresh()
+            await settle(pilot)
+            assert len(cells(app)) == 1
+            orch.rows = []
+            app.action_refresh()
+            await settle(pilot)
+            assert message(app) == "no worktrees yet: press a to add"  # re-armed
+
+    asyncio.run(scenario())

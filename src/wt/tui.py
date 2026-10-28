@@ -337,6 +337,7 @@ class WtApp(App[None]):
         self.rows: list[Row] = []
         self._loading = False
         self._busy = False
+        self._empty_hinted = False
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="table", cursor_type="row")
@@ -424,17 +425,35 @@ class WtApp(App[None]):
             branch = row.status.branch
             self.start(f"down {branch}", lambda: self._orch_for(row.project).stop(branch))
 
-    def action_add_new(self) -> None:
+    def _usable_projects(self) -> list[str]:
+        return [name for name, e in self._entries.items() if e.orch is not None]
+
+    def _can_add(self) -> bool:
+        """True when `a` has a project to add to even if no row is selected."""
+        return self.orch is not None or len(self._usable_projects()) == 1
+
+    def _project_for_add(self) -> str | None:
+        """The project a new worktree goes to; else say why there is none."""
         row = self.selected_row
-        if row is None:
-            self.say("nothing selected")
+        if row is not None:
+            if row.stale:
+                self.say(f"{row.project}: {row.note}")
+                return None
+            return row.project
+        if self.orch is not None:
+            return self.orch.cfg.project
+        usable = self._usable_projects()
+        if len(usable) == 1:
+            return usable[0]
+        self.say(
+            "several projects: run wt tui inside one to add" if usable else "no project to add to"
+        )
+        return None
+
+    def action_add_new(self) -> None:
+        project = self._project_for_add()
+        if project is None or not self.guard():
             return
-        if row.stale:
-            self.say(f"{row.project}: {row.note}")
-            return
-        if not self.guard():
-            return
-        project = row.project
 
         def got(name: str | None) -> None:
             if name and self.guard():
@@ -535,6 +554,12 @@ class WtApp(App[None]):
                 else:
                     cells = (Text(r.project), Text(r.note))
                 table.add_row(*cells, key=r.key)
+            if rows:
+                self._empty_hinted = False
+            elif not self._empty_hinted and not self._busy and self._can_add():
+                # once per empty spell: keep later messages visible
+                self._empty_hinted = True
+                self.say("no worktrees yet: press a to add")
             keys = [r.key for r in rows]
             if previous is not None and previous.key in keys:
                 table.move_cursor(row=keys.index(previous.key))
