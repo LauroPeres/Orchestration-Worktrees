@@ -274,6 +274,7 @@ class Orchestrator:
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         self._log_warnings()
         with self._branch_lock(names):
+            self._check_hosts_free(names)
             envs, commands, ports = self._reserve(branch, names)
 
             try:
@@ -338,6 +339,23 @@ class Orchestrator:
             except Exception:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
+
+    def _check_hosts_free(self, names: Names) -> None:
+        """Fail `up` before anything is created when another route file already routes a host.
+
+        The branch's own route file is ignored, so a re-run or a `stopped` branch never conflicts
+        with itself. Two `up` at the very same moment can still race: this is a safeguard.
+        """
+        in_use = router.hosts_in_use(exclude=router.route_file(names))
+        for svc in self.cfg.services.values():
+            if svc.subdomain is None:
+                continue
+            route_host = names.host(svc.subdomain)
+            if (path := in_use.get(route_host.lower())) is not None:
+                raise WtError(
+                    f"host {route_host} is already routed by {router.route_file_owner(path)}; "
+                    "give one of the projects another domain"
+                )
 
     def _reserve(
         self, branch: str, names: Names
