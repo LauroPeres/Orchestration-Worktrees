@@ -238,8 +238,8 @@ class KeycloakProvider:
         return self.cfg
 
     def client_id(self, ctx: BranchContext) -> str:
-        """`feat/cart` with client `web` -> `web-feat-cart`."""
-        return f"{self._cfg().client}-{ctx.names.slug}"
+        """`feat/cart` in project `shop` with client `web` -> `web-shop.feat-cart`."""
+        return f"{self._cfg().client}-{ctx.names.project}.{ctx.names.slug}"
 
     @staticmethod
     def redirect_uris(ctx: BranchContext) -> list[str]:
