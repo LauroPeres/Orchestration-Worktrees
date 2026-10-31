@@ -3,12 +3,14 @@
 import shutil
 import socket
 import subprocess
+import time
 from collections.abc import Iterator
 
 import pytest
 
-from wt import compose
+from wt import compose, doctor
 from wt.config import Config
+from wt.errors import WtError
 from wt.naming import Names
 from wt.providers import redis
 from wt.providers.base import BranchContext
@@ -122,3 +124,65 @@ def test_template_vars_connect_from_the_host(server: str) -> None:
     tv = provider.template_vars(ctx, "run")["redis"]
     assert tv["url"] == f"redis://127.0.0.1:{redis.host_port()}"
     assert tv["prefix"] == "feat-cart:"
+
+
+FAIL_FAST_SECONDS = 60  # a taken port must fail clearly, not hang for the readiness wait
+
+
+@pytest.fixture
+def stranger_on_redis_port(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[socket.socket]:
+    """A second, own instance whose Redis host port is held by a program that is not wt."""
+    monkeypatch.setenv("WT_INSTANCE", f"wtrp{free_port()}")
+    monkeypatch.setenv("WT_HOME", str(tmp_path_factory.mktemp("wt-home-ports")))
+    monkeypatch.setenv("WT_REDIS_PORT", str(free_port()))
+    stranger = socket.socket()
+    stranger.bind(("127.0.0.1", redis.host_port()))
+    stranger.listen()
+    try:
+        yield stranger
+    finally:
+        stranger.close()
+        docker("rm", "-f", "-v", redis.container())
+        docker("volume", "rm", "-f", redis.volume())
+        docker("network", "rm", compose.network_name())
+
+
+def failed_start() -> float:
+    started = time.monotonic()
+    with pytest.raises(WtError) as caught:
+        redis.ensure_server()
+    assert str(caught.value).strip()
+    return time.monotonic() - started
+
+
+def test_a_taken_port_fails_clearly_twice_then_recovers(
+    stranger_on_redis_port: socket.socket,
+) -> None:
+    assert failed_start() < FAIL_FAST_SECONDS
+    assert failed_start() < FAIL_FAST_SECONDS
+    assert redis.host_port() not in compose.published_host_ports(redis.container())
+
+    stranger_on_redis_port.close()
+    redis.ensure_server()
+    assert redis.host_port() in compose.published_host_ports(redis.container())
+    assert redis.cli("ping").stdout.strip() == "PONG"
+
+
+def test_doctor_fix_recreates_a_redis_that_runs_without_its_port(
+    stranger_on_redis_port: socket.socket,
+) -> None:
+    failed_start()
+    stranger_on_redis_port.close()
+    docker("start", redis.container())  # Docker's quirk: runs, but publishes nothing
+    time.sleep(3)
+    assert docker("port", redis.container()).stdout.strip() == ""
+    check = doctor.check_redis(fix=False)
+    assert check.level == "fail"
+    assert "runs without its published ports" in check.detail
+
+    fixed = doctor.check_redis(fix=True)
+    assert fixed.level == "ok", fixed
+    assert redis.host_port() in compose.published_host_ports(redis.container())
+    assert redis.cli("ping").stdout.strip() == "PONG"
