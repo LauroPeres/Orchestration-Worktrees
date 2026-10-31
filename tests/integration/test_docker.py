@@ -1,12 +1,14 @@
 """End to end against a real Docker daemon: `pytest -m docker`."""
 
 import json
+import os
 import shutil
 import socket
 import subprocess
 import sys
 import urllib.request
 from collections.abc import Iterator, Mapping
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -120,14 +122,10 @@ def volume_stack(
     yield from make_stack(make_repo, tmp_path, monkeypatch, services, VOLUME_COMPOSE)
 
 
-REMOTE = "https://api.remote.example"
-
-
-@pytest.fixture
-def catalog_stack(
-    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def catalog_orchestrator(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uses: list[str]
 ) -> Iterator[Orchestrator]:
-    """A compose `api` and a host-process `web` that consumes it (remote when api is dropped)."""
+    """A catalog: compose `api`, host-process `web` consuming it, independent host `side`."""
     if shutil.which("docker") is None or docker("info").returncode != 0:
         pytest.skip("docker is not available")
     instance = f"wtit{free_port()}"
@@ -137,23 +135,25 @@ def catalog_stack(
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/local/bin")
     make_repo("api", {"docker-compose.yml": COMPOSE})
     make_repo("web")
+    make_repo("side")
+    run = f"{sys.executable} {SERVE} {{{{ port }}}}"
     catalog = {
-        "repos": {"api": "./api", "web": "./web"},
+        "repos": {"api": "./api", "web": "./web", "side": "./side"},
         "services": {
             "api": {
                 "repo": "api",
                 "compose": "docker-compose.yml",
                 "port": 8000,
                 "subdomain": "api",
-                "remote": REMOTE,
             },
             "web": {
                 "repo": "web",
-                "run": f"{sys.executable} {SERVE} {{{{ port }}}}",
+                "run": run,
                 "port": "auto",
                 "subdomain": "web",
                 "consumes": {"api": "API_URL"},
             },
+            "side": {"repo": "side", "run": run, "port": "auto", "subdomain": "side"},
         },
     }
     (tmp_path / "catalog.yaml").write_text(yaml.safe_dump(catalog))
@@ -161,7 +161,7 @@ def catalog_stack(
         "project": instance,
         "domain": f"{instance}.localhost",
         "catalog": "./catalog.yaml",
-        "uses": ["web", "api"],
+        "uses": uses,
     }
     path = tmp_path / "worktree.yaml"
     path.write_text(yaml.safe_dump(config))
@@ -171,6 +171,20 @@ def catalog_stack(
         orch.down(branch, force=True)
     docker("rm", "-f", router.container())
     docker("network", "rm", instance)
+
+
+@pytest.fixture
+def catalog_stack(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Orchestrator]:
+    yield from catalog_orchestrator(make_repo, tmp_path, monkeypatch, ["web", "side"])
+
+
+@pytest.fixture
+def consumer_only_stack(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Orchestrator]:
+    yield from catalog_orchestrator(make_repo, tmp_path, monkeypatch, ["web"])
 
 
 def up_retrying(
@@ -301,29 +315,89 @@ def process_env(orch: Orchestrator, branch: str, service: str) -> dict[str, str]
     return dict(item.decode().split("=", 1) for item in raw if b"=" in item)
 
 
+def api_containers(orch: Orchestrator, branch: str) -> list[str]:
+    project = orch.names(branch).compose_project("api")
+    label = f"label=com.docker.compose.project={project}"
+    return docker("ps", "-q", "--filter", label).stdout.split()
+
+
 def test_configure_drops_a_service_and_adds_it_back(
     catalog_stack: Orchestrator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     orch = catalog_stack
     up_retrying(orch, "main", monkeypatch)
-    api_port = orch.store.load().branches["main"].ports["api"]
-    assert get(f"http://127.0.0.1:{api_port}/")[0] == 200
-    own_url = process_env(orch, "main", "web")["API_URL"]
-    assert own_url.startswith("https://api.main.")
+    bs = orch.store.load().branches["main"]
+    assert set(bs.ports) == {"web", "side", "api"}  # api is in because web consumes it
+    api_ids = api_containers(orch, "main")
+    assert len(api_ids) == 1
+    side_pid = bs.processes["side"].pid
 
-    orch.configure("main", ["web"])
+    orch.configure("main", ["web"])  # side is torn down; api stays for web
     bs = orch.store.load().branches["main"]
     assert bs.uses == ["web"]
-    assert "api" not in bs.ports
-    assert process_env(orch, "main", "web")["API_URL"] == REMOTE
-    project = orch.names("main").compose_project("api")
-    label = f"label=com.docker.compose.project={project}"
-    assert docker("ps", "-aq", "--filter", label).stdout.strip() == ""
-    with pytest.raises(OSError):
-        socket.create_connection(("127.0.0.1", api_port), timeout=1)
-    assert [r.name for r in orch.services("main")] == ["web"]
-
-    orch.configure("main", ["web", "api"])
-    assert get(f"http://127.0.0.1:{orch.store.load().branches['main'].ports['api']}/")[0] == 200
+    assert set(bs.ports) == {"web", "api"}
+    assert "side" not in bs.processes
+    assert not Path(f"/proc/{side_pid}").exists()
+    assert api_containers(orch, "main") == api_ids
     assert process_env(orch, "main", "web")["API_URL"].startswith("https://api.main.")
-    assert {r.name: r.status for r in orch.services("main")} == {"web": "healthy", "api": "healthy"}
+    assert get(f"http://127.0.0.1:{bs.ports['api']}/")[0] == 200
+
+    orch.configure("main", ["side"])  # web leaves, so its implicit dependency api leaves too
+    bs = orch.store.load().branches["main"]
+    assert bs.uses == ["side"]
+    assert set(bs.ports) == {"side"}
+    assert api_containers(orch, "main") == []
+    assert [r.name for r in orch.services("main")] == ["side"]
+
+    orch.configure("main", ["side", "web"])  # adding the consumer brings api back
+    bs = orch.store.load().branches["main"]
+    assert set(bs.ports) == {"web", "side", "api"}
+    assert get(f"http://127.0.0.1:{bs.ports['api']}/")[0] == 200
+    assert {r.name: r.status for r in orch.services("main")} == {
+        "web": "healthy",
+        "side": "healthy",
+        "api": "healthy",
+    }
+
+
+def container_started_at(container: str) -> float:
+    out = docker("inspect", container, "--format", "{{.State.StartedAt}}").stdout.strip()
+    return datetime.fromisoformat(out[:26] + "+00:00").timestamp()  # drop nanoseconds
+
+
+def process_started_at(pid: int) -> float:
+    """Epoch start time of a process from /proc (boot time + start ticks)."""
+    ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+    boot = next(
+        int(line.split()[1])
+        for line in Path("/proc/stat").read_text().splitlines()
+        if line.startswith("btime")
+    )
+    return boot + ticks / os.sysconf("SC_CLK_TCK")
+
+
+def test_consumer_alone_brings_its_dependency_and_down_removes_both(
+    consumer_only_stack: Orchestrator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch = consumer_only_stack
+    reports = up_retrying(orch, "main", monkeypatch)
+    assert {r.service for r in reports} == {"api", "web"}
+    assert {r.outcome for r in reports} == {"ok"}, reports
+
+    bs = orch.store.load().branches["main"]
+    assert get(f"http://127.0.0.1:{bs.ports['api']}/")[0] == 200
+    assert get(f"http://127.0.0.1:{bs.ports['web']}/")[0] == 200
+    api_url = process_env(orch, "main", "web")["API_URL"]
+    assert api_url.startswith("https://api.main.")
+    assert {r.name: r.status for r in orch.services("main")} == {
+        "web": "healthy",
+        "api": "healthy",
+    }
+    web_pid = bs.processes["web"].pid
+    (api_id,) = api_containers(orch, "main")
+    assert container_started_at(api_id) < process_started_at(web_pid)  # dependency first
+
+    assert orch.down("main", force=True)
+    assert api_containers(orch, "main") == []
+    assert not Path(f"/proc/{web_pid}").exists()
+    assert "main" not in orch.store.load().branches
