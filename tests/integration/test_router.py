@@ -102,12 +102,18 @@ def test_doctor_fix_recreates_a_traefik_that_runs_without_ports(
     stranger_on_https.hold()
     timed_failure()
     stranger_on_https.release()
-    docker("start", router.container())  # Docker's quirk: runs, but publishes nothing
+    docker("start", router.container())
     time.sleep(3)
-    assert docker("port", router.container()).stdout.strip() == ""
+    # Older Docker engines (seen locally) restart the container without publishing anything;
+    # newer ones (seen on the GitHub runner) publish normally. Both outcomes must be handled.
+    quirk_reproduced = docker("port", router.container()).stdout.strip() == ""
     check = ports_check(fix=False)
-    assert check.level == "fail"
-    assert "runs without its published ports" in check.detail
+    if quirk_reproduced:
+        assert check.level == "fail"
+        assert "runs without its published ports" in check.detail
+    else:
+        assert check.level == "ok", check
+        assert router.https_port() in compose.published_host_ports(router.container())
 
     fixed = ports_check(fix=True)
     assert fixed.level == "ok", fixed

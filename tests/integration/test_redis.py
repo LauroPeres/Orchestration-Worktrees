@@ -175,12 +175,18 @@ def test_doctor_fix_recreates_a_redis_that_runs_without_its_port(
 ) -> None:
     failed_start()
     stranger_on_redis_port.close()
-    docker("start", redis.container())  # Docker's quirk: runs, but publishes nothing
+    docker("start", redis.container())
     time.sleep(3)
-    assert docker("port", redis.container()).stdout.strip() == ""
+    # Older Docker engines (seen locally) restart the container without publishing anything;
+    # newer ones (seen on the GitHub runner) publish normally. Both outcomes must be handled.
+    quirk_reproduced = docker("port", redis.container()).stdout.strip() == ""
     check = doctor.check_redis(fix=False)
-    assert check.level == "fail"
-    assert "runs without its published ports" in check.detail
+    if quirk_reproduced:
+        assert check.level == "fail"
+        assert "runs without its published ports" in check.detail
+    else:
+        assert check.level == "ok", check
+        assert redis.host_port() in compose.published_host_ports(redis.container())
 
     fixed = doctor.check_redis(fix=True)
     assert fixed.level == "ok", fixed
