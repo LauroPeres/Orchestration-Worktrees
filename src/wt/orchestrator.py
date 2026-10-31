@@ -750,27 +750,74 @@ class Orchestrator:
         if (other := self._for(branch)) is not self:
             return other.down(branch, force=force)
         with self._branch_lock(self.names(branch)):
-            return self._down_locked(branch, force=force) is not None
+            if self._down_locked(branch, force=force) is None:
+                self._log_nothing_to_remove(branch)
+                return False
+            return True
 
     def remove(self, branch: str, *, force: bool = False) -> bool:
-        """`down`, then delete the git branch in every repo, except protected ones."""
+        """`down`, then delete the git branch in every repo, except protected ones.
+
+        Also works after `down` (the branch is no longer in state): the branch is then looked
+        up in every repo of the project. True when state or a git branch was removed.
+        """
         if (other := self._for(branch)) is not self:
             return other.remove(branch, force=force)
         with self._branch_lock(self.names(branch)):
             sources = self._down_locked(branch, force=force)
+            known = sources is not None
             if sources is None:
-                return False
-            pg = self.cfg.shared.postgres
-            base = pg.base_branch if pg is not None else "main"
-            for repo, source in sources.items():
-                if branch == base:
-                    self.log(f"keeping branch {branch!r} in repo {repo!r}: Postgres base branch")
-                elif any(t.branch == branch for t in git.list_worktrees(source)):
-                    self.log(f"keeping branch {branch!r} in repo {repo!r}: checked out elsewhere")
-                elif git.branch_exists(source, branch):
-                    self.log(f"deleting branch {branch!r} in repo {repo!r}")
-                    git.delete_branch(source, branch)
-            return True
+                sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
+            found, deleted = self._delete_branch_in_repos(branch, sources)
+            if not known and not found:
+                self._log_nothing_to_remove(branch)
+            return known or deleted > 0
+
+    def _log_nothing_to_remove(self, branch: str) -> None:
+        self.log(f"branch {branch} not found; nothing to remove")
+
+    def _delete_branch_in_repos(self, branch: str, sources: dict[str, Path]) -> tuple[int, int]:
+        """Delete `branch` where it exists unless protected; returns (repos having it, deleted).
+
+        A repo that fails (missing folder, not a git repo, refused delete) is logged and does not
+        stop the others; once all were tried, one error lists the failed repos.
+        """
+        found = deleted = 0
+        failures: dict[str, str] = {}
+        for repo, source in sources.items():
+            try:
+                outcome = self._delete_branch_in_repo(branch, repo, source)
+            except WtError as exc:
+                failures[repo] = _short_reason(exc)
+                self.log(
+                    f"[red]repo {repo!r}: could not delete branch {branch!r}:[/] {failures[repo]}"
+                )
+                continue
+            found += outcome != "absent"
+            deleted += outcome == "deleted"
+        if failures:
+            listed = "; ".join(f"{repo!r} ({reason})" for repo, reason in failures.items())
+            raise WtError(
+                f"could not delete branch {branch!r} in {len(failures)} repo(s): {listed}"
+            )
+        return found, deleted
+
+    def _delete_branch_in_repo(
+        self, branch: str, repo: str, source: Path
+    ) -> Literal["absent", "kept", "deleted"]:
+        git.check_repo(source)
+        if not git.branch_exists(source, branch):
+            return "absent"
+        pg = self.cfg.shared.postgres
+        if branch == (pg.base_branch if pg is not None else "main"):
+            self.log(f"keeping branch {branch!r} in repo {repo!r}: Postgres base branch")
+        elif any(t.branch == branch for t in git.list_worktrees(source)):
+            self.log(f"keeping branch {branch!r} in repo {repo!r}: checked out elsewhere")
+        else:
+            self.log(f"deleting branch {branch!r} in repo {repo!r}")
+            git.delete_branch(source, branch)
+            return "deleted"
+        return "kept"
 
     def _down_locked(self, branch: str, *, force: bool) -> dict[str, Path] | None:  # noqa: C901, PLR0912
         """The body of `down`; None when there was nothing to remove, else repo -> main folder."""
@@ -808,7 +855,6 @@ class Orchestrator:
             and not self.branch_dir(names).exists()
             and not any(p.exists() for p in leftovers)
         ):
-            self.log(f"branch {branch} not found; nothing to remove")
             return None
 
         if not force:
