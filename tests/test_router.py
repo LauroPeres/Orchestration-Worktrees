@@ -248,3 +248,90 @@ def test_ensure_running_with_force_recreate_still_reports_missing_ports(
     with pytest.raises(WtError, match="port 80 is already in use by another program"):
         router.ensure_running(force_recreate=True)
     assert len(_ups(calls)) == 1
+
+
+def _write_route_file(project: str, branch: str, *rules: str) -> Path:
+    """A route file shaped like `write_routes` writes it, with the given router rules."""
+    names = Names(project, branch, "shop.localhost")
+    path = router.write_routes(names, [], None)
+    routers = {
+        f"r{i}": {"rule": rule, "entryPoints": ["websecure"], "service": f"r{i}", "tls": {}}
+        for i, rule in enumerate(rules)
+    }
+    path.write_text(yaml.safe_dump({"http": {"routers": routers, "services": {}}}))
+    return path
+
+
+def test_hosts_in_use_empty_folder(isolated_home: Path) -> None:
+    assert router.hosts_in_use() == {}  # no folder yet
+    router.dynamic_dir().mkdir(parents=True)
+    assert router.hosts_in_use() == {}
+
+
+def test_hosts_in_use_reads_every_file(isolated_home: Path) -> None:
+    a = _write_route_file("shop", "main", "Host(`main.shop.localhost`)")
+    b = _write_route_file("lim", "dev", "Host(`dev.lim.localhost`)")
+    assert router.hosts_in_use() == {"main.shop.localhost": a, "dev.lim.localhost": b}
+
+
+def test_hosts_in_use_from_write_routes(isolated_home: Path) -> None:
+    path = router.write_routes(NAMES, ROUTES, None)
+    assert router.hosts_in_use() == {"api.feat-cart.shop.localhost": path}
+
+
+def test_hosts_in_use_same_host_shows_the_other_file_when_own_is_excluded(
+    isolated_home: Path,
+) -> None:
+    mine = _write_route_file("shop", "main", "Host(`main.shop.localhost`)")
+    other = _write_route_file("lim", "main", "Host(`main.shop.localhost`)")
+    assert router.hosts_in_use(exclude=mine) == {"main.shop.localhost": other}
+    assert router.hosts_in_use(exclude=other) == {"main.shop.localhost": mine}
+
+
+def test_hosts_in_use_excludes_own_file(isolated_home: Path) -> None:
+    mine = _write_route_file("shop", "main", "Host(`main.shop.localhost`)")
+    assert router.hosts_in_use(exclude=mine) == {}
+
+
+def test_hosts_in_use_reads_every_host_of_a_rule(isolated_home: Path) -> None:
+    path = _write_route_file(
+        "shop",
+        "main",
+        "Host(`a.localhost`) || Host(`b.localhost`)",
+        "Host(`c.localhost`) && PathPrefix(`/x`)",
+    )
+    assert router.hosts_in_use() == {
+        "a.localhost": path,
+        "b.localhost": path,
+        "c.localhost": path,
+    }
+
+
+def test_hosts_in_use_ignores_unreadable_files(isolated_home: Path) -> None:
+    good = _write_route_file("shop", "main", "Host(`ok.localhost`)")
+    folder = router.dynamic_dir()
+    (folder / "bad--yaml.yml").write_text("http: [unclosed\n  - : :")
+    (folder / "binary--x.yml").write_bytes(b"\xff\xfe\x00")
+    (folder / "list--x.yml").write_text("- Host(`list.localhost`)\n")
+    (folder / "routers--x.yml").write_text("http:\n  routers: [1, 2]\n")
+    (folder / "norule--x.yml").write_text("http:\n  routers:\n    r: {rule: 3}\n    s: 4\n")
+    (folder / "notes.txt").write_text("Host(`txt.localhost`)")
+    assert router.hosts_in_use() == {"ok.localhost": good}
+
+
+def test_hosts_in_use_compares_case_insensitively(isolated_home: Path) -> None:
+    path = _write_route_file("shop", "main", "Host(`Main.Shop.Localhost`)")
+    assert router.hosts_in_use() == {"main.shop.localhost": path}
+
+
+@pytest.mark.parametrize(
+    ("file_name", "owner"),
+    [
+        ("shop--feat-cart.yml", "shop/feat-cart"),
+        ("my--shop--main.yml", "my--shop/main"),
+        ("handwritten.yml", "handwritten"),
+        ("--main.yml", "--main"),
+    ],
+)
+def test_route_file_owner(file_name: str, owner: str) -> None:
+    assert router.route_file_owner(Path("/x") / file_name) == owner
