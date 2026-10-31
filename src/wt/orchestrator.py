@@ -35,6 +35,8 @@ from wt.state import (
 from wt.templating import render
 
 _REASON_MAX_CHARS = 120
+_REASON_ELLIPSIS = "..."
+_NOT_RUNNING_STATUSES = ("stopped", "removing")
 
 Log = Callable[[str], None]
 Outcome = Literal["ok", "fail", "skipped"]
@@ -48,14 +50,15 @@ def _short_reason(exc: Exception) -> str:
     """One short line saying why `exc` happened (no command dumps).
 
     A failed command's first line is only its argv; docker and kcadm put the cause at the end of
-    the output, so that line wins when there is one.
+    the output, so that line wins when there is one. A long line keeps its end: docker puts the
+    cause (`address already in use`) last.
     """
     lines = _non_empty_lines(str(exc))
     if isinstance(exc, proc.CommandError):
         lines = _non_empty_lines(exc.result.stderr or exc.result.stdout)[-1:] or lines
     reason = lines[0] if lines else type(exc).__name__
     if len(reason) > _REASON_MAX_CHARS:
-        return reason[: _REASON_MAX_CHARS - 3].rstrip() + "..."
+        return _REASON_ELLIPSIS + reason[-(_REASON_MAX_CHARS - len(_REASON_ELLIPSIS)) :]
     return reason
 
 
@@ -1184,12 +1187,14 @@ def _owns_port(
 
     A run service owns it only while its recorded process is alive: the branch status goes stale
     when the process dies, and a stranger may have taken the port since. A compose service's
-    container publishes the port, so the recorded status is the evidence."""
+    container publishes the port and there is no host process to check, so the branch status is the
+    evidence: an `up` interrupted after compose started leaves `creating` or `failed` with the
+    containers running, and the next `up` must reuse them."""
     if mine is None or mine.ports.get(name) != port:
         return False
     if svc.run is not None:
         return process is not None and host.alive(process)
-    return mine.status in ("up", "degraded")
+    return mine.status not in _NOT_RUNNING_STATUSES
 
 
 def _same_process(ps: ProcessState, command: str, port: int | None, env_hash: str) -> bool:

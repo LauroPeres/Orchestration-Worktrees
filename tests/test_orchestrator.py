@@ -589,7 +589,26 @@ def test_down_cuts_a_long_reason(
     with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
         o.down("feat/cart")
     reason = str(info.value).split("(", 1)[1].split("). Try", 1)[0]
-    assert len(reason) <= 120 and reason.endswith("...")
+    assert reason == "..." + "x" * 117
+
+
+def test_down_keeps_the_end_of_a_long_command_error_line(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cause = "failed to bind host port 127.0.0.1:21379/tcp: address already in use"
+    line = "Error response from daemon: failed to set up container networking: " + "driver " * 10
+    error = proc.CommandError(_DOCKER_EXEC, proc.Result(1, "", f"{line}{cause}\n"))
+    message = _down_failure_message(orch, fake_provider, monkeypatch, error)
+    reason = message.split("(", 1)[1].split("). Try", 1)[0]
+    assert reason.startswith("...") and reason.endswith(cause) and len(reason) == 120
+    assert "\n" not in reason and "docker exec" not in reason
+
+
+def test_down_keeps_a_line_of_exactly_the_limit_whole(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    message = _down_failure_message(orch, fake_provider, monkeypatch, WtError("y" * 120))
+    assert f"({'y' * 120})" in message
 
 
 def test_down_does_not_destroy_later_providers_after_a_failure(
@@ -2402,6 +2421,32 @@ def test_up_accepts_the_port_of_its_own_compose_container(orch, docker: FakeDock
     assert port == naming.host_port(0, 0)
     with stranger_listening(port):  # the fake docker publishes nothing: stand in for the container
         assert {r.service: r.outcome for r in o.up("feat/cart")} == {"api": "ok", "db": "ok"}
+
+
+@pytest.mark.parametrize("status", ["creating", "failed"])
+def test_up_reuses_the_compose_port_after_an_interrupted_up(
+    status: str, orch, docker: FakeDocker
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    port = o.store.load().branches["feat/cart"].ports["api"]
+    with o.store.edit() as state:  # an up killed after compose started: containers run, state stale
+        state.branches["feat/cart"].status = status
+    with stranger_listening(port):  # stands in for the container still publishing the port
+        assert {r.service: r.outcome for r in o.up("feat/cart")} == {"api": "ok", "db": "ok"}
+
+
+@pytest.mark.parametrize("status", ["stopped", "removing"])
+def test_up_refuses_a_recorded_compose_port_when_the_branch_is_not_running(
+    status: str, orch, docker: FakeDocker
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    port = o.store.load().branches["feat/cart"].ports["api"]
+    with o.store.edit() as state:
+        state.branches["feat/cart"].status = status
+    with stranger_listening(port), pytest.raises(WtError, match=f"port {port}.*in use"):
+        o.up("feat/cart")
 
 
 def test_up_refuses_a_stranger_on_a_compose_port_after_add(orch, docker: FakeDocker) -> None:
