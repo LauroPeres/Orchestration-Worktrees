@@ -15,7 +15,7 @@ from wt.naming import Names
 from wt.providers import kafka
 from wt.providers.base import BranchContext
 from wt.providers.kafka import KafkaProvider
-from wt.state import StateStore
+from wt.state import BranchState, StateStore
 
 pytestmark = pytest.mark.docker
 
@@ -51,18 +51,20 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         mp.undo()
 
 
-def make(branch: str, topic_prefix: bool = True) -> tuple[KafkaProvider, BranchContext]:
+def make(
+    branch: str, topic_prefix: bool = True, project: str = "shop"
+) -> tuple[KafkaProvider, BranchContext]:
     cfg = Config.model_validate(
         {
-            "project": "shop",
+            "project": project,
             "domain": "shop.localhost",
             "repos": {"api": "./api"},
             "services": {"api": {"repo": "api", "compose": "c.yml"}},
             "shared": {"kafka": {"groups": ["orders"], "topic_prefix": topic_prefix}},
         }
     )
-    names = Names("shop", branch, "shop.localhost")
-    return KafkaProvider(cfg), BranchContext(names, branch, "main", StateStore("shop"))
+    names = Names(project, branch, "shop.localhost")
+    return KafkaProvider(cfg), BranchContext(names, branch, "main", StateStore(project))
 
 
 def produce(topic: str, message: str) -> None:
@@ -151,35 +153,93 @@ def test_destroy_deletes_only_the_branch_topics_and_groups(server: str) -> None:
         produce(topic, f"hello-{ctx.branch}")
         assert consume(topic, group) == f"hello-{ctx.branch}"
     produce("plain", "unprefixed")
-    assert {"orders-feat", "orders-feat-x", "orders-other"} <= groups()
+    feat_topic, longer_topic, other_topic = (
+        p.topic("events", c)
+        for p, c in [(feat, feat_ctx), (longer, longer_ctx), (other, other_ctx)]
+    )
+    feat_group, longer_group, other_group = (
+        p.group("orders", c)
+        for p, c in [(feat, feat_ctx), (longer, longer_ctx), (other, other_ctx)]
+    )
+    assert {feat_group, longer_group, other_group} <= groups()
+    # The one literal per provider: a rename of the scheme is caught here.
+    assert (feat_topic, feat_group) == ("shop.feat.events", "orders-shop.feat")
 
     feat.destroy(feat_ctx)
     feat.destroy(feat_ctx)  # safe to repeat
-    current = wait_topics_gone("feat.events")
-    assert "feat.events" not in current
-    assert {"feat-x.events", "other.events", "plain"} <= current
-    assert "orders-feat" not in groups()
-    assert {"orders-feat-x", "orders-other"} <= groups()
+    current = wait_topics_gone(feat_topic)
+    assert feat_topic not in current
+    assert {longer_topic, other_topic, "plain"} <= current
+    assert feat_group not in groups()
+    assert {longer_group, other_group} <= groups()
 
     longer.destroy(longer_ctx)
     other.destroy(other_ctx)
-    current = wait_topics_gone("feat-x.events", "other.events")
+    current = wait_topics_gone(longer_topic, other_topic)
     assert "plain" in current
-    assert not {"feat-x.events", "other.events"} & current
+    assert not {longer_topic, other_topic} & current
     kafka.tool("kafka-topics.sh", "--delete", "--topic", "plain")
+
+
+def test_same_branch_in_two_projects_keeps_separate_topics_and_groups(server: str) -> None:
+    shop, shop_ctx = make("main", project="shop")
+    blog, blog_ctx = make("main", project="blog")
+    mine = {}
+    for provider, ctx in [(shop, shop_ctx), (blog, blog_ctx)]:
+        provider.create(ctx)
+        topic, group = provider.topic("events", ctx), provider.group("orders", ctx)
+        produce(topic, ctx.names.project)
+        assert consume(topic, group) == ctx.names.project
+        mine[ctx.names.project] = (topic, group)
+    assert mine["shop"] != mine["blog"]
+
+    shop.destroy(shop_ctx)
+    current = wait_topics_gone(mine["shop"][0])
+    assert mine["shop"][0] not in current and mine["shop"][1] not in groups()
+    assert mine["blog"][0] in current and mine["blog"][1] in groups()
+
+    blog.destroy(blog_ctx)
+    assert mine["blog"][1] not in groups()
+    assert mine["blog"][0] not in wait_topics_gone(mine["blog"][0])
+
+
+def test_destroy_cleans_a_branch_recorded_by_0_5_0_without_the_project(server: str) -> None:
+    provider, ctx = make("legacy")
+    other, other_ctx = make("legacy", project="blog")
+    other.create(other_ctx)
+    other_topic = other.topic("events", other_ctx)
+    produce(other_topic, "keep")
+    produce("legacy.events", "old")  # the 0.5.0 topic: `<slug>.<name>`
+    assert consume("legacy.events", "orders-legacy") == "old"  # the 0.5.0 group
+    with ctx.state.edit() as state:
+        state.branches[ctx.branch] = BranchState(
+            branch=ctx.branch,
+            slug=ctx.names.slug,
+            providers={"kafka": ["orders-legacy", "legacy."]},
+        )
+
+    provider.destroy(ctx)
+    current = wait_topics_gone("legacy.events")
+    assert "legacy.events" not in current
+    assert "orders-legacy" not in groups()
+    assert other_topic in current
+
+    other.destroy(other_ctx)
+    wait_topics_gone(other_topic)
 
 
 def test_without_topic_prefix_destroy_deletes_only_groups(server: str) -> None:
     provider, ctx = make("feat/cart", topic_prefix=False)
-    assert provider.create(ctx).names == ["orders-feat-cart"]
+    group = provider.group("orders", ctx)
+    assert provider.create(ctx).names == [group]
     check = provider.verify(ctx)
     assert check.ok, check.detail
     produce("shared-topic", "msg")
-    assert consume("shared-topic", provider.group("orders", ctx)) == "msg"
-    assert "orders-feat-cart" in groups()
+    assert consume("shared-topic", group) == "msg"
+    assert group in groups()
 
     provider.destroy(ctx)
-    assert "orders-feat-cart" not in groups()
+    assert group not in groups()
     assert "shared-topic" in topics()
     kafka.tool("kafka-topics.sh", "--delete", "--topic", "shared-topic")
 

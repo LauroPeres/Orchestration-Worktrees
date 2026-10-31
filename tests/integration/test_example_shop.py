@@ -171,6 +171,7 @@ def wait_counter(key: str, expected: str, timeout: float = 60.0) -> str:
 
 def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.MonkeyPatch) -> None:
     domain = shop.cfg.domain
+    project = shop.cfg.project  # the fixture renames it to keep the stack apart from a real `shop`
     up(shop, "main", monkeypatch)
     up(shop, "feat/cart", monkeypatch)
 
@@ -195,23 +196,23 @@ def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.Monk
     # Events: each POST reaches the branch's worker through its own topic and group.
     request(cart_api, "POST", "/items", {"name": "plug", "quantity": 1})
     request(main_api, "POST", "/items", {"name": "lamp"})
-    assert wait_counter("main:events", "1") == "1"
-    assert wait_counter("feat-cart:events", "2") == "2"
-    assert "worker-feat-cart" in kafka_list("kafka-consumer-groups.sh")
-    assert "feat-cart.items" in kafka_list("kafka-topics.sh")
+    assert wait_counter(f"{project}:main:events", "1") == "1"
+    assert wait_counter(f"{project}:feat-cart:events", "2") == "2"
+    assert f"worker-{project}.feat-cart" in kafka_list("kafka-consumer-groups.sh")
+    assert f"{project}.feat-cart.items" in kafka_list("kafka-topics.sh")
 
     # Keycloak: one client per branch, each with its own redirect URI, and a working login page.
     port = router.https_port()
     cart_web = f"https://feat-cart.{domain}:{port}"
     clients = keycloak_clients()
-    assert set(clients["web-main"]) == {
+    assert set(clients[f"web-{project}.main"]) == {
         f"https://main.{domain}:{port}/*",
         f"https://api.main.{domain}:{port}/*",
     }
-    assert f"{cart_web}/*" in clients["web-feat-cart"]
+    assert f"{cart_web}/*" in clients[f"web-{project}.feat-cart"]
     query = urllib.parse.urlencode(
         {
-            "client_id": "web-feat-cart",
+            "client_id": f"web-{project}.feat-cart",
             "redirect_uri": cart_web + "/",
             "response_type": "code",
             "scope": "openid",
@@ -220,22 +221,22 @@ def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.Monk
     status, login = http_get(f"{keycloak.url()}/realms/shop/protocol/openid-connect/auth?{query}")
     assert status == 200
     assert "kc-form-login" in login or 'name="username"' in login
-    assert "client_id=web-feat-cart" in page_body(f"feat-cart.{domain}")
+    assert f"client_id=web-{project}.feat-cart" in page_body(f"feat-cart.{domain}")
 
     shop.down("feat/cart")
     clients = keycloak_clients()
-    assert "web-feat-cart" not in clients
-    assert "web-main" in clients
+    assert f"web-{project}.feat-cart" not in clients
+    assert f"web-{project}.main" in clients
     realms = json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout)
     assert "shop" in [r["realm"] for r in realms]
     assert not health.probe(cart_api, "/healthz", router.https_port()).ok
     assert health.probe(main_api, "/healthz", router.https_port()).ok
     assert health.probe(f"main.{domain}", "/", router.https_port()).ok
 
-    assert redis_cli("KEYS", "feat-cart:*") == ""
-    assert redis_cli("GET", "main:events") == "1"
-    assert "worker-feat-cart" not in kafka_list("kafka-consumer-groups.sh")
-    assert "worker-main" in kafka_list("kafka-consumer-groups.sh")
+    assert redis_cli("KEYS", f"{project}:feat-cart:*") == ""
+    assert redis_cli("GET", f"{project}:main:events") == "1"
+    assert f"worker-{project}.feat-cart" not in kafka_list("kafka-consumer-groups.sh")
+    assert f"worker-{project}.main" in kafka_list("kafka-consumer-groups.sh")
     topics = kafka_list("kafka-topics.sh")
-    assert not [t for t in topics if t.startswith("feat-cart.")]
-    assert "main.items" in topics
+    assert not [t for t in topics if t.startswith(f"{project}.feat-cart.")]
+    assert f"{project}.main.items" in topics
