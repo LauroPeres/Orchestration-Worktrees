@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, proc
+from wt import compose, host, proc
 from wt.errors import WtError
 
 
@@ -179,3 +179,108 @@ def test_override_publishes_host_port_on_loopback() -> None:
     text = compose.dump(doc)
     assert "ports: !override\n    - 127.0.0.1:10101:8080" in text
     assert "ports: !reset []" in text  # db keeps today's behavior
+
+
+def _docker_port(monkeypatch: pytest.MonkeyPatch, *outputs: tuple[int, str]) -> list[list[str]]:
+    """Fake `docker port`: each call returns the next (returncode, stdout); the last repeats."""
+    calls: list[list[str]] = []
+    pending = list(outputs)
+
+    def run(args: list[str], **kw: object) -> proc.Result:
+        calls.append(list(args))
+        code, out = pending.pop(0) if len(pending) > 1 else pending[0]
+        return proc.Result(code, out, "")
+
+    monkeypatch.setattr(proc, "run", run)
+    return calls
+
+
+def test_published_host_ports_parses_ipv4_ipv6_and_many_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = "80/tcp -> 0.0.0.0:80\n443/tcp -> [::]:443\n5432/tcp -> 127.0.0.1:55432\n\n"
+    calls = _docker_port(monkeypatch, (0, out))
+    assert compose.published_host_ports("wt-traefik") == {80, 443, 55432}
+    assert calls == [["docker", "port", "wt-traefik"]]
+
+
+def test_published_host_ports_ignores_lines_it_cannot_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    _docker_port(monkeypatch, (0, "garbage\n5432/tcp -> 127.0.0.1:x\n6379/tcp -> 127.0.0.1:6380\n"))
+    assert compose.published_host_ports("c") == {6380}
+
+
+@pytest.mark.parametrize("result", [(0, ""), (1, "Error: No such container: c\n")])
+def test_published_host_ports_empty_for_stopped_or_missing(
+    monkeypatch: pytest.MonkeyPatch, result: tuple[int, str]
+) -> None:
+    _docker_port(monkeypatch, result)
+    assert compose.published_host_ports("c") == set()
+
+
+def test_ensure_published_does_nothing_when_all_published(monkeypatch: pytest.MonkeyPatch) -> None:
+    _docker_port(monkeypatch, (0, "5432/tcp -> 127.0.0.1:55432\n"))
+    recreated: list[bool] = []
+    compose.ensure_published("c", [55432], lambda: recreated.append(True))
+    assert recreated == []
+
+
+def test_ensure_published_with_no_ports_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _docker_port(monkeypatch, (0, ""))
+    compose.ensure_published("c", [], lambda: pytest.fail("must not recreate"))
+    assert calls == []
+
+
+def test_ensure_published_recreates_once_then_accepts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _docker_port(monkeypatch, (0, ""), (0, "5432/tcp -> 127.0.0.1:55432\n"))
+    recreated: list[bool] = []
+    compose.ensure_published("c", [55432], lambda: recreated.append(True))
+    assert recreated == [True]
+
+
+def test_ensure_published_names_the_busy_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    _docker_port(monkeypatch, (0, "1/tcp -> 127.0.0.1:1\n"))
+    monkeypatch.setattr(host, "port_free", lambda port: False)
+    recreated: list[bool] = []
+    with pytest.raises(WtError, match=r"^port 7 is already in use by another program$"):
+        compose.ensure_published("c", [9, 1, 7], lambda: recreated.append(True))
+    assert recreated == [True]
+
+
+def test_ensure_published_names_the_unpublished_port_when_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _docker_port(monkeypatch, (1, "Error: No such container: c\n"))
+    monkeypatch.setattr(host, "port_free", lambda port: True)
+    with pytest.raises(WtError, match=r"^c does not publish port 7$"):
+        compose.ensure_published("c", [9, 7], lambda: None)
+
+
+def _failing_recreate() -> None:
+    raise WtError("docker: bind: address already in use")
+
+
+def test_ensure_published_names_the_busy_port_when_the_recreate_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _docker_port(monkeypatch, (0, "1/tcp -> 127.0.0.1:1\n"))
+    probed: list[int] = []
+
+    def port_free(port: int) -> bool:
+        probed.append(port)
+        return port != 7
+
+    monkeypatch.setattr(host, "port_free", port_free)
+    with pytest.raises(WtError, match=r"^port 7 is already in use by another program$") as caught:
+        compose.ensure_published("c", [9, 1, 7], _failing_recreate)
+    assert "address already in use" in str(caught.value.__cause__)
+    assert probed == [7]
+
+
+def test_ensure_published_keeps_the_original_error_when_ports_are_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _docker_port(monkeypatch, (0, ""))
+    monkeypatch.setattr(host, "port_free", lambda port: True)
+    with pytest.raises(WtError, match=r"^docker: bind: address already in use$") as caught:
+        compose.ensure_published("c", [9, 7], _failing_recreate)
+    assert caught.value.__cause__ is None

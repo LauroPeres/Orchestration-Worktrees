@@ -3,14 +3,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
-from wt import compose, proc, providers
+from wt import compose, host, proc, providers
 from wt.config import Config
 from wt.errors import WtError
 from wt.naming import Names
-from wt.providers import kafka, keycloak, postgres, redis
+from wt.providers import kafka, keycloak, postgres, redis, server
 from wt.providers.base import BranchContext, Check, Resources
 from wt.state import StateStore
 
@@ -74,6 +75,16 @@ def test_dataclasses(isolated_home: Path) -> None:
     assert Check(False, "boom", ["w"]).warnings == ["w"]
 
 
+def published_lines() -> dict[str, str]:
+    """What `docker port` prints for each shared container when it publishes its host port."""
+    return {
+        postgres.container(): f"5432/tcp -> 127.0.0.1:{postgres.host_port()}\n",
+        redis.container(): f"6379/tcp -> 127.0.0.1:{redis.host_port()}\n",
+        kafka.container(): f"19092/tcp -> 127.0.0.1:{kafka.host_port()}\n",
+        keycloak.container(): f"8080/tcp -> 127.0.0.1:{keycloak.host_port()}\n",
+    }
+
+
 class FakeClock:
     """Time only moves when the code sleeps or when `docker compose up` "takes" `up_seconds`."""
 
@@ -81,6 +92,7 @@ class FakeClock:
         self.now = 1000.0
         self.up_seconds = up_seconds
         self.probes_ok = False
+        self.published = published_lines()
 
     def monotonic(self) -> float:
         return self.now
@@ -92,6 +104,8 @@ class FakeClock:
         if list(args[:2]) == ["docker", "compose"]:
             self.now += self.up_seconds
             return proc.Result(0, "", "")
+        if list(args[:2]) == ["docker", "port"]:
+            return proc.Result(0, self.published.get(args[2], ""), "")
         result = proc.Result(0 if self.probes_ok else 1, "", "not ready")
         if check and not result.ok:
             raise proc.CommandError(args, result)
@@ -169,3 +183,32 @@ def test_the_whole_start_stays_inside_the_budget_and_the_error_names_the_total(
         shared.start()
     # The readiness loop gave up one probe after the leftover 10 s, not 10 s plus another budget.
     assert clock.now - began == shared.budget
+
+
+@pytest.mark.parametrize("shared", SHARED, ids=ids)
+def test_the_ports_parsed_from_the_provider_doc_are_the_ones_it_publishes(shared: Shared) -> None:
+    module = shared.module
+    assert server.expected_ports(module.container(), module.compose_doc()) == {
+        module.container(): {module.host_port()}
+    }
+
+
+@pytest.mark.parametrize("shared", SHARED, ids=ids)
+def test_a_server_that_runs_without_its_ports_is_recreated_once_then_reported(
+    shared: Shared, clock_for: Callable[[float], FakeClock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = clock_for(1)
+    clock.published = {}
+    monkeypatch.setattr(host, "port_free", lambda port: True)
+    compose_calls: list[Sequence[str]] = []
+    run = proc.run
+
+    def recording(args: Sequence[str], **kwargs: Any) -> proc.Result:
+        compose_calls.append(args)
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", recording)
+    with pytest.raises(WtError, match=rf"{shared.module.container()} does not publish port"):
+        shared.start()
+    starts = [c for c in compose_calls if list(c[:2]) == ["docker", "compose"]]
+    assert ["--force-recreate" in c for c in starts] == [False, True]

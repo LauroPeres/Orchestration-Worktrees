@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, proc, router
+from wt import compose, host, proc, router
 from wt.errors import WtError
 from wt.naming import Names
 
@@ -79,6 +79,9 @@ def test_invalid_port_variable(
         fn()  # type: ignore[operator]
 
 
+PUBLISHED = "80/tcp -> 127.0.0.1:80\n443/tcp -> 127.0.0.1:443\n"
+
+
 def test_ensure_running_streams_only_with_on_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -86,6 +89,8 @@ def test_ensure_running_streams_only_with_on_line(
     calls: list[dict[str, object]] = []
 
     def fake(args: list[str], **kwargs: object) -> proc.Result:
+        if args[:2] == ["docker", "port"]:
+            return proc.Result(0, PUBLISHED, "")
         calls.append(kwargs)
         return proc.Result(0, "", "")
 
@@ -109,6 +114,8 @@ def _fake_traefik(
             return proc.Result(0, "true\n" if running else "false\n", "")
         if args[:2] == ["docker", "exec"]:
             return proc.Result(0, listing.get(args[-1], ""), "")
+        if args[:2] == ["docker", "port"]:
+            return proc.Result(0, PUBLISHED, "")
         return proc.Result(0, "", "")
 
     monkeypatch.setattr(proc, "run", run)
@@ -166,3 +173,78 @@ def test_restart_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(time, "sleep", lambda s: None)
     with pytest.raises(WtError, match="did not come back"):
         router.restart(timeout=0)
+
+
+def _fake_traefik_ports(monkeypatch: pytest.MonkeyPatch, outputs: list[str]) -> list[list[str]]:
+    """Fake docker where each `docker port` call returns the next of `outputs` (last repeats)."""
+    calls: list[list[str]] = []
+    pending = list(outputs)
+
+    def run(args: list[str], **kw: object) -> proc.Result:
+        calls.append(list(args))
+        if args[:2] == ["docker", "port"]:
+            return proc.Result(0, pending.pop(0) if len(pending) > 1 else pending[0], "")
+        return proc.Result(0, "", "")
+
+    monkeypatch.setattr(proc, "run", run)
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    return calls
+
+
+def _ups(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if c[:2] == ["docker", "compose"]]
+
+
+def test_ensure_running_checks_the_configured_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WT_HTTP_PORT", "8080")
+    monkeypatch.setenv("WT_HTTPS_PORT", "8443")
+    calls = _fake_traefik_ports(
+        monkeypatch, ["80/tcp -> 127.0.0.1:8080\n443/tcp -> 127.0.0.1:8443\n"]
+    )
+    router.ensure_running()
+    assert len(_ups(calls)) == 1
+
+
+def test_ensure_running_recreates_once_when_ports_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_traefik_ports(monkeypatch, ["", PUBLISHED])
+    router.ensure_running()
+    ups = _ups(calls)
+    assert len(ups) == 2
+    assert "--force-recreate" not in ups[0] and "--force-recreate" in ups[1]
+
+
+def test_ensure_running_reports_a_port_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _fake_traefik_ports(monkeypatch, ["443/tcp -> 127.0.0.1:443\n", ""])
+    monkeypatch.setattr(host, "port_free", lambda port: False)
+    with pytest.raises(WtError, match="port 80 is already in use by another program"):
+        router.ensure_running()
+    assert len(_ups(calls)) == 2
+
+
+def test_ensure_running_reports_unpublished_port_when_it_is_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_traefik_ports(monkeypatch, [""])
+    monkeypatch.setattr(host, "port_free", lambda port: True)
+    with pytest.raises(WtError, match=f"{router.container()} does not publish port 80"):
+        router.ensure_running()
+
+
+def test_ensure_running_with_force_recreate_recreates_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_traefik_ports(monkeypatch, [PUBLISHED])
+    router.ensure_running(force_recreate=True)
+    assert [("--force-recreate" in up) for up in _ups(calls)] == [True]
+
+
+def test_ensure_running_with_force_recreate_still_reports_missing_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_traefik_ports(monkeypatch, [""])
+    monkeypatch.setattr(host, "port_free", lambda port: False)
+    with pytest.raises(WtError, match="port 80 is already in use by another program"):
+        router.ensure_running(force_recreate=True)
+    assert len(_ups(calls)) == 1

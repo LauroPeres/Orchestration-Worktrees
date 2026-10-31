@@ -63,6 +63,7 @@ class FakeProc:
 def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     f = FakeProc()
     monkeypatch.setattr(proc, "run", f)
+    f.on("docker port", proc.Result(0, f"19092/tcp -> 127.0.0.1:{kafka.host_port()}\n", ""))
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr("wt.providers.kafka.time.sleep", lambda s: None)
     return f

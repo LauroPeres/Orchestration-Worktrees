@@ -10,6 +10,23 @@ from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
 
 OK = proc.Result(0, "", "")
+TRAEFIK_PORTS = "80/tcp -> 127.0.0.1:80\n443/tcp -> 127.0.0.1:443\n"
+
+
+def _answer(running: bool, ports: set[int]) -> Callable[..., proc.Result]:
+    """Fake `proc.run` for a container: `docker inspect` says running, `docker port` its ports."""
+
+    def run(args: list[str], **kw: object) -> proc.Result:
+        if args[:2] == ["docker", "port"]:
+            return proc.Result(0, "".join(f"{p}/tcp -> 127.0.0.1:{p}\n" for p in sorted(ports)), "")
+        return proc.Result(0, "true\n" if running else "false\n", "")
+
+    return run
+
+
+def _traefik_answers(args: list[str], **kw: object) -> proc.Result:
+    """Fake `proc.run` for a Traefik that publishes its HTTP and HTTPS ports."""
+    return proc.Result(0, TRAEFIK_PORTS if args[:2] == ["docker", "port"] else "", "")
 
 
 def _fake_docker(compose_version: str | None) -> Callable[..., proc.Result]:
@@ -94,7 +111,7 @@ def test_fix_starts_traefik_when_ports_free(monkeypatch: pytest.MonkeyPatch) -> 
     def start(*a: object, **k: object) -> None:
         state["running"] = True
 
-    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "", ""))
+    monkeypatch.setattr(proc, "run", _traefik_answers)
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr(router, "is_running", lambda: state["running"])
     monkeypatch.setattr(router, "ensure_running", start)
@@ -111,7 +128,7 @@ def _stale_traefik(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     def recreate(*a: object, **k: object) -> None:
         state["gateway"] = True
 
-    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "", ""))
+    monkeypatch.setattr(proc, "run", _traefik_answers)
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr(router, "is_running", lambda: True)
     monkeypatch.setattr(router, "has_host_gateway", lambda: state["gateway"])
@@ -150,19 +167,21 @@ def test_has_host_gateway_reads_inspect(monkeypatch: pytest.MonkeyPatch) -> None
 class PgFake:
     """Stands in for the container and the provider helpers."""
 
-    def __init__(self, *, running: bool, closed: list[str]) -> None:
+    def __init__(self, *, running: bool, closed: list[str], published: bool = True) -> None:
         self.running = running
+        self.ports = {postgres.host_port()} if published else set()
         self.closed = closed
         self.ensured: list[list[str]] = []
         self.repaired = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def run(args: list[str], **kw: object) -> proc.Result:
-            return proc.Result(0, "true\n" if self.running else "false\n", "")
+            return _answer(self.running, self.ports)(args, **kw)
 
         def ensure(databases: list[str], timeout: int = 60) -> None:
             self.ensured.append(databases)
             self.running = True
+            self.ports = {postgres.host_port()}
             self.repair(databases)
 
         monkeypatch.setattr(proc, "run", run)
@@ -248,17 +267,19 @@ def test_postgres_closed_databases_fail_then_fix(monkeypatch: pytest.MonkeyPatch
 class RedisFake:
     """Stands in for the container and the server start."""
 
-    def __init__(self, *, running: bool) -> None:
+    def __init__(self, *, running: bool, published: bool = True) -> None:
         self.running = running
+        self.ports = {redis.host_port()} if published else set()
         self.ensured = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def run(args: list[str], **kw: object) -> proc.Result:
-            return proc.Result(0, "true\n" if self.running else "false\n", "")
+            return _answer(self.running, self.ports)(args, **kw)
 
         def ensure() -> None:
             self.ensured += 1
             self.running = True
+            self.ports = {redis.host_port()}
 
         monkeypatch.setattr(proc, "run", run)
         monkeypatch.setattr(redis, "ensure_server", ensure)
@@ -304,17 +325,19 @@ def test_redis_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
 class KafkaFake:
     """Stands in for the container and the server start."""
 
-    def __init__(self, *, running: bool) -> None:
+    def __init__(self, *, running: bool, published: bool = True) -> None:
         self.running = running
+        self.ports = {kafka.host_port()} if published else set()
         self.ensured = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def run(args: list[str], **kw: object) -> proc.Result:
-            return proc.Result(0, "true\n" if self.running else "false\n", "")
+            return _answer(self.running, self.ports)(args, **kw)
 
         def ensure() -> None:
             self.ensured += 1
             self.running = True
+            self.ports = {kafka.host_port()}
 
         monkeypatch.setattr(proc, "run", run)
         monkeypatch.setattr(kafka, "ensure_server", ensure)
@@ -360,17 +383,19 @@ def test_kafka_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
 class KeycloakFake:
     """Stands in for the container and the server start."""
 
-    def __init__(self, *, running: bool) -> None:
+    def __init__(self, *, running: bool, published: bool = True) -> None:
         self.running = running
+        self.ports = {keycloak.host_port()} if published else set()
         self.ensured = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def run(args: list[str], **kw: object) -> proc.Result:
-            return proc.Result(0, "true\n" if self.running else "false\n", "")
+            return _answer(self.running, self.ports)(args, **kw)
 
         def ensure(realm: str | None = None, timeout: int = 120) -> None:
             self.ensured += 1
             self.running = True
+            self.ports = {keycloak.host_port()}
 
         monkeypatch.setattr(proc, "run", run)
         monkeypatch.setattr(keycloak, "ensure_server", ensure)
@@ -556,7 +581,7 @@ def _mounts(monkeypatch: pytest.MonkeyPatch, after_restart: list[str]) -> list[s
         restarts.append("restart")
         missing["now"] = after_restart
 
-    monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(0, "", ""))
+    monkeypatch.setattr(proc, "run", _traefik_answers)
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr(router, "is_running", lambda: True)
     monkeypatch.setattr(router, "has_host_gateway", lambda: True)
@@ -619,7 +644,7 @@ def test_mounts_fix_passes_force_recreate_to_compose(monkeypatch: pytest.MonkeyP
         calls.append(list(args))
         if args[:2] == ["docker", "compose"]:
             state["missing"] = []
-        return proc.Result(0, "", "")
+        return _traefik_answers(args, **kw)
 
     monkeypatch.setattr(proc, "run", run)
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
@@ -630,3 +655,224 @@ def test_mounts_fix_passes_force_recreate_to_compose(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
     assert _by_name(doctor.check_routing(fix=True))["traefik mounts"].level == "ok"
     assert any("--force-recreate" in c for c in calls)
+
+
+# ---- published host ports ---------------------------------------------------------------
+
+
+class TraefikFake:
+    """A running Traefik whose published ports change when it is recreated."""
+
+    def __init__(self, *, published: bool) -> None:
+        self.ports = {router.http_port(), router.https_port()} if published else set()
+        self.recreated = 0
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, *, running: bool = True) -> None:
+        def recreate(*a: object, **k: object) -> None:
+            assert k.get("force_recreate") is True
+            self.recreated += 1
+            self.ports = {router.http_port(), router.https_port()}
+
+        monkeypatch.setattr(proc, "run", lambda args, **kw: _answer(running, self.ports)(args))
+        monkeypatch.setattr(compose, "ensure_network", lambda: None)
+        monkeypatch.setattr(router, "is_running", lambda: running)
+        monkeypatch.setattr(router, "has_host_gateway", lambda: True)
+        monkeypatch.setattr(router, "missing_in_container", lambda: [])
+        monkeypatch.setattr(router, "ensure_running", recreate)
+        monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+        monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
+
+
+def test_traefik_without_published_ports_fails_with_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = TraefikFake(published=False)
+    fake.install(monkeypatch)
+    check = _by_name(doctor.check_routing(fix=False))["traefik ports"]
+    assert check.level == "fail"
+    assert check.detail.startswith(f"{router.container()} runs without its published ports")
+    assert str(router.http_port()) in check.detail
+    assert "\n" not in check.detail
+    assert check.hint == "run `wt doctor --fix`"
+    assert fake.recreated == 0
+
+
+def test_traefik_names_only_the_missing_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = TraefikFake(published=True)
+    fake.ports.discard(router.https_port())
+    fake.install(monkeypatch)
+    check = _by_name(doctor.check_routing(fix=False))["traefik ports"]
+    assert check.level == "fail"
+    assert check.detail.endswith(f"(missing {router.https_port()})")
+
+
+def test_traefik_with_published_ports_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = TraefikFake(published=True)
+    fake.install(monkeypatch)
+    assert _by_name(doctor.check_routing(fix=False))["traefik ports"].level == "ok"
+    assert fake.recreated == 0
+
+
+def test_traefik_fix_recreates_once_and_the_next_check_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = TraefikFake(published=False)
+    fake.install(monkeypatch)
+    assert _by_name(doctor.check_routing(fix=True))["traefik ports"].level == "ok"
+    assert fake.recreated == 1
+    assert _by_name(doctor.check_routing(fix=False))["traefik ports"].level == "ok"
+    assert fake.recreated == 1
+
+
+def test_traefik_fix_that_cannot_publish_stays_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = TraefikFake(published=False)
+    fake.install(monkeypatch)
+
+    def recreate(*a: object, **k: object) -> None:
+        fake.recreated += 1
+
+    monkeypatch.setattr(router, "ensure_running", recreate)
+    check = _by_name(doctor.check_routing(fix=True))["traefik ports"]
+    assert (check.level, fake.recreated) == ("fail", 1)
+    assert "runs without its published ports" in check.detail
+
+
+def test_traefik_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    TraefikFake(published=False).install(monkeypatch)
+
+    def boom(*a: object, **k: object) -> None:
+        raise WtError("port 80 is already in use by another program\nmore")
+
+    monkeypatch.setattr(router, "ensure_running", boom)
+    check = _by_name(doctor.check_routing(fix=True))["traefik ports"]
+    assert check.level == "fail"
+    assert check.detail == "port 80 is already in use by another program"
+    assert "wt doctor --fix" in check.hint
+
+
+def test_stopped_traefik_has_no_ports_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = TraefikFake(published=False)
+    fake.install(monkeypatch, running=False)
+    checks = _by_name(doctor.check_routing(fix=False))
+    assert "traefik ports" not in checks
+    assert checks["traefik"].detail == "not running"
+    assert fake.recreated == 0
+
+
+ServerFake = RedisFake | KafkaFake | KeycloakFake
+SERVERS: dict[str, tuple[Callable[..., ServerFake], Callable[..., doctor.Check]]] = {
+    "redis": (RedisFake, doctor.check_redis),
+    "kafka": (KafkaFake, doctor.check_kafka),
+    "keycloak": (KeycloakFake, doctor.check_keycloak),
+}
+
+
+HOST_PORTS: dict[str, Callable[[], int]] = {
+    "redis": redis.host_port,
+    "kafka": kafka.host_port,
+    "keycloak": keycloak.host_port,
+}
+
+
+@pytest.mark.parametrize("name", SERVERS)
+def test_server_without_published_port_fails_with_hint(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    make_fake, check_server = SERVERS[name]
+    fake = make_fake(running=True, published=False)
+    fake.install(monkeypatch)
+    check = check_server(fix=False)
+    assert check.level == "fail"
+    port = HOST_PORTS[name]()
+    assert check.detail.endswith(f"runs without its published ports (missing {port})")
+    assert "\n" not in check.detail
+    assert check.hint == "run `wt doctor --fix`"
+    assert fake.ensured == 0
+
+
+@pytest.mark.parametrize("name", SERVERS)
+def test_server_with_published_port_is_ok(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    make_fake, check_server = SERVERS[name]
+    fake = make_fake(running=True, published=True)
+    fake.install(monkeypatch)
+    assert check_server(fix=False).level == "ok"
+    assert fake.ensured == 0
+
+
+@pytest.mark.parametrize("name", SERVERS)
+def test_server_fix_recreates_once_and_the_next_check_passes(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    make_fake, check_server = SERVERS[name]
+    fake = make_fake(running=True, published=False)
+    fake.install(monkeypatch)
+    assert check_server(fix=True).level == "ok"
+    assert fake.ensured == 1
+    assert check_server(fix=False).level == "ok"
+    assert fake.ensured == 1
+
+
+@pytest.mark.parametrize("name", SERVERS)
+def test_server_fix_that_cannot_publish_stays_failed(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    make_fake, check_server = SERVERS[name]
+    fake = make_fake(running=True, published=False)
+    fake.install(monkeypatch)
+    module = {"redis": redis, "kafka": kafka, "keycloak": keycloak}[name]
+    calls: list[int] = []
+    monkeypatch.setattr(module, "ensure_server", lambda *a, **k: calls.append(1))
+    check = check_server(fix=True)
+    assert (check.level, len(calls)) == ("fail", 1)
+    assert "runs without its published ports" in check.detail
+
+
+@pytest.mark.parametrize("name", SERVERS)
+def test_stopped_server_keeps_the_not_running_failure(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    make_fake, check_server = SERVERS[name]
+    fake = make_fake(running=False, published=False)
+    fake.install(monkeypatch)
+    check = check_server(fix=False)
+    assert check.level == "fail"
+    assert check.detail.endswith("not running")
+    assert fake.ensured == 0
+
+
+def test_postgres_without_published_port_fails_with_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = PgFake(running=True, closed=[], published=False)
+    fake.install(monkeypatch)
+    check = _by_name(doctor.check_postgres(["shop"], fix=False))["postgres"]
+    assert check.level == "fail"
+    assert check.detail == (
+        f"{postgres.container()} runs without its published ports (missing {postgres.host_port()})"
+    )
+    assert check.hint == "run `wt doctor --fix`"
+    assert fake.ensured == []
+
+
+def test_postgres_fix_recreates_once_and_the_next_check_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = PgFake(running=True, closed=[], published=False)
+    fake.install(monkeypatch)
+    assert _by_name(doctor.check_postgres(["shop"], fix=True))["postgres"].level == "ok"
+    assert fake.ensured == [["shop"]]
+    assert _by_name(doctor.check_postgres(["shop"], fix=False))["postgres"].level == "ok"
+    assert fake.ensured == [["shop"]]
+
+
+def test_postgres_fix_that_cannot_publish_stays_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    PgFake(running=True, closed=[], published=False).install(monkeypatch)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(postgres, "ensure_server", lambda dbs, timeout=60: calls.append(dbs))
+    check = _by_name(doctor.check_postgres(["shop"], fix=True))["postgres"]
+    assert (check.level, len(calls)) == ("fail", 1)
+
+
+def test_stopped_postgres_keeps_the_not_running_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = PgFake(running=False, closed=[], published=False)
+    fake.install(monkeypatch)
+    check = _by_name(doctor.check_postgres(["shop"], fix=False))["postgres"]
+    assert check.level == "warn"
+    assert check.detail.endswith("not running")
+    assert fake.ensured == []

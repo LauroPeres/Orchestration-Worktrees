@@ -3,6 +3,7 @@
 import platform
 import re
 import socket
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Literal
 
@@ -154,6 +155,7 @@ def check_routing(fix: bool) -> list[Check]:
         )
     if running:
         checks.append(_check_mounts(fix))
+        checks.append(_check_traefik_published(fix))
     mapped = _traefik_ports() if running else ""
     for label, port, env in [
         ("http port", router.http_port(), "WT_HTTP_PORT"),
@@ -176,6 +178,36 @@ def check_routing(fix: bool) -> list[Check]:
 
 
 _MOUNTS_HINT = "run `wt doctor --fix` (recreates the container)"
+_PORTS_HINT = "run `wt doctor --fix`"
+
+
+def _missing_ports(container_name: str, expected: Collection[int]) -> list[int]:
+    return sorted(set(expected) - compose.published_host_ports(container_name))
+
+
+def _unpublished_check(label: str, container_name: str, missing: list[int]) -> Check:
+    ports = ", ".join(str(port) for port in missing)
+    return Check(
+        label,
+        "fail",
+        f"{container_name} runs without its published ports (missing {ports})",
+        _PORTS_HINT,
+    )
+
+
+def _check_traefik_published(fix: bool) -> Check:
+    expected = {router.http_port(), router.https_port()}
+    missing = _missing_ports(router.container(), expected)
+    if missing and fix:
+        try:
+            with file_lock("traefik"):
+                router.ensure_running(force_recreate=True)
+        except WtError as exc:
+            return Check("traefik ports", "fail", str(exc).splitlines()[0], _PORTS_HINT)
+        missing = _missing_ports(router.container(), expected)
+    if not missing:
+        return Check("traefik ports", "ok", f"{router.container()} publishes its ports")
+    return _unpublished_check("traefik ports", router.container(), missing)
 
 
 def _check_mounts(fix: bool) -> Check:
@@ -221,81 +253,78 @@ def check_resolution(domain: str) -> Check:
     )
 
 
+@dataclass(frozen=True)
+class _Server:
+    """A shared server the doctor checks: its container, host port and how `--fix` starts it."""
+
+    label: str
+    container: str
+    port: int
+    ensure: Callable[[], None]
+
+
 def check_postgres(databases: list[str], *, fix: bool) -> list[Check]:
     """Shared Postgres: container, password file mode, closed databases (no secrets shown)."""
-    checks: list[Check] = []
-    name = postgres.container()
-    running = _container_running(name)
-    if not running and fix:
-        try:
-            with file_lock("postgres"):
-                postgres.ensure_server(databases)
-        except WtError as exc:
-            checks.append(Check("postgres", "fail", str(exc).splitlines()[0]))
-        running = _container_running(name)
-    if running:
-        checks.append(Check("postgres", "ok", f"{name} running"))
-    elif not any(c.name == "postgres" for c in checks):
-        checks.append(
-            Check(
-                "postgres",
-                "warn",
-                f"{name} not running",
-                "started on first `wt up` (or `wt doctor --fix`)",
-            )
-        )
-    checks.append(_check_password(fix))
-    if running:
+    server = _Server(
+        "postgres",
+        postgres.container(),
+        postgres.host_port(),
+        lambda: postgres.ensure_server(databases),
+    )
+    down = Check(
+        "postgres",
+        "warn",
+        f"{server.container} not running",
+        "started on first `wt up` (or `wt doctor --fix`)",
+    )
+    checks = [_check_server(server, down, fix), _check_password(fix)]
+    if _container_running(server.container):
         checks.append(_check_connections(databases, fix))
     return checks
 
 
 def check_redis(*, fix: bool) -> Check:
-    """Shared Redis: the container is running (started by `--fix`)."""
-    name = redis.container()
-    running = _container_running(name)
-    if not running and fix:
-        try:
-            with file_lock("redis"):
-                redis.ensure_server()
-        except WtError as exc:
-            return Check("redis", "fail", str(exc).splitlines()[0])
-        running = _container_running(name)
-    if running:
-        return Check("redis", "ok", f"{name} running")
-    return Check("redis", "fail", f"{name} not running", "run `wt doctor --fix`")
+    """Shared Redis: the container is running and publishes its port (started by `--fix`)."""
+    return _check_required(
+        _Server("redis", redis.container(), redis.host_port(), redis.ensure_server), fix
+    )
 
 
 def check_kafka(*, fix: bool) -> Check:
-    """Shared Kafka: the container is running (started by `--fix`)."""
-    name = kafka.container()
-    running = _container_running(name)
-    if not running and fix:
-        try:
-            with file_lock("kafka"):
-                kafka.ensure_server()
-        except WtError as exc:
-            return Check("kafka", "fail", str(exc).splitlines()[0])
-        running = _container_running(name)
-    if running:
-        return Check("kafka", "ok", f"{name} running")
-    return Check("kafka", "fail", f"{name} not running", "run `wt doctor --fix`")
+    """Shared Kafka: the container is running and publishes its port (started by `--fix`)."""
+    return _check_required(
+        _Server("kafka", kafka.container(), kafka.host_port(), kafka.ensure_server), fix
+    )
 
 
 def check_keycloak(*, fix: bool) -> Check:
-    """Shared Keycloak: the container is running (started by `--fix`)."""
-    name = keycloak.container()
-    running = _container_running(name)
-    if not running and fix:
+    """Shared Keycloak: the container is running and publishes its port (started by `--fix`)."""
+    return _check_required(
+        _Server("keycloak", keycloak.container(), keycloak.host_port(), keycloak.ensure_server),
+        fix,
+    )
+
+
+def _check_required(server: _Server, fix: bool) -> Check:
+    down = Check(server.label, "fail", f"{server.container} not running", "run `wt doctor --fix`")
+    return _check_server(server, down, fix)
+
+
+def _check_server(server: _Server, down: Check, fix: bool) -> Check:
+    """Running and publishing its port; `--fix` starts it, or recreates it when the port is lost."""
+    name, label = server.container, server.label
+    if fix and (not _container_running(name) or _missing_ports(name, [server.port])):
         try:
-            with file_lock("keycloak"):
-                keycloak.ensure_server()
+            with file_lock(label):
+                server.ensure()
         except WtError as exc:
-            return Check("keycloak", "fail", str(exc).splitlines()[0])
-        running = _container_running(name)
-    if running:
-        return Check("keycloak", "ok", f"{name} running")
-    return Check("keycloak", "fail", f"{name} not running", "run `wt doctor --fix`")
+            return Check(label, "fail", str(exc).splitlines()[0])
+    if not _container_running(name):
+        return down
+    missing = _missing_ports(name, [server.port])
+    if missing:
+        return _unpublished_check(label, name, missing)
+    return Check(label, "ok", f"{name} running")
 
 
 def _container_running(name: str) -> bool:

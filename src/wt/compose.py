@@ -1,14 +1,14 @@
 """Docker Compose runtime: one compose project per (branch, repo)."""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from wt import proc
+from wt import host, proc
 from wt.errors import WtError
 from wt.paths import instance
 
@@ -191,3 +191,57 @@ def ensure_network() -> None:
         # Another wt process may have created it between inspect and create.
         if not proc.run(inspect, check=False).ok:
             raise
+
+
+def published_host_ports(container: str) -> set[int]:
+    """Host ports the container publishes, read from `docker port` (empty when it has none).
+
+    A stopped or missing container makes `docker port` fail or print nothing: both mean
+    "no published ports". Lines look like `5432/tcp -> 127.0.0.1:55432` or `443/tcp -> [::]:443`.
+    """
+    result = proc.run(["docker", "port", container], check=False)
+    if not result.ok:
+        return set()
+    ports: set[int] = set()
+    for line in result.stdout.splitlines():
+        _, arrow, bound = line.partition("->")
+        _, colon, port = bound.strip().rpartition(":")
+        if arrow and colon and port.isdecimal():
+            ports.add(int(port))
+    return ports
+
+
+def ensure_published(
+    container: str, host_ports: Collection[int], recreate: Callable[[], None]
+) -> None:
+    """Make sure the container publishes every host port; recreate it once if it does not.
+
+    After a start that failed on a taken host port, Docker's next start runs the container
+    with no network and no published ports while it still reports healthy.
+    """
+    if not host_ports:
+        return
+    missing = set(host_ports) - published_host_ports(container)
+    if not missing:
+        return
+    try:
+        recreate()
+    except WtError as exc:
+        # A recreate that fails on the bind surfaces Docker's raw error; name the port instead.
+        # Only unpublished ports are probed: the ones the container holds look busy.
+        busy = _first_busy_port(missing)
+        if busy is None:
+            raise
+        raise WtError(f"port {busy} is already in use by another program") from exc
+    still_missing = sorted(set(host_ports) - published_host_ports(container))
+    if not still_missing:
+        return
+    port = still_missing[0]
+    if not host.port_free(port):
+        raise WtError(f"port {port} is already in use by another program")
+    raise WtError(f"{container} does not publish port {port}")
+
+
+def _first_busy_port(host_ports: Collection[int]) -> int | None:
+    """The lowest of `host_ports` that another program listens on, or None when all are free."""
+    return next((port for port in sorted(host_ports) if not host.port_free(port)), None)

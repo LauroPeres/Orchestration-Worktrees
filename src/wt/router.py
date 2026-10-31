@@ -98,13 +98,38 @@ def ensure_running(
     *,
     force_recreate: bool = False,
 ) -> None:
-    """Start (or update) the shared Traefik. Safe to call on every `up`."""
+    """Start (or update) the shared Traefik. Safe to call on every `up`.
+
+    Fails at once when Traefik runs without its host ports (e.g. after a start that lost the
+    port to another program), instead of leaving routes that never answer.
+    """
     folder = traefik_dir()
     dynamic_dir().mkdir(parents=True, exist_ok=True)
     certs_dir().mkdir(parents=True, exist_ok=True)
     compose_file = folder / "compose.yml"
     atomic_write(compose_file, yaml.safe_dump(compose_doc(), sort_keys=False))
     compose.ensure_network()
+
+    def start(recreate: bool) -> None:
+        _compose_up(compose_file, timeout, on_line, force_recreate=recreate)
+
+    start(force_recreate)
+    # A recreate was already done when requested: only verify, never recreate twice.
+    repair = _no_repair if force_recreate else lambda: start(recreate=True)
+    compose.ensure_published(container(), {http_port(), https_port()}, repair)
+
+
+def _no_repair() -> None:
+    """Placeholder repair for a start that already recreated the container."""
+
+
+def _compose_up(
+    compose_file: Path,
+    timeout: int,
+    on_line: Callable[[str], None] | None,
+    *,
+    force_recreate: bool,
+) -> None:
     proc.run(
         [
             "docker",
@@ -120,7 +145,7 @@ def ensure_running(
             "--wait-timeout",
             str(timeout),
         ],
-        cwd=folder,
+        cwd=compose_file.parent,
         capture=on_line is None,
         on_line=on_line,
     )
