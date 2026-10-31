@@ -1,6 +1,7 @@
 """Shared Traefik (file provider) and one route file per branch."""
 
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,6 +19,9 @@ from wt.state import atomic_write
 DEFAULT_IMAGE = "traefik:v3.5"
 CERTS_IN_CONTAINER = "/etc/traefik/certs"
 HOST_GATEWAY_NAME = "host.docker.internal"  # how the Traefik container reaches host processes
+ROUTE_FILE_SUFFIXES = {".yml", ".yaml"}  # what Traefik's file provider loads from our folder
+ROUTE_FILE_SEPARATOR = "--"  # between project and branch slug in a route file name
+_HOST_MATCHER = re.compile(r"Host\(\s*`([^`]+)`\s*\)")
 
 
 def container() -> str:
@@ -251,3 +255,51 @@ def write_routes(names: Names, routes: list[Route], cert: tuple[Path, Path] | No
 
 def remove_routes(path: Path) -> None:
     path.unlink(missing_ok=True)
+
+
+def hosts_in_use(exclude: Path | None = None) -> dict[str, Path]:
+    """Every host routed by a route file in `dynamic_dir()`, mapped to the file that routes it.
+
+    Hosts are lowercased (DNS is case-insensitive). `exclude` is skipped, so a branch can ignore
+    its own file. Files that cannot be read or are not valid YAML are ignored, never raised.
+    When two files route the same host, the first in file-name order is returned.
+    """
+    folder = dynamic_dir()
+    if not folder.is_dir():
+        return {}
+    in_use: dict[str, Path] = {}
+    for path in sorted(folder.iterdir()):
+        if path.suffix not in ROUTE_FILE_SUFFIXES or path == exclude:
+            continue
+        for route_host in _route_file_hosts(path):
+            in_use.setdefault(route_host, path)
+    return in_use
+
+
+def _route_file_hosts(path: Path) -> set[str]:
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return set()
+    routers = doc.get("http", {}).get("routers", {}) if isinstance(doc, dict) else {}
+    if not isinstance(routers, dict):
+        return set()
+    rules = (r.get("rule") for r in routers.values() if isinstance(r, dict))
+    return {
+        match.lower()
+        for rule in rules
+        if isinstance(rule, str)
+        for match in _HOST_MATCHER.findall(rule)
+    }
+
+
+def route_file_owner(path: Path) -> str:
+    """`project/branch` for a route file named `<project>--<slug>.yml`, else the file stem.
+
+    Only the project and the branch *slug* are recoverable (`feat/cart` is stored as
+    `feat-cart`). The split is at the last `--`: a project name may contain `--`, a slug never.
+    """
+    project, separator, slug = path.stem.rpartition(ROUTE_FILE_SEPARATOR)
+    if not separator or not project or not slug:
+        return path.stem
+    return f"{project}/{slug}"
