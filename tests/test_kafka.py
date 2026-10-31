@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
@@ -28,10 +28,14 @@ def config(**opts: object) -> Config:
 class FakeProc:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
-        self.rules: list[tuple[str, proc.Result]] = []
+        self.rules: list[tuple[str, Callable[[], proc.Result]]] = []
 
     def on(self, needle: str, result: proc.Result) -> None:
-        self.rules.append((needle, result))
+        self.rules.append((needle, lambda: result))
+
+    def on_each(self, needle: str, next_result: Callable[[], proc.Result]) -> None:
+        """Answer every matching call with the next result (a sequence of answers)."""
+        self.rules.append((needle, next_result))
 
     def tools(self) -> list[list[str]]:
         """`[script, args...]` for every exec of a /opt/kafka/bin tool, in order."""
@@ -48,7 +52,7 @@ class FakeProc:
         result = proc.Result(0, "", "")
         for needle, rule in self.rules:
             if needle in line:
-                result = rule
+                result = rule()
                 break
         if check and not result.ok:
             raise proc.CommandError(args, result)
@@ -246,22 +250,93 @@ def test_destroy_tolerates_missing_group(fake: FakeProc) -> None:
     provider().destroy(ctx())
 
 
-def test_destroy_warns_when_a_consumer_is_still_connected(fake: FakeProc) -> None:
-    fake.on(
-        "kafka-consumer-groups.sh",
-        proc.Result(
-            0,
-            "Error: Deletion of some consumer groups failed:\n"
-            "* Group 'worker-feat-cart' could not be deleted due to: "
-            "java.util.concurrent.ExecutionException: "
-            "org.apache.kafka.common.errors.GroupNotEmptyException: The group is not empty.\n",
-            "",
-        ),
+NOT_EMPTY = proc.Result(
+    0,
+    "Error: Deletion of some consumer groups failed:\n"
+    "* Group 'worker-feat-cart' could not be deleted due to: "
+    "java.util.concurrent.ExecutionException: "
+    "org.apache.kafka.common.errors.GroupNotEmptyException: The group is not empty.\n",
+    "",
+)
+
+
+class Clock:
+    """A monotonic clock that only moves when the code sleeps, so retries cost no real time."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        monkeypatch.setattr("wt.providers.kafka.time.monotonic", lambda: self.now)
+        monkeypatch.setattr("wt.providers.kafka.time.sleep", self.sleep)
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    return Clock(monkeypatch)
+
+
+def group_deletes(fake: FakeProc) -> list[list[str]]:
+    return [t for t in fake.tools() if t[0] == "kafka-consumer-groups.sh"]
+
+
+def test_destroy_retries_while_a_consumer_is_still_a_member_then_succeeds(
+    fake: FakeProc, clock: Clock
+) -> None:
+    results = iter(
+        [NOT_EMPTY, NOT_EMPTY, proc.Result(0, "Deletion of requested consumer groups", "")]
     )
+    fake.on_each("kafka-consumer-groups.sh", lambda: next(results))
+    provider().destroy(ctx())
+    assert len(group_deletes(fake)) == 3
+    assert clock.sleeps == [kafka.GROUP_RETRY_INTERVAL] * 2
+
+
+def test_destroy_accepts_a_group_that_disappears_while_retrying(
+    fake: FakeProc, clock: Clock
+) -> None:
+    results = iter([NOT_EMPTY, proc.Result(1, "", "Group worker-feat-cart does not exist")])
+    fake.on_each("kafka-consumer-groups.sh", lambda: next(results))
+    provider().destroy(ctx())
+    assert len(group_deletes(fake)) == 2
+
+
+def test_destroy_raises_when_members_remain_after_the_retry_window(
+    fake: FakeProc, clock: Clock
+) -> None:
+    fake.on("kafka-consumer-groups.sh", NOT_EMPTY)
+    with pytest.raises(WtError) as err:
+        provider().destroy(ctx())
+    assert str(err.value) == "consumer group worker-feat-cart still has members"
+    assert sum(clock.sleeps) == kafka.GROUP_RETRY_WINDOW
+    assert kafka.GROUP_RETRY_WINDOW == 20 and kafka.GROUP_RETRY_INTERVAL == 2
+
+
+def test_a_group_with_members_stops_destroy_before_it_touches_the_topics(
+    fake: FakeProc, clock: Clock
+) -> None:
+    fake.on("kafka-consumer-groups.sh", NOT_EMPTY)
+    with pytest.raises(WtError):
+        provider(topic_prefix=True).destroy(ctx())
+    assert not [t for t in fake.tools() if t[0] == "kafka-topics.sh"]
+
+
+def test_destroy_does_not_retry_when_the_first_delete_works(fake: FakeProc, clock: Clock) -> None:
+    provider().destroy(ctx())
+    assert len(group_deletes(fake)) == 1 and clock.sleeps == []
+
+
+def test_destroy_tells_once_that_it_is_waiting_for_the_consumer(
+    fake: FakeProc, clock: Clock
+) -> None:
+    results = iter([NOT_EMPTY, NOT_EMPTY, proc.Result(0, "", "")])
+    fake.on_each("kafka-consumer-groups.sh", lambda: next(results))
     messages: list[str] = []
     KafkaProvider(config(), messages.append).destroy(ctx())
-    assert len(messages) == 1
-    assert "worker-feat-cart" in messages[0] and "consumer is still connected" in messages[0]
+    assert len(messages) == 1 and "worker-feat-cart" in messages[0]
 
 
 def test_destroy_raises_on_other_group_errors(fake: FakeProc) -> None:
