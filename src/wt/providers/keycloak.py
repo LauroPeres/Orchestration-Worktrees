@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -32,6 +33,18 @@ SCRIPT = (
     '--user "$KC_BOOTSTRAP_ADMIN_USERNAME" --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" '
     '>/dev/null && /opt/keycloak/bin/kcadm.sh "$@" --config "$CFG"'
 )
+
+# What kcadm 26.8.1 prints (stderr, exit 1) when an admin REST path answers 404, which is how a
+# missing realm is reported. A missing client is not an error: the list comes back empty (`[ ]`).
+# Any other failure (login refused, server unreachable, container stopped) has other wording.
+NOT_FOUND = re.compile(r"Resource not found for url: \S*/admin/realms/")
+# kcadm prints this progress line to stderr on every call, even a successful one.
+LOGIN_NOTICE = "Logging into"
+# A line that opens a JSON or HTML body, not an error message.
+FRAGMENT = re.compile(r"[\[\]{}<]")
+# `down` shows the first ~120 characters of the message: 10 for the prefix, 26 for the call name.
+REASON_MAX = 80
+CALL_WORDS = 2
 
 
 def container() -> str:
@@ -106,11 +119,50 @@ def compose_doc() -> dict[str, Any]:
     }
 
 
+def _failure_reason(res: proc.Result) -> str:
+    """The first meaningful line kcadm (or docker exec) wrote: stderr first, then stdout.
+
+    Skips the login notice and lines that are only a JSON or HTML fragment (`[`, `{`, `<html>`),
+    which say nothing about the cause.
+    """
+    for stream in (res.stderr, res.stdout):
+        for line in stream.splitlines():
+            line = line.strip()
+            if line and not line.startswith(LOGIN_NOTICE) and not FRAGMENT.match(line):
+                return line
+    return f"exit code {res.returncode}"
+
+
+def _short(reason: str) -> str:
+    """Cap the reason but keep its end, where kcadm puts the cause ("... Connection refused")."""
+    if len(reason) <= REASON_MAX:
+        return reason
+    return "..." + reason[-(REASON_MAX - len("...")) :]
+
+
+def _call_name(args: tuple[str, ...]) -> str:
+    """`kcadm.sh <verb> <resource>`: never ids, realm or client names, the script or a password."""
+    words = [arg.split("/")[0] for arg in args if not arg.startswith("-")]
+    return " ".join(["kcadm.sh", *words[:CALL_WORDS]])
+
+
+def _failure(args: tuple[str, ...], reason: str) -> WtError:
+    """One line, cause first, so a caller that shows only the start of it still shows the cause."""
+    return WtError(f"keycloak: {_short(reason)} ({_call_name(args)})")
+
+
+def _kcadm_error(args: tuple[str, ...], res: proc.Result) -> WtError:
+    return _failure(args, _failure_reason(res))
+
+
 def kcadm(*args: str, check: bool = True) -> proc.Result:
     """Run one `kcadm.sh` command inside the server container (arguments stay positional)."""
-    return proc.run(
-        ["docker", "exec", container(), "bash", "-c", SCRIPT, "kcadm", *args], check=check
+    res = proc.run(
+        ["docker", "exec", container(), "bash", "-c", SCRIPT, "kcadm", *args], check=False
     )
+    if check and not res.ok:
+        raise _kcadm_error(args, res)
+    return res
 
 
 def wait_ready(timeout: float = 120.0) -> None:
@@ -128,12 +180,12 @@ def wait_ready(timeout: float = 120.0) -> None:
 
 
 def ensure_realm(realm: str) -> None:
-    res = kcadm(
-        "create", "realms", "-s", f"realm={realm}", "-s", "enabled=true",
-        "-s", "sslRequired=none", check=False,
+    args = (
+        "create", "realms", "-s", f"realm={realm}", "-s", "enabled=true", "-s", "sslRequired=none",
     )  # fmt: skip
+    res = kcadm(*args, check=False)
     if not res.ok and "already exists" not in f"{res.stdout}{res.stderr}":
-        raise WtError(f"could not create Keycloak realm {realm!r}: {res.stderr.strip()}")
+        raise _kcadm_error(args, res)
 
 
 def ensure_server(realm: str | None = None, timeout: int = 120) -> None:
@@ -143,18 +195,27 @@ def ensure_server(realm: str | None = None, timeout: int = 120) -> None:
         ensure_realm(realm)
 
 
-def find_client(realm: str, client_id: str, *, check: bool = True) -> dict[str, Any] | None:
-    """The client whose clientId is exactly `client_id` (the server filter is a substring)."""
-    res = kcadm(
+def find_client(realm: str, client_id: str) -> dict[str, Any] | None:
+    """The client whose clientId is exactly `client_id` (the server filter is a substring).
+
+    None only when the realm or the client does not exist; every other failure raises, so a
+    stopped server is never read as "nothing to do".
+    """
+    args = (
         "get", "clients", "-r", realm, "-q", f"clientId={client_id}",
-        "--fields", "id,clientId,redirectUris", check=check,
+        "--fields", "id,clientId,redirectUris",
     )  # fmt: skip
+    res = kcadm(*args, check=False)
     if not res.ok:
-        return None
+        if NOT_FOUND.search(res.stderr):
+            return None
+        raise _kcadm_error(args, res)
     try:
-        rows = json.loads(res.stdout or "[]")
+        rows = json.loads(res.stdout)
     except json.JSONDecodeError as e:
-        raise WtError(f"unexpected kcadm output for clients in realm {realm!r}") from e
+        raise _failure(args, "did not return JSON") from e
+    if not isinstance(rows, list):
+        raise _failure(args, "did not return a list")
     for row in rows:
         if row.get("clientId") == client_id:
             return dict(row)
@@ -208,9 +269,7 @@ class KeycloakProvider:
 
     def verify(self, ctx: BranchContext) -> Check:
         realm, client_id = self._cfg().realm, self.client_id(ctx)
-        if not kcadm("get", f"realms/{realm}", check=False).ok:
-            return Check(False, f"Keycloak realm {realm!r} did not answer ({container()})")
-        row = find_client(realm, client_id, check=False)
+        row = find_client(realm, client_id)
         if row is None:
             return Check(False, f"client {client_id!r} not found in realm {realm!r}")
         if set(row.get("redirectUris", [])) != set(self.redirect_uris(ctx)):
@@ -229,7 +288,7 @@ class KeycloakProvider:
             realm, sep, client_id = entry.partition("/")
             if not sep or not realm or not client_id:
                 continue
-            row = find_client(realm, client_id, check=False)
+            row = find_client(realm, client_id)
             if row is not None:
                 kcadm("delete", f"clients/{row['id']}", "-r", realm)
 

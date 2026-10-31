@@ -1,6 +1,6 @@
 import json
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
@@ -80,6 +80,41 @@ def clients(*rows: tuple[str, str, list[str]]) -> proc.Result:
         json.dumps([{"id": i, "clientId": c, "redirectUris": r} for i, c, r in rows]),
         "",
     )
+
+
+REALM_NOT_FOUND = proc.Result(
+    1,
+    "",
+    "Logging into http://localhost:8080 as user admin of realm master\n"
+    "Resource not found for url: http://localhost:8080/admin/realms/shop/clients?clientId=x\n",
+)
+LOGIN_REFUSED = proc.Result(
+    1,
+    "",
+    "Logging into http://localhost:8080 as user admin of realm master\n"
+    "Invalid user credentials [invalid_grant]\n",
+)
+UNREACHABLE = proc.Result(
+    1,
+    "",
+    "Logging into http://localhost:8080 as user admin of realm master\n"
+    "Failed to send request - Connect to localhost:8080 [localhost/127.0.0.1] failed: "
+    "Connection refused\n",
+)
+CONTAINER_STOPPED = proc.Result(
+    1, "", "Error response from daemon: container abc123 is not running\n"
+)
+FAILURES = pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (LOGIN_REFUSED, "Invalid user credentials"),
+        (UNREACHABLE, "Connection refused"),
+        (CONTAINER_STOPPED, "is not running"),
+        (proc.Result(1, "", "something kcadm never said\n"), "something kcadm never said"),
+        (proc.Result(0, "<html>proxy error</html>", ""), "did not return JSON"),
+        (proc.Result(0, '{"error": "x"}', ""), "did not return a list"),
+    ],
+)
 
 
 def rendered(urls: tuple[str, ...] = URLS) -> list[str]:
@@ -191,8 +226,20 @@ def test_ensure_server_treats_existing_realm_as_done(fake: FakeProc) -> None:
 
 def test_ensure_server_raises_on_other_realm_errors(fake: FakeProc) -> None:
     fake.on("create realms", proc.Result(1, "", "boom"))
-    with pytest.raises(WtError, match="boom"):
+    with pytest.raises(WtError) as err:
         provider().ensure_server()
+    assert str(err.value) == "keycloak: boom (kcadm.sh create realms)"
+
+
+def test_ensure_realm_failure_drops_the_login_notice_and_puts_the_cause_first(
+    fake: FakeProc,
+) -> None:
+    fake.on("create realms", UNREACHABLE)
+    with pytest.raises(WtError) as err:
+        keycloak.ensure_realm("shop")
+    message = str(err.value)
+    assert "Logging into" not in message and "Connection refused" in message[:100]
+    assert message.endswith("(kcadm.sh create realms)")
 
 
 def test_wait_ready_times_out_naming_password_file_and_volume(
@@ -205,6 +252,113 @@ def test_wait_ready_times_out_naming_password_file_and_volume(
         keycloak.wait_ready(timeout=25)
     assert str(keycloak.password_file()) in str(err.value)
     assert keycloak.volume() in str(err.value)
+
+
+def test_find_client_returns_none_for_a_missing_realm(fake: FakeProc) -> None:
+    fake.on("get clients", REALM_NOT_FOUND)
+    assert keycloak.find_client("shop", "web-x") is None
+
+
+def test_find_client_returns_none_for_a_missing_client(fake: FakeProc) -> None:
+    fake.on("get clients", proc.Result(0, "[ ]", ""))
+    assert keycloak.find_client("shop", "web-x") is None
+
+
+def test_find_client_does_not_take_a_login_404_for_a_missing_realm(fake: FakeProc) -> None:
+    fake.on(
+        "get clients",
+        proc.Result(1, "", "Resource not found for url: http://localhost:8080/realms/master/x\n"),
+    )
+    with pytest.raises(WtError, match=r"\(kcadm\.sh get clients\)$"):
+        keycloak.find_client("shop", "web-x")
+
+
+@FAILURES
+def test_find_client_raises_on_every_other_failure(
+    fake: FakeProc, failure: proc.Result, reason: str
+) -> None:
+    fake.on("get clients", failure)
+    with pytest.raises(WtError, match=reason):
+        keycloak.find_client("shop", "web-x")
+
+
+def test_failing_kcadm_puts_the_cause_first_and_names_the_call_not_the_login_script(
+    fake: FakeProc,
+) -> None:
+    fake.on("get realms/shop", LOGIN_REFUSED)
+    with pytest.raises(WtError) as err:
+        keycloak.kcadm("get", "realms/shop")
+    message = str(err.value)
+    assert message == "keycloak: Invalid user credentials [invalid_grant] (kcadm.sh get realms)"
+    assert keycloak.SCRIPT not in message and "mktemp" not in message
+    assert "KC_BOOTSTRAP_ADMIN_PASSWORD" not in message and "docker exec" not in message
+
+
+def test_the_cause_survives_a_long_realm_and_client_name(fake: FakeProc) -> None:
+    realm, client = "a-long-realm-name", "web-some-very-long-branch-name-here"
+    fake.on("get clients", proc.Result(1, "", "Connection refused"))
+    with pytest.raises(WtError) as err:
+        keycloak.find_client(realm, client)
+    message = str(err.value)
+    assert "Connection refused" in message[:100]
+    assert realm not in message and client not in message
+
+
+def test_a_long_reason_is_capped_but_keeps_its_end(fake: FakeProc) -> None:
+    fake.on("get clients", UNREACHABLE)
+    with pytest.raises(WtError) as err:
+        keycloak.find_client("shop", "web-x")
+    message = str(err.value)
+    assert len(message) < 120 and "Connection refused" in message
+
+
+def test_the_call_name_drops_ids_and_names(fake: FakeProc) -> None:
+    fake.on("delete clients", UNREACHABLE)
+    with pytest.raises(WtError) as err:
+        keycloak.kcadm("delete", f"clients/{UUID}", "-r", "shop")
+    assert str(err.value).endswith("(kcadm.sh delete clients)")
+
+
+def test_no_message_the_module_builds_carries_the_admin_password(fake: FakeProc) -> None:
+    secret = keycloak.password()
+    fake.on("kcadm", UNREACHABLE)
+    failing: list[Callable[[], object]] = [
+        lambda: keycloak.kcadm("get", "realms/shop"),
+        lambda: keycloak.ensure_realm("shop"),
+        lambda: keycloak.find_client("shop", "web-x"),
+        lambda: provider().verify(ctx()),
+        lambda: provider().destroy(ctx()),
+        lambda: keycloak.wait_ready(timeout=0),
+    ]
+    for call in failing:
+        with pytest.raises(WtError) as err:
+            call()
+        assert secret not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (proc.Result(1, "", "[\n  {"), "exit code 1"),
+        (proc.Result(1, "", "<html>...</html>"), "exit code 1"),
+        (proc.Result(1, "", "Logging into x\nboom"), "boom"),
+        (proc.Result(1, "[\n  {", "boom"), "boom"),
+        (proc.Result(1, "stdout cause", ""), "stdout cause"),
+        (proc.Result(1, "stdout cause", "stderr cause"), "stderr cause"),
+        (proc.Result(1, "", '{\n  "error": "x"\n}\n'), '"error": "x"'),
+        (proc.Result(137, "", ""), "exit code 137"),
+    ],
+)
+def test_failure_reason_prefers_stderr_and_never_returns_a_lone_fragment(
+    failure: proc.Result, expected: str
+) -> None:
+    assert keycloak._failure_reason(failure) == expected
+
+
+def test_kcadm_failure_without_output_still_has_a_reason(fake: FakeProc) -> None:
+    fake.on("get realms/shop", proc.Result(137, "", ""))
+    with pytest.raises(WtError, match="exit code 137"):
+        keycloak.kcadm("get", "realms/shop")
 
 
 def test_client_id_uses_branch_slug() -> None:
@@ -256,7 +410,6 @@ def test_verify_ok(fake: FakeProc) -> None:
     fake.on("get clients", clients((UUID, "web-feat-cart", list(reversed(rendered())))))
     check = provider().verify(ctx())
     assert check.ok and not check.warnings
-    assert any(c[:2] == ["get", "realms/shop"] for c in fake.kc())
 
 
 def test_verify_detects_redirect_uri_mismatch(fake: FakeProc) -> None:
@@ -271,10 +424,18 @@ def test_verify_detects_missing_client(fake: FakeProc) -> None:
     assert not check.ok and "web-feat-cart" in check.detail
 
 
-def test_verify_detects_unanswering_realm(fake: FakeProc) -> None:
-    fake.on("get realms/shop", proc.Result(1, "", "Resource not found"))
+def test_verify_reports_a_missing_realm_as_a_failed_check(fake: FakeProc) -> None:
+    fake.on("get clients", REALM_NOT_FOUND)
     check = provider().verify(ctx())
-    assert not check.ok and "shop" in check.detail
+    assert not check.ok and "shop" in check.detail and "web-feat-cart" in check.detail
+
+
+@FAILURES
+def test_verify_raises_when_kcadm_fails(fake: FakeProc, failure: proc.Result, reason: str) -> None:
+    fake.on("get clients", failure)
+    with pytest.raises(WtError, match=reason) as err:
+        provider().verify(ctx())
+    assert str(err.value).endswith("(kcadm.sh get clients)")
 
 
 def test_verify_warns_when_no_routed_urls(fake: FakeProc) -> None:
@@ -302,10 +463,31 @@ def test_destroy_never_touches_a_longer_branch(fake: FakeProc) -> None:
     assert not any(c[0] == "delete" for c in fake.kc())
 
 
-def test_destroy_is_safe_when_client_or_realm_is_missing(fake: FakeProc) -> None:
-    fake.on("get clients", proc.Result(1, "", "Realm not found"))
+def test_destroy_is_silent_when_the_realm_is_missing(fake: FakeProc) -> None:
+    fake.on("get clients", REALM_NOT_FOUND)
     provider().destroy(ctx())
     assert not any(c[0] == "delete" for c in fake.kc())
+
+
+def test_destroy_is_silent_when_the_client_is_missing(fake: FakeProc) -> None:
+    fake.on("get clients", proc.Result(0, "[ ]", ""))
+    provider().destroy(ctx())
+    assert not any(c[0] == "delete" for c in fake.kc())
+
+
+@FAILURES
+def test_destroy_raises_when_kcadm_fails(fake: FakeProc, failure: proc.Result, reason: str) -> None:
+    fake.on("get clients", failure)
+    with pytest.raises(WtError, match=reason):
+        provider().destroy(ctx())
+    assert not any(c[0] == "delete" for c in fake.kc())
+
+
+def test_destroy_raises_when_the_delete_itself_fails(fake: FakeProc) -> None:
+    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    fake.on("delete clients", UNREACHABLE)
+    with pytest.raises(WtError, match="Connection refused"):
+        provider().destroy(ctx())
 
 
 def test_destroy_uses_recorded_names_when_config_is_gone(fake: FakeProc) -> None:
