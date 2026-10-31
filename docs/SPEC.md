@@ -274,7 +274,8 @@ contain the password, so they are written with mode `0600`.
 **Postgres lock.** `up` and `down` hold `file_lock("postgres")` (same name as `doctor`) around `ensure_server`, `create` (incl. the clone) and `destroy`; order: branch, ports, postgres, state. `password()` is create-once across processes (dedicated `postgres-password` flock).
 
 **Postgres server start.** `ensure_server()` starts the container if needed, the same way Traefik is
-started. It waits up to 60 s for `pg_isready` inside the container. Then it re-enables
+started. The start and the `pg_isready` wait inside the container share one 60 s deadline (§18
+"One deadline"). Then it re-enables
 `datallowconn` on the wt-managed databases (`<db>__*` for each configured `<db>`, `_` escaped in
 `LIKE`) that have it off. A user's own database such as `a__b` is never touched. `doctor --fix` runs the same
 repair.
@@ -363,6 +364,14 @@ to the port. No port: the process is alive.
 
 **Up order.** resolve ports and render env → shared Traefik → worktrees → providers (ensure,
 create, verify) → TLS → compose services → host processes → routes → health → URL table.
+
+**Down failures.** When a provider step of `down` fails (its server cannot be started or reached,
+a login fails, a command errors), `down` stops there: the branch stays `removing`, its state
+record is not removed, and the command exits non-zero with the message
+``<provider>: could not clean branch <branch> (<short reason>). Try `wt doctor --fix`, then
+`wt down <branch>` again.`` Running `wt down <branch>` again after the fix finishes the job.
+`down` never continues past a failed provider step, because it would then delete the record
+and orphan the resource.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
 worktrees. Each step skips what state says was never created. Without a state entry, a folder
@@ -719,9 +728,12 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
   group that still has a live consumer is not deleted (the tool exits 0 and prints
   `GroupNotEmptyException`): `destroy` logs a warning naming the group and does not abort `down`.
 - **Locks and waits.** `file_lock("redis")` / `file_lock("kafka")`, also used by doctor.
-  `ensure_server` waits for the server (Redis 60 s, Kafka 90 s, each for `up --wait` and again for
-  readiness): `redis-cli PING` answers PONG; Kafka answers
+  `redis-cli PING` answers PONG; Kafka answers
   `kafka-broker-api-versions.sh --bootstrap-server localhost:9092`.
+- **One deadline.** `ensure_server` gives `docker compose up --wait` and the readiness wait one
+  deadline per provider (Postgres 60 s, Redis 60 s, Kafka 90 s, Keycloak 120 s). The compose
+  start gets the whole value as `--wait-timeout`; the readiness wait gets what is left (at least
+  1 s). The worst case is the stated value, never twice that. The readiness error names the total.
 - **Template values.** `redis.url` is `redis://<container>:6379/0` for `compose` and
   `redis://127.0.0.1:<WT_REDIS_PORT>/0` for `run`; `kafka.bootstrap` is `<container>:9092` for
   `compose` and `127.0.0.1:<WT_KAFKA_PORT>` for `run`.
@@ -746,8 +758,8 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
   `kcadm.sh "$@"`. User values are positional arguments, never part of the script, and the admin
   password never appears on the host command line.
 - **Readiness.** No compose healthcheck. `ensure_server` waits for `up --wait` (running), then
-  polls a `kcadm` login (`get realms/master`) for up to 120 s (a fresh start logs in after about
-  17 s). If the password file is gone but the volume is not, the login keeps failing and the
+  polls a `kcadm` login (`get realms/master`) within the shared 120 s deadline of §18 "One
+  deadline" (a fresh start logs in after about 17 s). If the password file is gone but the volume is not, the login keeps failing and the
   error names `~/.wt/keycloak/password` and the volume.
 - **Realm.** `ensure_server` creates the shared realm if missing (`realm=<realm> enabled=true
   sslRequired=none`; `create realms` exits 1 with "already exists", which counts as done). wt
@@ -762,7 +774,11 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
   id '<uuid>'`).
 - **Verify and destroy.** `verify`: the client exists with exactly the rendered redirect URIs and
   the realm answers. `destroy`: delete only this branch's client; branch `feat` never touches
-  `feat-x`. The realm and its users stay. Resources are recorded as `["<realm>/<clientId>"]` so
+  `feat-x`. The realm and its users stay. A realm or client that does not exist is not an
+  error (nothing to do, silent). A kcadm call that cannot log in, cannot reach the server, or
+  returns something that is not JSON raises a short `WtError` (`keycloak: <reason>`), for
+  `destroy` and `verify` alike: a stopped server is never read as "client not found". A failing
+  kcadm call is reported as `kcadm.sh <args>`, never with the login script or any password. Resources are recorded as `["<realm>/<clientId>"]` so
   `down` works even after `shared.keycloak` leaves the config.
 - **Template values.** `keycloak.url` (`http://localhost:<port>`), `keycloak.issuer`
   (`<url>/realms/<realm>`, the same for every branch: one login works across the branch
