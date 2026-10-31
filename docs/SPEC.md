@@ -161,6 +161,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
+| v0.5.1 (in progress, §20) | Stabilise (stale-port rule, destroy errors, one deadline) and dependencies run together |
 | later | shared dependency caches, plugin entry points, native Windows |
 
 ## 11. Clean-room rules
@@ -449,6 +450,7 @@ uses: [front]                  # back comes in because front consumes it
 ```
 
 Changed by §17: `uses` is the exact stack (no closure through `consumes`), and the service order is the selection order.
+Changed back by §20: a service that a selected service consumes runs with it again.
 
 Rules:
 - A worktree.yaml has exactly one of `services:` (v0.2 style, unchanged) or `uses:`.
@@ -604,7 +606,7 @@ port rules of §13 (compose isolation) and §14 (ports).
   kept in the registry `$WT_HOME/worktree-index.json` (`{index: "<project>/<branch>"}`) under the
   ports lock, and recorded as `BranchState.index`. It is freed on `down` and `remove`, kept on
   `stop`. Registry entries missing from the state files are rebuilt from the state files.
-- **D-d. `services.<x>.url` for remote services.** A catalog service that is not selected renders
+- **D-d. `services.<x>.url` for remote services (limited by §20).** A catalog service that is not in the stack renders
   its `remote:` (or `""` if it has none). Its `host` is `""` and its `port` is None. `needs` lists
   selected dependencies only.
 - **D-e. Configure.** Validate and store the selection. Tear down the services that left: their
@@ -616,12 +618,12 @@ port rules of §13 (compose isolation) and §14 (ports).
 - **D-f. TUI.** The main action line gains `enter: services`.
 
 **Contract**
-1. **Exact `uses`.** The stack is exactly the selection (`BranchState.uses`, else `uses:`).
+1. **Exact `uses` (replaced by §20).** The stack is exactly the selection (`BranchState.uses`, else `uses:`).
    `consumes` no longer pulls services in. For `consumes: {dep: VAR}`: if `dep` is selected,
    `VAR = {{ services.dep.url }}` and `dep` is added to `needs` (as before); if not, `VAR` is the
    `remote:` URL of `dep` (literal). `infra` is merged from the selected services only. Service
    order is the selection order. D-d applies to `services.<x>` in templates.
-2. **`remote:`.** New CatalogService key `remote: str | None`, which must start with `http://` or
+2. **`remote:` (no longer required, §20).** New CatalogService key `remote: str | None`, which must start with `http://` or
    `https://`. Every service that some catalog service consumes must set it, otherwise the
    catalog is invalid: `service 'back' is consumed by 'front' and needs 'remote:' (the URL used
    when it is not selected)`. `wt catalog` gains a REMOTE column.
@@ -662,7 +664,7 @@ port rules of §13 (compose isolation) and §14 (ports).
    health `unhealthy`, a selected run process is dead, or its port refuses a TCP connect (0.3 s);
    `healthy` otherwise. No HTTP probe: the view refreshes every 2 s and must stay fast (one
    `docker compose ps` per compose project).
-7. **Configure.** `Orchestrator.catalog_choices(branch) -> list[Choice] | None`, with
+7. **Configure (`Choice` gains `required_by`, §20).** `Orchestrator.catalog_choices(branch) -> list[Choice] | None`, with
    `Choice(service: str, repo: str, selected: bool)` in catalog order, and None for a `services:`
    project. `Orchestrator.configure(branch, uses: list[str]) -> None` follows D-e. A branch not in
    state is a WtError.
@@ -677,6 +679,7 @@ port rules of §13 (compose isolation) and §14 (ports).
    line are green, PORT values are purple, STATUS `healthy` and `up` are green, everything else is
    plain. This replaces "no colors" in §16.
 9. **`examples/notes`.** `uses: [front, back]`. `back` gets `remote: https://api.staging.notes.example`.
+   (§20: `uses: [front]` and no `remote:`.)
 
 ## 18. v0.4: Redis and Kafka providers, shop worker
 
@@ -795,3 +798,39 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
 - **`examples/shop`** gets `shared.keycloak: {realm: shop, client: web}` and a "Sign in" link on the
   web page built from `KEYCLOAK_URL`, `KEYCLOAK_REALM` and `KEYCLOAK_CLIENT_ID`. It enforces
   nothing; it proves the per-branch client and redirect URI.
+
+## 20. v0.5.1: dependencies run together
+
+Decided 2026-10-31. There is no paid staging, so a service that is not running cannot be replaced by
+a staging URL. This replaces §17 Contract 1 (exact `uses`), Contract 2 (`remote:` required), Contract
+7 (`Choice`) and Contract 9 (`examples/notes`), and limits §17 D-d. `services:` projects are unchanged.
+
+**Decisions**
+- **The stack is the closure.** For a catalog project the stack is the explicit selection
+  (`BranchState.uses`, else `uses:`) plus every service reachable through `consumes`, transitively.
+  Selecting `front`, which consumes `back`, starts both; `down` and `stop` handle both. A cycle is
+  still an error ("cycle through catalog consumes: a -> b -> a") and so is an unknown name.
+- **`BranchState.uses` stays the explicit selection only.** The closure is computed on every load,
+  `with_uses` and `configure`, so dropping a consumer also drops a dependency that was not selected
+  explicitly. Service order is the selection entries, then their dependencies (§15); the service
+  index stays the position in the catalog (§17 D-b).
+- **Environment and order.** `consumes: {dep: VAR}` always sets `VAR: "{{ services.dep.url }}"` (the
+  local URL of the running dependency) and adds `dep` to `needs`, so the dependency starts first. The
+  literal-`remote` branch of §17 Contract 1 is gone. `infra` is merged from the whole stack.
+- **`remote:` is optional.** It must still be an `http://` or `https://` URL when present. The error
+  "is consumed by … and needs 'remote:'" is removed. A `remote:` on a service that a selected service
+  consumes is ignored, with one warning per load: `remote of 'back' is ignored: 'front' needs it, so
+  it runs locally`. It is now used only to render `services.<x>.url` (D-d: `host` `""`, `port` None)
+  of a catalog service that is neither selected nor consumed by a selected service. Existing files
+  keep loading. `wt catalog` keeps its REMOTE column.
+- **Configure.** `Choice(service: str, repo: str, selected: bool, required_by: tuple[str, ...] = ())`.
+  `selected` is true for every service in the stack. `required_by` lists the selected consumers of a
+  service that is in the stack only because of them (a service selected explicitly has
+  `required_by=()`). `configure(branch, uses)` stores the explicit list, validates names, and keeps the
+  "select at least one service" error. Services that leave the stack are torn down as §17 D-e; those
+  that enter are started, dependencies first. Unchecking a service that a selected service still
+  consumes changes the stored selection but not the running stack.
+- **TUI.** A choice with `required_by` is shown checked and labelled `(required by front)`, cannot be
+  toggled, and is left out of the list sent on confirm (explicit = checked minus locked).
+- **`examples/notes`.** `uses: [front]` brings `back` in; the fictional staging URL is removed from
+  its catalog.
