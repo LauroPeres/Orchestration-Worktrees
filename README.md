@@ -111,7 +111,8 @@ services:
 
 Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`), `ident`
 (`feat_cart`), `domain`, `branch_domain`, `port`, `url`, `host`, and
-`services.<name>.url|host|port`.
+`services.<name>.url|host|port`. A service name with a hyphen needs brackets:
+`services['music-back'].url` (wt writes that form itself for `consumes`).
 
 ## Host processes (`run:`)
 

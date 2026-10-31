@@ -5,6 +5,7 @@ import pytest
 from wt.catalog import Catalog, catalog_path, expand_uses, load_catalog
 from wt.config import load_config
 from wt.errors import WtError
+from wt.templating import render
 
 GOOD = """\
 repos:
@@ -127,7 +128,7 @@ def test_uses_resolves(tmp_path: Path) -> None:
     assert loaded.catalog == tmp_path / "catalog.yaml"
     assert list(cfg.services) == ["front", "back"]  # selection order
     assert cfg.services["front"].needs == ["back"]
-    assert cfg.services["front"].env == {"API_URL": "{{ services.back.url }}"}
+    assert cfg.services["front"].env == {"API_URL": "{{ services['back'].url }}"}
     assert cfg.repos["notes-back"] == str(tmp_path / "back")
     assert cfg.shared.postgres is not None and cfg.shared.postgres.databases == ["notes"]
     assert loaded.repo_path("notes-back") == tmp_path / "back"
@@ -143,7 +144,7 @@ def test_uses_pulls_in_the_dependency_and_ignores_its_remote(tmp_path: Path) -> 
     assert list(cfg.services) == ["front", "back"]  # the selection, then its dependencies
     assert sorted(cfg.repos) == ["notes-back", "notes-front"]
     assert cfg.services["front"].needs == ["back"]
-    assert cfg.services["front"].env == {"API_URL": "{{ services.back.url }}"}
+    assert cfg.services["front"].env == {"API_URL": "{{ services['back'].url }}"}
     assert cfg.shared.postgres is not None and cfg.shared.postgres.databases == ["notes"]
     assert loaded.remotes == {}
     assert loaded.warnings == (IGNORED_BACK,)
@@ -161,7 +162,7 @@ def test_consumed_service_needs_no_remote(tmp_path: Path) -> None:
     text = GOOD.replace("    remote: https://api.staging.example\n", "")
     loaded = load_config(project(tmp_path, text, "uses: [front]\n"))
     assert list(loaded.config.services) == ["front", "back"]
-    assert loaded.config.services["front"].env == {"API_URL": "{{ services.back.url }}"}
+    assert loaded.config.services["front"].env == {"API_URL": "{{ services['back'].url }}"}
     assert loaded.warnings == ()
     assert load_catalog(write(tmp_path, text)).catalog.services["back"].remote is None
 
@@ -465,7 +466,7 @@ def test_closure_is_the_stack_and_uses_stays_explicit(tmp_path: Path) -> None:
     assert loaded.remotes == {"d": ""}
     assert loaded.config.services["a"].needs == ["b"]
     assert loaded.config.services["b"].needs == ["c"]
-    assert loaded.config.services["b"].env == {"C_URL": "{{ services.c.url }}"}
+    assert loaded.config.services["b"].env == {"C_URL": "{{ services['c'].url }}"}
 
 
 def test_service_index_ignores_the_closure_order(tmp_path: Path) -> None:
@@ -504,7 +505,7 @@ def test_consumes_always_sets_the_local_url_template(tmp_path: Path) -> None:
     for remote in ("", "    remote: https://c.example\n"):
         text = CHAIN.replace("    subdomain: c\n", f"    subdomain: c\n{remote}")
         cfg = load_config(project(tmp_path, text, "uses: [b]\n")).config
-        assert cfg.services["b"].env == {"C_URL": "{{ services.c.url }}"}
+        assert cfg.services["b"].env == {"C_URL": "{{ services['c'].url }}"}
         assert cfg.services["b"].needs == ["c"]
 
 
@@ -535,3 +536,49 @@ def test_remote_is_still_validated_in_a_dependency(tmp_path: Path) -> None:
     text = CHAIN.replace("    subdomain: c\n", "    subdomain: c\n    remote: not-a-url\n")
     with pytest.raises(WtError, match="remote: must be an http:// or https:// URL"):
         load_catalog(write(tmp_path, text))
+
+
+HYPHENATED = """\
+repos:
+  music: ./music
+services:
+  music-back:
+    repo: music
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+  music-front:
+    repo: music
+    run: serve --port {{ port }}
+    port: auto
+    subdomain: ""
+    consumes:
+      music-back: VITE_API_URL
+"""
+
+
+def test_hyphenated_services_render_the_consumer_env_to_the_producer_url(tmp_path: Path) -> None:
+    cfg = load_config(project(tmp_path, HYPHENATED, "uses: [music-front]\n")).config
+    env = cfg.services["music-front"].env
+    assert env == {"VITE_API_URL": "{{ services['music-back'].url }}"}
+    assert cfg.services["music-front"].needs == ["music-back"]
+    context = {"services": {"music-back": {"url": "https://api.music.localhost"}}}
+    assert render(env["VITE_API_URL"], context, "env.VITE_API_URL") == "https://api.music.localhost"
+
+
+def test_services_project_with_hyphenated_names_renders_both_forms_of_access(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "worktree.yaml"
+    path.write_text(
+        "project: music\ndomain: music.localhost\nrepos: {music: ./music}\nservices:\n"
+        "  music-back: {repo: music, run: serve, port: 8000, subdomain: api}\n"
+        "  music-front:\n    repo: music\n    run: serve\n    port: 8001\n"
+        "    needs: [music-back]\n"
+        "    env: {API: \"{{ services['music-back'].url }}\"}\n"
+    )
+    cfg = load_config(path).config
+    context = {"services": {"music-back": {"url": "https://api.music.localhost"}}}
+    assert render(cfg.services["music-front"].env["API"], context, "env.API") == (
+        "https://api.music.localhost"
+    )
