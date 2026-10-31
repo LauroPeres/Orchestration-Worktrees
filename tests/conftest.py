@@ -2,6 +2,7 @@ import os
 import random
 import socket
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,16 +59,39 @@ def _window_is_free(base: int, size: int = PORT_WINDOW) -> bool:
     return True
 
 
-@pytest.fixture(autouse=True)
-def private_port_base(monkeypatch: pytest.MonkeyPatch) -> int:
-    """Move the host-port formula to a free private window, so tests never meet a real stack."""
+WINDOW_TRIES = 50
+# Every window the run probed and every base a test saw: tests assert the probe happens once per
+# run: a probe per test opens ~1000 sockets each and exhausts macOS socket buffers (ENOBUFS).
+_PROBED_WINDOWS: list[int] = []
+_BASES_SEEN: set[int] = set()
+
+
+def _pick_free_window(is_free: Callable[[int], bool], probed: list[int]) -> int:
+    """First random window that `is_free` accepts, noting every window tried in `probed`."""
     rng = random.Random()
-    for _ in range(50):
+    for _ in range(WINDOW_TRIES):
         base = rng.randrange(PORT_WINDOW_FLOOR, LOWEST_EPHEMERAL_PORT - PORT_WINDOW)
-        if _window_is_free(base):
-            break
-    monkeypatch.setattr(naming, "PORT_BASE", base)
-    return base
+        probed.append(base)
+        if is_free(base):
+            return base
+    raise RuntimeError(
+        f"no free window of {PORT_WINDOW} ports in [{PORT_WINDOW_FLOOR}, {LOWEST_EPHEMERAL_PORT}) "
+        f"after {WINDOW_TRIES} tries; free the local ports or lower PORT_WINDOW"
+    )
+
+
+@pytest.fixture(scope="session")
+def session_port_base() -> int:
+    """Pick the free private window once per run; a bind probe per test is too many sockets."""
+    return _pick_free_window(_window_is_free, _PROBED_WINDOWS)
+
+
+@pytest.fixture(autouse=True)
+def private_port_base(session_port_base: int, monkeypatch: pytest.MonkeyPatch) -> int:
+    """Move the host-port formula to the run's private window, so tests never meet a real stack."""
+    _BASES_SEEN.add(session_port_base)
+    monkeypatch.setattr(naming, "PORT_BASE", session_port_base)
+    return session_port_base
 
 
 _LEAKED: list[str] = []
