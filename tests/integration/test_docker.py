@@ -10,6 +10,7 @@ import urllib.request
 from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 import yaml
@@ -307,6 +308,23 @@ def test_stop_keeps_a_named_volume_and_down_removes_it(
 
     orch.down("main", force=True)
     assert volumes() == []
+
+
+@pytest.mark.parametrize("interrupted", ["creating", "failed"])
+def test_up_after_an_interrupted_up_reuses_the_running_compose_container(
+    stack: Orchestrator, monkeypatch: pytest.MonkeyPatch, interrupted: Literal["creating", "failed"]
+) -> None:
+    up_retrying(stack, "main", monkeypatch)
+    before = api_containers(stack, "main")
+    assert len(before) == 1
+    with stack.store.edit() as state:
+        state.branches["main"].status = interrupted
+
+    reports = stack.up("main", timeout=90)
+
+    assert [(r.service, r.outcome) for r in reports] == [("api", "ok")], reports
+    assert api_containers(stack, "main") == before
+    assert [r.status for r in stack.services("main")] == ["healthy"]
 
 
 def process_env(orch: Orchestrator, branch: str, service: str) -> dict[str, str]:
