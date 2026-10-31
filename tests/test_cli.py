@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from tests.conftest import SHARED, FakeDocker
@@ -11,7 +12,7 @@ from wt import __version__, cli, compose, host, proc
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
-from wt.orchestrator import Orchestrator, ServiceReport
+from wt.orchestrator import BranchStatus, Orchestrator, ServiceReport
 
 runner = CliRunner()
 
@@ -322,6 +323,33 @@ def test_catalog_uses_worktree_yaml_catalog(
     assert f"catalog ok: {tmp_path / 'mine.yaml'}" in result.output
 
 
+def test_catalog_check_passes_a_good_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _check_catalog(tmp_path, monkeypatch, CATALOG)
+    assert result.exit_code == 0, result.output
+    assert "catalog ok" in result.output
+
+
+def test_error_line_is_not_wrapped_when_stderr_is_not_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    long_path = "/var/log/wt/" + "x" * 200 + "/run.log"
+    fake = typer.Typer()
+
+    def boom() -> None:
+        raise WtError(f"api exited; see {long_path}")
+
+    fake.command()(boom)
+
+    monkeypatch.setattr(sys, "argv", ["wt"])
+    with pytest.raises(SystemExit) as stop:
+        cli._run(fake)
+    assert stop.value.code == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [f"error: api exited; see {long_path}"]
+
+
 def test_catalog_check_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "c.yaml").write_text(CATALOG.replace("repo: notes-front", "repo: nope"))
     monkeypatch.chdir(tmp_path)
@@ -329,6 +357,67 @@ def test_catalog_check_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     result = runner.invoke(app, ["catalog", "--check"])
     assert result.exit_code == 1
     assert "unknown repo 'nope'" in result.output
+
+
+def _check_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str) -> Any:
+    (tmp_path / "c.yaml").write_text(text)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    return runner.invoke(app, ["catalog", "--check"])
+
+
+def test_catalog_check_reports_a_dependency_without_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _check_catalog(tmp_path, monkeypatch, CATALOG.replace("    subdomain: api\n", ""))
+    assert result.exit_code == 1, result.output
+    assert "service 'front'" in result.output
+    assert "has no 'subdomain'" in result.output
+    assert "catalog ok" not in result.output
+
+
+def test_catalog_check_reports_env_that_sets_the_consumed_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = CATALOG.replace("    consumes:\n", "    env: {API_URL: http://x}\n    consumes:\n")
+    result = _check_catalog(tmp_path, monkeypatch, text)
+    assert result.exit_code == 1, result.output
+    assert "service 'front'" in result.output
+    assert "env already sets API_URL" in result.output
+
+
+def test_catalog_check_reports_a_cycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    text = CATALOG.replace(
+        "    infra:\n      postgres: {databases: [notes]}\n",
+        "    consumes:\n      front: FRONT_URL\n",
+    )
+    result = _check_catalog(tmp_path, monkeypatch, text)
+    assert result.exit_code == 1, result.output
+    assert "cycle" in result.output
+
+
+def test_catalog_check_reports_an_unknown_consumes_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _check_catalog(
+        tmp_path, monkeypatch, CATALOG.replace("back: API_URL", "ghost: API_URL")
+    )
+    assert result.exit_code == 1, result.output
+    assert "ghost" in result.output
+
+
+def test_catalog_check_reports_every_failing_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = CATALOG.replace("    subdomain: api\n", "") + (
+        "  admin:\n    repo: notes-front\n    run: python3 admin.py\n"
+        "    consumes:\n      back: BACK_URL\n"
+    )
+    result = _check_catalog(tmp_path, monkeypatch, text)
+    assert result.exit_code == 1, result.output
+    assert "service 'front'" in result.output
+    assert "service 'admin'" in result.output
+    assert "service 'back'" not in result.output
 
 
 def test_catalog_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -394,6 +483,43 @@ def test_add_stop_remove_commands(orch, docker: FakeDocker, tmp_path: Path) -> N
     removed = runner.invoke(app, [*cfg, "remove", "feat/cart", "--yes"])
     assert removed.exit_code == 0, removed.output
     assert "no branches" in runner.invoke(app, [*cfg, "ls", "--no-probe"]).output
+
+
+def _stub_ls(monkeypatch: pytest.MonkeyPatch, rows: list[BranchStatus]) -> None:
+    monkeypatch.setattr(Orchestrator, "ls", lambda self, *, probe: rows)
+
+
+def test_ls_shows_a_dash_for_the_health_of_a_stopped_branch(
+    orch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    skipped = ServiceReport("api", "skipped", "", "http://api.feat-cart.localhost")
+    live = ServiceReport("web", "ok", "200 in 12ms", "http://web.feat-up.localhost")
+    _stub_ls(
+        monkeypatch,
+        [
+            BranchStatus("feat/cart", "stopped", 0, 1, services=[skipped]),
+            BranchStatus("feat/up", "up", 1, 1, services=[live]),
+        ],
+    )
+    listed = runner.invoke(app, [*_cfg(tmp_path), "ls"])
+    assert listed.exit_code == 0, listed.output
+    stopped_line = next(line for line in listed.output.splitlines() if "feat/cart" in line)
+    up_line = next(line for line in listed.output.splitlines() if "feat/up" in line)
+    assert "skipped" not in listed.output
+    assert stopped_line.rstrip().endswith("-")
+    assert "200 in 12ms" in up_line
+
+
+def test_ls_no_probe_still_shows_a_dash_for_health(
+    orch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    live = ServiceReport("web", "ok", "200 in 12ms", "http://web.feat-up.localhost")
+    _stub_ls(monkeypatch, [BranchStatus("feat/up", "up", 1, 1, services=[live])])
+    listed = runner.invoke(app, [*_cfg(tmp_path), "ls", "--no-probe"])
+    assert listed.exit_code == 0, listed.output
+    assert "200 in 12ms" not in listed.output
 
 
 REMOVE_QUESTION = (
