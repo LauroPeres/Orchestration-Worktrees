@@ -857,3 +857,16 @@ a staging URL. This replaces §17 Contract 1 (exact `uses`), Contract 2 (`remote
   toggled, and is left out of the list sent on confirm (explicit = checked minus locked).
 - **`examples/notes`.** `uses: [front]` brings `back` in; the fictional staging URL is removed from
   its catalog.
+
+**Published ports (v0.5.1).** After it starts Traefik or a shared server (Postgres, Redis, Kafka,
+Keycloak), wt checks that the running container really publishes its host ports (`docker port
+<container>`). A container can run without them: after a start that failed because the host port was
+taken, Docker's next start attaches no network and publishes nothing, and the container still reports
+healthy. In that case wt recreates the container once (`docker compose up -d --force-recreate`, for
+Traefik and for a shared server alike; when a recreate was already requested it is not repeated). If
+the recreate fails because the port is taken, or the port is still not published afterwards, `up`
+fails at once and says why: `port N is already in use by another program` when something listens on
+it, else `<container> does not publish port N`. `wt doctor` reports the same condition as a failed check
+(`<container> runs without its published ports`) and `wt doctor --fix` recreates the container. The
+check applies to the ports wt publishes on `127.0.0.1` (and the HTTP/HTTPS ports of Traefik), not to
+containers of the user's services.
