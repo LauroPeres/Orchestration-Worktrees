@@ -246,7 +246,9 @@ class KeycloakProvider:
         return [u + "/*" for u in ctx.urls]
 
     def ensure_server(self) -> None:
-        ensure_server(self._cfg().realm)
+        # Without the section (`down` after it left the config) there is no realm to create,
+        # but the server must still be up so `destroy` can delete the recorded clients.
+        ensure_server(self.cfg.realm if self.cfg is not None else None)
 
     def preflight(self, ctx: BranchContext) -> None:
         pass
