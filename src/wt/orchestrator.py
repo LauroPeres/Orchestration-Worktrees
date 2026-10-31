@@ -119,7 +119,8 @@ class Choice:
 
     service: str
     repo: str
-    selected: bool
+    selected: bool  # in the stack: chosen, or pulled in by a chosen consumer
+    required_by: tuple[str, ...] = ()  # the stack services that consume it; () when chosen
 
 
 class Orchestrator:
@@ -252,6 +253,11 @@ class Orchestrator:
             change(bs)
             bs.updated_at = now()
 
+    def _log_warnings(self) -> None:
+        """The notes `load_config` produced, e.g. a `remote:` the stack makes irrelevant."""
+        for warning in self.loaded.warnings:
+            self.log(f"warning: {warning}")
+
     # ---- up -------------------------------------------------------------------------------
 
     def up(self, branch: str, *, build: bool = False, timeout: int = 120) -> list[ServiceReport]:
@@ -260,6 +266,7 @@ class Orchestrator:
             return other.up(branch, build=build, timeout=timeout)
         names = self.names(branch)
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
+        self._log_warnings()
         with self._branch_lock(names):
             envs, commands, ports = self._reserve(branch, names)
 
@@ -370,6 +377,7 @@ class Orchestrator:
             return other.add(branch)
         names = self.names(branch)
         self.start_plan()  # a cycle fails here, before anything is created
+        self._log_warnings()
         with self._branch_lock(names):
             if branch in self.store.load().branches:
                 self.log(f"branch {branch} is already known; nothing to add")
@@ -1019,18 +1027,33 @@ class Orchestrator:
         return "healthy"
 
     def catalog_choices(self, branch: str) -> list[Choice] | None:
-        """Every catalog service with its repo and whether the branch selects it (§17 D-a)."""
+        """Every catalog service with its repo and its place in the branch's stack (§20)."""
         if self.loaded.uses is None or self.loaded.catalog is None:
             return None
-        bs = self.store.load().branches.get(branch)
-        if bs is None:
+        if self.store.load().branches.get(branch) is None:
             raise WtError(f"branch {branch!r} not found (see `wt ls`)")
-        selected = set(bs.uses if bs.uses is not None else self.loaded.uses)
+        mine = self._for(branch).loaded
         catalog = load_catalog(self.loaded.catalog).catalog
-        return [Choice(n, s.repo, n in selected) for n, s in catalog.services.items()]
+        stack = list(mine.config.services)
+        explicit = set(mine.uses or ())
+
+        def required_by(name: str) -> tuple[str, ...]:
+            if name in explicit or name not in stack:
+                return ()
+            return tuple(s for s in stack if name in catalog.services[s].consumes)
+
+        return [
+            Choice(name, svc.repo, name in stack, required_by(name))
+            for name, svc in catalog.services.items()
+        ]
 
     def configure(self, branch: str, uses: list[str]) -> None:
-        """Change the services of a branch: store the selection, tear down what left, `up`."""
+        """Change the services of a branch: store the selection, tear down what left, `up`.
+
+        What leaves and what arrives is the difference between the old and the new stack (the
+        selection plus the services it consumes), so a service a selected consumer still needs
+        stays where it is.
+        """
         if self.store.load().branches.get(branch) is None:
             raise WtError(f"branch {branch!r} not found (see `wt ls`)")
         old = self._for(branch)
@@ -1043,9 +1066,14 @@ class Orchestrator:
             bs = self.store.load().branches[branch]
             self._record(branch, lambda b: setattr(b, "uses", wanted))
             self._drop_services(branch, names, bs, old, new, removed)
-            stopped = bs.status == "stopped"
-        if not stopped or added:
+            status = bs.status
+        # A stopped branch stays stopped unless something new arrives; a still-healthy one with an
+        # unchanged stack only had its stored selection changed. Anything else is retried/healed.
+        unchanged = not added and not removed
+        if added or (status != "stopped" and not (unchanged and status == "up")):
             new.up(branch)
+        else:
+            new._log_warnings()  # `up` says them otherwise
 
     def _drop_services(  # noqa: C901, PLR0913
         self,
