@@ -82,16 +82,16 @@ NEEDS_CATALOG = "configure needs a catalog project (uses: in worktree.yaml)"
 NOTHING_CHECKED = "check at least one service"
 
 
-def choice_label(choice: Choice) -> Text:
-    """`service (repo)`, plus `(required by x, y)` for a service only the stack consumes."""
+def choice_label(choice: Choice, holders: tuple[str, ...] = ()) -> Text:
+    """`service (repo)`, plus `(required by x, y)` while checked consumers `holders` need it."""
     label = f"{choice.service} ({choice.repo})"
-    if choice.required_by:
-        label += f" (required by {', '.join(choice.required_by)})"
+    if holders:
+        label += f" (required by {', '.join(holders)})"
     return Text(label)
 
 
-def required_note(service: str, required_by: tuple[str, ...]) -> str:
-    return f"{service} is required by {', '.join(required_by)}"
+def required_note(service: str, holders: tuple[str, ...]) -> str:
+    return f"{service} is required by {', '.join(holders)}"
 
 
 def actions_text(actions: str = ACTIONS) -> Text:
@@ -215,6 +215,7 @@ class ConfirmScreen(ModalScreen[bool]):
     CSS = """
     ConfirmScreen { align: center bottom; background: transparent; }
     #dialog { width: 100%; height: auto; border: solid; padding: 0 1; }
+    #dialog Label { width: 100%; }  /* a Label is as wide as its text by default: wrap instead */
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("y", "answer(True)", "Yes"),
@@ -260,26 +261,46 @@ class InputScreen(ModalScreen[str | None]):
 
 
 class ChoiceList(SelectionList[str]):
-    """Selection list whose `locked` services stay checked; a toggle attempt is reported."""
+    """Selection list where a service stays checked while a checked consumer needs it (SPEC §20).
+
+    A toggle attempt on such a service is reported; unchecking its consumers lifts the lock.
+    """
 
     class Refused(Message):
-        """The user tried to toggle a locked service."""
+        """The user tried to toggle a service that a checked consumer still requires."""
 
-        def __init__(self, service: str) -> None:
+        def __init__(self, service: str, holders: tuple[str, ...]) -> None:
             super().__init__()
             self.service = service
+            self.holders = holders
 
-    def __init__(
-        self, selections: list[Selection[str]], locked: dict[str, tuple[str, ...]]
-    ) -> None:
-        super().__init__(*selections, id="choices")
-        self.locked = locked
+    def __init__(self, choices: list[Choice]) -> None:
+        super().__init__(
+            *[Selection(choice_label(c), c.service, c.selected) for c in choices], id="choices"
+        )
+        self._choices = choices
+
+    def holders(self, choice: Choice) -> tuple[str, ...]:
+        """The consumers of `choice` that are checked right now: they lock it."""
+        checked = self.selected
+        return tuple(consumer for consumer in choice.required_by if consumer in checked)
+
+    def explicit(self) -> list[str]:
+        """The checked services no checked consumer pulls in, in catalog order (SPEC §20)."""
+        checked = self.selected
+        return [c.service for c in self._choices if c.service in checked and not self.holders(c)]
+
+    def relabel(self) -> None:
+        """Show `(required by ...)` only for the consumers that are still checked."""
+        for index, choice in enumerate(self._choices):
+            self.replace_option_prompt_at_index(index, choice_label(choice, self.holders(choice)))
 
     def toggle(self, selection: Selection[str] | str) -> Self:
         value = selection.value if isinstance(selection, Selection) else selection
-        if value in self.locked:
-            self.post_message(self.Refused(value))
-            return self
+        for choice in self._choices:
+            if choice.service == value and (holders := self.holders(choice)):
+                self.post_message(self.Refused(value, holders))
+                return self
         return super().toggle(selection)
 
 
@@ -311,32 +332,39 @@ class ConfigureScreen(ModalScreen[list[str] | None]):
     def __init__(self, choices: list[Choice]) -> None:
         super().__init__()
         self.choices = choices
-        self.locked = {c.service: c.required_by for c in choices if c.required_by}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text("Services"))
-            yield ChoiceList(
-                [Selection(choice_label(c), c.service, c.selected) for c in self.choices],
-                self.locked,
-            )
+            yield ChoiceList(self.choices)
             yield Static(actions_text(CONFIGURE_HINTS), id="hints")
             yield Static("", id="error")
 
     def on_mount(self) -> None:
-        self.query_one("#choices", SelectionList).focus()
+        options = self._options
+        options.relabel()  # an initial selection can already have unchecked consumers
+        options.focus()
+
+    @property
+    def _options(self) -> ChoiceList:
+        return self.query_one("#choices", ChoiceList)
+
+    def _say(self, text: str) -> None:
+        self.query_one("#error", Static).update(Text(text))
 
     @on(ChoiceList.Refused)
     def _refused(self, event: ChoiceList.Refused) -> None:
-        self.query_one("#error", Static).update(
-            Text(required_note(event.service, self.locked[event.service]))
-        )
+        self._say(required_note(event.service, event.holders))
+
+    @on(SelectionList.SelectedChanged)
+    def _selection_changed(self) -> None:
+        self._options.relabel()
+        self._say("")  # a note about the previous selection no longer applies
 
     def action_confirm(self) -> None:
-        checked = self.query_one("#choices", SelectionList).selected
-        uses = [service for service in checked if service not in self.locked]
+        uses = self._options.explicit()
         if not uses:
-            self.query_one("#error", Static).update(Text(NOTHING_CHECKED))
+            self._say(NOTHING_CHECKED)
             return
         self.dismiss(uses)
 
@@ -354,7 +382,8 @@ class WtApp(App[None]):
     #table:focus { border: solid $foreground; background-tint: transparent; }
     DataTable > .datatable--header { text-style: bold; background: transparent; }
     DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
-    #actions, #message { height: 1; background: transparent; }
+    #actions { height: auto; background: transparent; }  /* wraps on a narrow terminal */
+    #message { height: 1; background: transparent; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("u", "up_selected", "Up", show=False),

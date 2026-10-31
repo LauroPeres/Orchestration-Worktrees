@@ -181,6 +181,46 @@ def test_r_confirms_then_removes_with_force() -> None:
     asyncio.run(scenario())
 
 
+def screen_lines(app: WtApp) -> list[str]:
+    """What the terminal shows right now, one string per screen row (after clipping)."""
+    return [strip.text for strip in app.screen._compositor.render_strips()]
+
+
+def dialog_text(app: WtApp) -> tuple[str, int]:
+    """The words visible inside the `#dialog` box, and the box height."""
+    region = app.screen.query_one("#dialog").region
+    rows = screen_lines(app)[region.y : region.y + region.height]
+    inner = [row.strip("│ ") for row in rows if row.startswith("│")]
+    return " ".join(" ".join(inner).split()), region.height
+
+
+def test_remove_confirmation_wraps_so_the_whole_sentence_is_visible() -> None:
+    async def scenario(size: tuple[int, int]) -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test(size=size) as pilot:
+            await settle(pilot)
+            await pilot.press("r")
+            await pilot.pause()
+            text, height = dialog_text(app)
+            assert text == REMOVE_QUESTION
+            assert 3 < height <= size[1]
+            assert "unpushed commits are lost. Remove? y/N" in text
+
+    for size in [(100, 30), (60, 20)]:
+        asyncio.run(scenario(size))
+
+
+def test_action_line_keeps_every_hint_on_a_narrow_screen() -> None:
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test(size=(40, 15)) as pilot:
+            await settle(pilot)
+            shown = " ".join(" ".join(screen_lines(app)).split())
+            assert "r: remove" in shown and "q: quit" in shown
+
+    asyncio.run(scenario())
+
+
 def test_busy_note_and_error_message() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
@@ -490,7 +530,7 @@ def test_space_on_locked_choice_keeps_it_checked_and_says_why() -> None:
             await open_configure(pilot)
             await pilot.press("down", "space")
             await pilot.pause()
-            assert checked(app) == ["front", "back"]
+            assert sorted(checked(app)) == ["back", "front"]
             assert str(app.screen.query_one("#error", Static).render()) == (
                 "back is required by front"
             )
@@ -528,16 +568,99 @@ def test_explicit_service_that_is_also_needed_keeps_its_toggle() -> None:
     asyncio.run(scenario())
 
 
-def test_confirm_with_only_locked_checked_is_an_error_without_call() -> None:
+def labels(app: WtApp) -> list[str]:
+    options = app.screen.query_one("#choices", SelectionList)
+    return [str(options.get_option_at_index(i).prompt) for i in range(options.option_count)]
+
+
+def test_unchecking_the_consumer_unlocks_the_dependency_and_confirm_sends_it() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
         orch.choices = locked_choices()
         app = WtApp(orch)
         async with app.run_test() as pilot:
             await open_configure(pilot)
-            await pilot.press("space", "enter")  # uncheck front: only back (locked) is left
+            await pilot.press("space")  # uncheck front: back is no longer required
+            await pilot.pause()
+            assert labels(app)[1] == "back (api)"
+            await pilot.press("down", "space")  # back is togglable now: uncheck, check again
+            await pilot.press("space")
             await pilot.pause()
             assert checked(app) == ["back"]
+            assert str(app.screen.query_one("#error", Static).render()) == ""
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["back"])]
+
+    asyncio.run(scenario())
+
+
+def test_rechecking_the_consumer_locks_the_dependency_again() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = locked_choices()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            await pilot.press("space", "space")  # uncheck front, check it again
+            await pilot.pause()
+            assert labels(app)[1] == "back (api) (required by front)"
+            await pilot.press("down", "space")  # refused: still required
+            await pilot.pause()
+            assert sorted(checked(app)) == ["back", "front"]
+            assert str(app.screen.query_one("#error", Static).render()) == (
+                "back is required by front"
+            )
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["front"])]
+
+    asyncio.run(scenario())
+
+
+def test_dependency_with_two_consumers_stays_locked_until_both_are_unchecked() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = [
+            Choice("front", "web", True),
+            Choice("mid", "web", True),
+            Choice("back", "api", True, required_by=("front", "mid")),
+        ]
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            await pilot.press("space")  # uncheck front: mid still needs back
+            await pilot.pause()
+            assert labels(app)[2] == "back (api) (required by mid)"
+            await pilot.press("down", "down", "space")
+            await pilot.pause()
+            assert checked(app) == ["mid", "back"]
+            assert str(app.screen.query_one("#error", Static).render()) == (
+                "back is required by mid"
+            )
+            await pilot.press("up", "space")  # uncheck mid: back is free
+            await pilot.pause()
+            assert labels(app)[2] == "back (api)"
+            assert checked(app) == ["back"]
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["back"])]
+
+    asyncio.run(scenario())
+
+
+def test_confirm_with_nothing_explicit_is_an_error_without_call() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = locked_choices()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            await pilot.press("space", "down", "space")  # uncheck front, then back
+            await pilot.pause()
+            assert checked(app) == []
+            await pilot.press("enter")
+            await pilot.pause()
             assert str(app.screen.query_one("#error", Static).render()) == (
                 "check at least one service"
             )
