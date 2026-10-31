@@ -1,0 +1,33 @@
+{
+  "_comment": "Which files each agent may edit (globs relative to the repo root, `*` crosses folders). One owner per file. Read by the code-framework ownership hook and by the fixer's debugging skill. docs/, README.md, pyproject.toml, uv.lock and .github/ belong to the main session (the planner).",
+  "interface-coder": [
+    "src/wt/cli.py", "src/wt/tui.py", "src/wt/__main__.py",
+    "tests/test_cli.py", "tests/test_tui.py"
+  ],
+  "core-coder": [
+    "src/wt/orchestrator.py", "src/wt/doctor.py",
+    "tests/test_orchestrator.py", "tests/test_doctor.py", "tests/conftest.py", "tests/serve.py"
+  ],
+  "providers-coder": [
+    "src/wt/providers/*",
+    "tests/test_providers_base.py", "tests/test_postgres.py", "tests/test_kafka.py",
+    "tests/test_redis.py", "tests/test_keycloak.py", "tests/test_server.py"
+  ],
+  "runtime-coder": [
+    "src/wt/proc.py", "src/wt/git.py", "src/wt/compose.py", "src/wt/host.py", "src/wt/router.py",
+    "src/wt/tls.py", "src/wt/health.py", "src/wt/state.py", "src/wt/projects.py",
+    "tests/test_proc.py", "tests/test_git.py", "tests/test_compose.py", "tests/test_host.py",
+    "tests/test_router.py", "tests/test_tls.py", "tests/test_health.py", "tests/test_state.py",
+    "tests/test_projects.py"
+  ],
+  "model-coder": [
+    "src/wt/config.py", "src/wt/catalog.py", "src/wt/naming.py", "src/wt/templating.py",
+    "src/wt/paths.py", "src/wt/errors.py", "src/wt/__init__.py",
+    "tests/test_config.py", "tests/test_catalog.py", "tests/test_naming.py",
+    "tests/test_templating.py"
+  ],
+  "e2e": ["tests/integration/*", "tests/test_example_*", "examples/*"],
+  "fixer": ["src/wt/*", "tests/*", "examples/*"],
+  "validate-code": [],
+  "checker": []
+}
