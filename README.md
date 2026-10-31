@@ -201,7 +201,8 @@ shared:
 ```
 
 wt runs one shared `wt-redis` container (`redis:7-alpine`, data in the `wt-redis-data` volume,
-published on `127.0.0.1:56379`). Branch `feat/cart` gets the key prefix `feat-cart:`.
+published on `127.0.0.1:56379`). Branch `feat/cart` of project `shop` gets the key prefix
+`shop:feat-cart:`.
 
 - `{{ redis.url }}` is the connection URL and `{{ redis.prefix }}` the key prefix of the branch.
   Compose services get `redis://wt-redis:6379` on the shared `wt` network; host processes get
@@ -226,7 +227,8 @@ shared:
 
 wt runs one shared `wt-kafka` container (single-node `apache/kafka`, data in the
 `wt-kafka-data` volume, published on `127.0.0.1:59092`). Branch `feat/cart` gets the consumer
-group `worker-feat-cart` and, with `topic_prefix: true`, the topic `feat-cart.items` for `items`.
+group `worker-shop.feat-cart` (project `shop`) and, with `topic_prefix: true`, the topic
+`shop.feat-cart.items` for `items`.
 
 - `{{ kafka.bootstrap }}` is the bootstrap address. Compose services get `wt-kafka:9092` on the
   shared `wt` network; host processes get `127.0.0.1:59092`.
@@ -248,7 +250,7 @@ group `worker-feat-cart` and, with `topic_prefix: true`, the topic `feat-cart.it
 shared:
   keycloak:
     realm: shop             # one realm shared by every branch
-    client: web             # each branch gets its own client: web-<slug>
+    client: web             # each branch gets its own client: web-<project>.<slug>
 ```
 
 `realm` and `client` may use letters, digits, `.`, `_` and `-`.
@@ -257,7 +259,8 @@ wt runs one shared `wt-keycloak` container (`quay.io/keycloak/keycloak:26.8.1` i
 mode, data in the `wt-keycloak-data` volume, published on `127.0.0.1:58080`).
 
 - `up` creates the realm once, if it is missing. wt never deletes the realm.
-- `up` creates one public client per branch, `<client>-<slug>` (for example `web-feat-cart`).
+- `up` creates one public client per branch, `<client>-<project>.<slug>` (for example
+  `web-shop.feat-cart`).
   Its redirect URIs are `<url>/*` and its web origins are `<url>`, one pair for each selected
   routed service of the branch. `<url>` is the service URL, with the HTTPS port unless it is 443.
 - `down` deletes only that branch's client. The realm and its users stay.
@@ -272,6 +275,19 @@ mode, data in the `wt-keycloak-data` volume, published on `127.0.0.1:58080`).
     network, where `localhost` is not the server. For `run:` services it is the same as `url`.
 - Overrides: `WT_KEYCLOAK_PORT` (host port, default `58080`) and `WT_KEYCLOAK_IMAGE` (default
   `quay.io/keycloak/keycloak:26.8.1`).
+
+## Names on the shared servers
+
+Redis, Kafka and Keycloak are shared by every project, so each per-branch name carries the project
+as well as the branch: Redis prefix `<project>:<slug>:`, Kafka group `<group>-<project>.<slug>` and
+topics `<project>.<slug>.<name>`, Keycloak client `<client>-<project>.<slug>`. Two projects can use
+the same branch name (`main`) without sharing or deleting each other's keys, groups or clients.
+
+**Upgrading from 0.5.0:** those names did not include the project before. A branch created by 0.5.0
+keeps its old names recorded and `wt down` still removes them, so the simplest upgrade is to run
+`wt down` on branches that use Redis, Kafka or Keycloak first (or just before you re-run `up` on
+them). Running `up` on such a branch after the upgrade creates the new names and keeps the old ones
+recorded until `down`. The Keycloak realm is never deleted, not even after the last branch is down.
 
 ## User catalog (`uses:`)
 
@@ -416,8 +432,8 @@ flowchart TB
     cc["compose: api, worker"]
     ch["run: web (host process)"]
     cdb["database shop__feat_cart"]
-    cr["Redis keys feat-cart:*"]
-    ck["Kafka group worker-feat-cart"]
+    cr["Redis keys shop:feat-cart:*"]
+    ck["Kafka group worker-shop.feat-cart"]
   end
 
   orch --> mw
