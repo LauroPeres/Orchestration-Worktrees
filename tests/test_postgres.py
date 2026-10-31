@@ -68,6 +68,7 @@ def err(text: str) -> proc.Result:
 def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     f = FakeProc()
     monkeypatch.setattr(proc, "run", f)
+    f.on("docker port", out(f"5432/tcp -> 127.0.0.1:{postgres.host_port()}\n"))
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr("wt.providers.postgres.time.sleep", lambda s: None)
     return f

@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, proc
+from wt import compose, host, proc
+from wt.errors import WtError
 from wt.providers import server
 
 
@@ -66,3 +67,112 @@ def test_up_never_returns_less_than_one_second(
 ) -> None:
     assert run_up(tmp_path, monkeypatch, took=59.5, timeout=60) == 1.0
     assert run_up(tmp_path, monkeypatch, took=75, timeout=60) == 1.0
+
+
+PUBLISHED_DOC = {
+    "services": {"db": {"image": "x", "container_name": "t-db", "ports": ["127.0.0.1:55432:5432"]}}
+}
+PORT_LINE = "5432/tcp -> 127.0.0.1:55432\n"
+
+
+class Docker:
+    """`docker compose` calls take `took` seconds; `docker port` answers from a script."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, port_answers: list[str], took: float = 0):
+        self.now = 500.0
+        self.took = took
+        self.port_answers = port_answers
+        self.compose_calls: list[list[str]] = []
+        monkeypatch.setattr(proc, "run", self.run)
+        monkeypatch.setattr(compose, "ensure_network", lambda: None)
+        monkeypatch.setattr(time, "monotonic", lambda: self.now)
+
+    def run(self, cmd: list[str], **kwargs: object) -> proc.Result:
+        if cmd[:2] == ["docker", "port"]:
+            answer = (
+                self.port_answers.pop(0) if len(self.port_answers) > 1 else self.port_answers[0]
+            )
+            return proc.Result(0, answer, "")
+        self.now += self.took
+        self.compose_calls.append(cmd)
+        return proc.Result(0, "", "")
+
+
+def test_published_ports_cost_exactly_one_compose_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker(monkeypatch, [PORT_LINE])
+    server.up("t-db", tmp_path, PUBLISHED_DOC, 30)
+    assert len(docker.compose_calls) == 1
+    assert "--force-recreate" not in docker.compose_calls[0]
+
+
+def test_missing_ports_recreate_the_container_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker(monkeypatch, ["", PORT_LINE])
+    server.up("t-db", tmp_path, PUBLISHED_DOC, 30)
+    file = tmp_path / "compose.yml"
+    assert docker.compose_calls[1] == [
+        "docker", "compose", "-p", "t-db", "-f", str(file),
+        "up", "-d", "--force-recreate", "--wait", "--wait-timeout", "30",
+    ]  # fmt: skip
+    assert len(docker.compose_calls) == 2
+
+
+def test_recreate_gets_only_what_the_deadline_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker(monkeypatch, ["", PORT_LINE], took=50)
+    left = server.up("t-db", tmp_path, PUBLISHED_DOC, 60)
+    assert docker.compose_calls[1][-1] == "10"
+    assert left == 1.0  # both starts together used more than the deadline
+
+
+def test_recreate_never_gets_less_than_the_minimum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker(monkeypatch, ["", PORT_LINE], took=75)
+    server.up("t-db", tmp_path, PUBLISHED_DOC, 60)
+    assert docker.compose_calls[1][-1] == "1"
+
+
+def test_ports_still_missing_after_the_recreate_fail_with_the_container_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = Docker(monkeypatch, [""])
+    monkeypatch.setattr(host, "port_free", lambda port: True)
+    with pytest.raises(WtError, match="t-db does not publish port 55432"):
+        server.up("t-db", tmp_path, PUBLISHED_DOC, 30)
+    assert len(docker.compose_calls) == 2  # recreated once, not in a loop
+
+
+def test_a_port_taken_by_another_program_is_named_as_such(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    Docker(monkeypatch, [""])
+    monkeypatch.setattr(host, "port_free", lambda port: False)
+    with pytest.raises(WtError, match="port 55432 is already in use by another program"):
+        server.up("t-db", tmp_path, PUBLISHED_DOC, 30)
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("127.0.0.1:55432:5432", {55432}),
+        ("55432:5432", {55432}),
+        ("127.0.0.1:55432:5432/tcp", {55432}),
+        ("5432", set()),  # Docker picks the host port
+        (5432, set()),
+    ],
+)
+def test_expected_ports_reads_every_form_of_a_ports_entry(
+    entry: object, expected: set[int]
+) -> None:
+    doc = {"services": {"db": {"container_name": "t-db", "ports": [entry]}}}
+    assert server.expected_ports("t", doc) == ({"t-db": expected} if expected else {})
+
+
+def test_expected_ports_derives_the_container_name_the_way_compose_does() -> None:
+    doc = {"services": {"db": {"ports": ["55432:5432"]}, "other": {"image": "x"}}}
+    assert server.expected_ports("t", doc) == {"t-db-1": {55432}}
