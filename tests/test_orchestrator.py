@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,7 @@ from tests.conftest import (
     _window_is_free,
 )
 from tests.conftest import git as git_run
-from wt import compose, git, health, host, naming, proc, router, tls
+from wt import compose, git, health, host, naming, orchestrator, proc, router, state, tls
 from wt.config import load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
@@ -455,6 +455,216 @@ def test_down_cannot_start_server_keeps_state_for_rerun(
     monkeypatch.setattr(fake_provider, "ensure_server", working)
     o.down("feat/cart")
     assert o.store.load().branches == {}
+
+
+def _raising(error: Exception) -> Callable[..., None]:
+    def fail(*args: object) -> None:
+        raise error
+
+    return fail
+
+
+def _failing(message: str) -> Callable[..., None]:
+    return _raising(WtError(message))
+
+
+def _clean_message(branch: str, provider: str = "postgres") -> str:
+    return (
+        rf"^{provider}: could not clean branch {branch} \([^\n]+\)\. "
+        rf"Try `wt doctor --fix`, then `wt down {branch}` again\.$"
+    )
+
+
+def test_down_destroy_failure_stops_and_keeps_the_branch(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    worktree = isolated_home / "shop" / "worktrees" / "feat-cart" / "api"
+    working = fake_provider.destroy
+    monkeypatch.setattr(fake_provider, "destroy", _failing("drop failed"))
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    assert "(drop failed)" in str(info.value)
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.status == "removing"
+    assert bs.providers == {"postgres": ["db_feat_cart"]}
+    assert worktree.is_dir()
+
+    monkeypatch.setattr(fake_provider, "destroy", working)
+    assert o.down("feat/cart") is True
+    assert o.store.load().branches == {}
+    assert not worktree.exists()
+
+
+def test_down_ensure_server_failure_has_the_same_shape(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    monkeypatch.setattr(fake_provider, "ensure_server", _failing("server is down"))
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    assert "(server is down)" in str(info.value)
+    assert "destroy" not in fake_provider.events
+    assert o.store.load().branches["feat/cart"].status == "removing"
+
+
+def _down_failure_message(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, error: WtError
+) -> str:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+
+    def fail(*args: object) -> None:
+        raise error
+
+    monkeypatch.setattr(fake_provider, "destroy", fail)
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    return str(info.value)
+
+
+_DOCKER_EXEC = ["docker", "exec", "redis", "redis-cli", "-a", "x"]
+
+
+def test_down_converts_a_command_error_into_one_short_line(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = proc.Result(1, "", "noise\n" * 40 + "ERROR: server is not running\n  \n")
+    message = _down_failure_message(
+        orch, fake_provider, monkeypatch, proc.CommandError(_DOCKER_EXEC, result)
+    )
+    assert "\n" not in message and "noise" not in message
+    assert "(ERROR: server is not running)" in message
+
+
+def test_down_shows_the_daemon_cause_of_a_command_error_not_the_argv(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stderr = "Some earlier line\nError response from daemon: container abc is not running\n"
+    error = proc.CommandError(_DOCKER_EXEC, proc.Result(1, "", stderr))
+    message = _down_failure_message(orch, fake_provider, monkeypatch, error)
+    assert "Error response from daemon: container abc is not running" in message
+    assert "docker exec" not in message
+
+
+def test_down_uses_stdout_when_a_command_error_has_no_stderr(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = proc.CommandError(_DOCKER_EXEC, proc.Result(1, "first\nConnection refused\n", ""))
+    message = _down_failure_message(orch, fake_provider, monkeypatch, error)
+    assert "(Connection refused)" in message
+
+
+def test_down_falls_back_to_the_first_line_when_a_command_error_has_no_output(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = proc.CommandError(_DOCKER_EXEC, proc.Result(1, "", "  \n"))
+    message = _down_failure_message(orch, fake_provider, monkeypatch, error)
+    assert "command failed (1): docker exec redis redis-cli -a x" in message
+
+
+def test_down_keeps_the_first_line_of_a_plain_wt_error(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    message = _down_failure_message(
+        orch, fake_provider, monkeypatch, WtError("first cause\nsecond line")
+    )
+    assert "(first cause)" in message and "second line" not in message
+
+
+def test_down_cuts_a_long_reason(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    monkeypatch.setattr(fake_provider, "destroy", _failing("x" * 500))
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    reason = str(info.value).split("(", 1)[1].split("). Try", 1)[0]
+    assert len(reason) <= 120 and reason.endswith("...")
+
+
+def test_down_does_not_destroy_later_providers_after_a_failure(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wt import providers
+
+    second = FakeProvider(fake_provider.events, name="redis")
+    monkeypatch.setitem(providers.REGISTRY, "redis", lambda cfg, log: second)
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    with o.store.edit() as state:
+        state.branches["feat/cart"].providers["redis"] = ["r_feat_cart"]
+    working = fake_provider.destroy
+    monkeypatch.setattr(fake_provider, "destroy", _failing("drop failed"))
+    with pytest.raises(WtError, match=_clean_message("feat/cart")):
+        o.down("feat/cart")
+    assert fake_provider.events.count("destroy") == 0
+    assert o.store.load().branches["feat/cart"].providers == {
+        "postgres": ["db_feat_cart"],
+        "redis": ["r_feat_cart"],
+    }
+
+    monkeypatch.setattr(fake_provider, "destroy", working)
+    assert o.down("feat/cart") is True
+    assert o.store.load().branches == {}
+
+
+def test_down_converts_an_os_error_from_the_provider_and_recovers(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    working = fake_provider.ensure_server
+    monkeypatch.setattr(
+        fake_provider, "ensure_server", _raising(OSError(28, "No space left on device"))
+    )
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    assert "No space left on device" in str(info.value)
+    assert "\n" not in str(info.value)
+    bs = o.store.load().branches["feat/cart"]
+    assert bs.status == "removing"
+    assert bs.providers == {"postgres": ["db_feat_cart"]}
+
+    monkeypatch.setattr(fake_provider, "ensure_server", working)
+    assert o.down("feat/cart") is True
+    assert o.store.load().branches == {}
+
+
+def test_down_converts_a_permission_error_from_the_provider_lock(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    real_lock = state.file_lock
+
+    def lock(name: str) -> AbstractContextManager[None]:
+        if name == "postgres":
+            raise PermissionError(13, "Permission denied")
+        return real_lock(name)
+
+    monkeypatch.setattr(orchestrator, "file_lock", lock)
+    with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
+        o.down("feat/cart")
+    assert "Permission denied" in str(info.value)
+    assert o.store.load().branches["feat/cart"].status == "removing"
+
+    monkeypatch.setattr(orchestrator, "file_lock", real_lock)
+    assert o.down("feat/cart") is True
+    assert o.store.load().branches == {}
+
+
+def test_down_does_not_convert_a_provider_bug(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    monkeypatch.setattr(fake_provider, "destroy", _raising(KeyError("missing")))
+    with pytest.raises(KeyError):
+        o.down("feat/cart")
 
 
 def test_provider_state_is_recorded_and_cleared(orch, fake_provider: FakeProvider) -> None:

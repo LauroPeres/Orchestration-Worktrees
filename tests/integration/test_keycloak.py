@@ -13,6 +13,7 @@ import pytest
 
 from wt import compose
 from wt.config import Config
+from wt.errors import WtError
 from wt.naming import Names
 from wt.providers import keycloak
 from wt.providers.base import BranchContext
@@ -62,14 +63,14 @@ def module_home(server: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WT_HOME", server)
 
 
-def make(branch: str) -> tuple[KeycloakProvider, BranchContext]:
+def make(branch: str, realm: str = REALM) -> tuple[KeycloakProvider, BranchContext]:
     cfg = Config.model_validate(
         {
             "project": "shop",
             "domain": "shop.localhost",
             "repos": {"api": "./api"},
             "services": {"api": {"repo": "api", "compose": "c.yml"}},
-            "shared": {"keycloak": {"realm": REALM, "client": "web"}},
+            "shared": {"keycloak": {"realm": realm, "client": "web"}},
         }
     )
     names = Names("shop", branch, "shop.localhost")
@@ -79,6 +80,15 @@ def make(branch: str) -> tuple[KeycloakProvider, BranchContext]:
         f"https://api.{names.branch_domain}:{port}",
     )
     return KeycloakProvider(cfg), BranchContext(names, branch, "main", StateStore("shop"), urls)
+
+
+def leftover_configs() -> str:
+    """How many kcadm login config files remain inside the Keycloak container."""
+    res = docker(
+        "exec", keycloak.container(), "sh", "-c", "ls /tmp/kcadm-*.config 2>/dev/null | wc -l"
+    )
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip()
 
 
 def clients() -> dict[str, list[str]]:
@@ -179,3 +189,50 @@ def test_destroy_leaves_the_other_branch_and_the_realm(server: str) -> None:
     assert discovery(keycloak.url())["issuer"] == f"{keycloak.url()}/realms/{REALM}"
     longer.destroy(longer_ctx)
     assert "web-feat-x" not in clients()
+
+
+def test_no_login_config_file_is_left_in_the_container(server: str) -> None:
+    provider, ctx = make("cfgleak")
+    provider.create(ctx)
+    assert keycloak.find_client(REALM, provider.client_id(ctx)) is not None
+    assert leftover_configs() == "0"
+    assert keycloak.find_client("never-created-realm", "web") is None
+    with pytest.raises(WtError):
+        keycloak.kcadm("get", "clients", "-r", "never-created-realm")
+    assert leftover_configs() == "0"
+    provider.destroy(ctx)
+    assert leftover_configs() == "0"
+
+
+def test_missing_realm_destroy_is_silent_and_verify_fails(server: str) -> None:
+    provider, ctx = make("norealm", realm="wt-never-created")
+    provider.destroy(ctx)
+    check = provider.verify(ctx)
+    assert not check.ok
+    assert "not found" in check.detail
+
+
+def test_stopped_server_raises_then_destroy_works_after_restart(server: str) -> None:
+    gone, gone_ctx = make("stopgone")
+    kept, kept_ctx = make("stopkept")
+    gone.create(gone_ctx)
+    kept.create(kept_ctx)
+    secrets = [keycloak.password(), keycloak.SCRIPT]
+    assert docker("stop", keycloak.container()).returncode == 0
+    try:
+        for action in (gone.destroy, gone.verify):
+            with pytest.raises(WtError) as raised:
+                action(gone_ctx)
+            message = str(raised.value)
+            assert message.startswith("keycloak:"), message
+            assert not any(secret in message for secret in secrets), message
+    finally:
+        assert docker("start", keycloak.container()).returncode == 0
+        keycloak.wait_ready()
+    gone.destroy(gone_ctx)
+    found = clients()
+    assert "web-stopgone" not in found
+    assert "web-stopkept" in found
+    assert kept.verify(kept_ctx).ok
+    kept.destroy(kept_ctx)
+    assert discovery(keycloak.url())["issuer"] == f"{keycloak.url()}/realms/{REALM}"

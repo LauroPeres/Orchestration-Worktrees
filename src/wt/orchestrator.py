@@ -34,8 +34,29 @@ from wt.state import (
 )
 from wt.templating import render
 
+_REASON_MAX_CHARS = 120
+
 Log = Callable[[str], None]
 Outcome = Literal["ok", "fail", "skipped"]
+
+
+def _non_empty_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _short_reason(exc: Exception) -> str:
+    """One short line saying why `exc` happened (no command dumps).
+
+    A failed command's first line is only its argv; docker and kcadm put the cause at the end of
+    the output, so that line wins when there is one.
+    """
+    lines = _non_empty_lines(str(exc))
+    if isinstance(exc, proc.CommandError):
+        lines = _non_empty_lines(exc.result.stderr or exc.result.stdout)[-1:] or lines
+    reason = lines[0] if lines else type(exc).__name__
+    if len(reason) > _REASON_MAX_CHARS:
+        return reason[: _REASON_MAX_CHARS - 3].rstrip() + "..."
+    return reason
 
 
 @dataclass(frozen=True)
@@ -838,22 +859,29 @@ class Orchestrator:
                     f"resources by hand: {leftover}"
                 )
                 continue
-            provider = factory(self.cfg, self.log)
-            with file_lock(name):
-                try:
-                    provider.ensure_server()
-                except WtError as exc:
-                    raise WtError(
-                        f"cannot start the {name} server to remove this branch's resources: "
-                        f"{exc}. Try `wt doctor --fix`, then run `wt down {branch}` again"
-                    ) from exc
-                self.log(f"destroying {name} resources")
-                provider.destroy(ctx)
+            self._destroy_provider(branch, name, factory(self.cfg, self.log), ctx)
 
             def cleared(b: BranchState, n: str = name) -> None:
                 b.providers.pop(n, None)
 
             self._record(branch, cleared)
+
+    def _destroy_provider(
+        self, branch: str, name: str, provider: Provider, ctx: BranchContext
+    ) -> None:
+        """The single place where a failed provider step of `down` becomes the user-facing error."""
+        # OSError is caught too: the lock directory and the provider's own file writes (disk full,
+        # permissions) fail without going through `proc.run`, so they never become a WtError.
+        try:
+            with file_lock(name):
+                provider.ensure_server()
+                self.log(f"destroying {name} resources")
+                provider.destroy(ctx)
+        except (WtError, OSError) as exc:
+            raise WtError(
+                f"{name}: could not clean branch {branch} ({_short_reason(exc)}). "
+                f"Try `wt doctor --fix`, then `wt down {branch}` again."
+            ) from exc
 
     # ---- ls / logs ------------------------------------------------------------------------
 

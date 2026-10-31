@@ -366,12 +366,15 @@ to the port. No port: the process is alive.
 create, verify) → TLS → compose services → host processes → routes → health → URL table.
 
 **Down failures.** When a provider step of `down` fails (its server cannot be started or reached,
-a login fails, a command errors), `down` stops there: the branch stays `removing`, its state
+a login fails, a command errors, or a local file or lock operation fails with an OS error),
+`down` stops there: the branch stays `removing`, its state
 record is not removed, and the command exits non-zero with the message
 ``<provider>: could not clean branch <branch> (<short reason>). Try `wt doctor --fix`, then
 `wt down <branch>` again.`` Running `wt down <branch>` again after the fix finishes the job.
-`down` never continues past a failed provider step, because it would then delete the record
-and orphan the resource.
+The `<short reason>` is one line of at most about 120 characters: for a failed command the last
+non-empty line of its output (where Docker and kcadm put the cause), never the command line; for
+any other error its first line. `down` never continues past a failed provider step, because it
+would then delete the record and orphan the resource.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
 worktrees. Each step skips what state says was never created. Without a state entry, a folder
@@ -772,13 +775,15 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
   it looks the client up by exact `clientId` (matched in Python, never by prefix) and then
   creates or updates it. The id of a new client is on stdout, quoted (`Created new client with
   id '<uuid>'`).
-- **Verify and destroy.** `verify`: the client exists with exactly the rendered redirect URIs and
-  the realm answers. `destroy`: delete only this branch's client; branch `feat` never touches
+- **Verify and destroy.** `verify`: the client exists with exactly the rendered redirect URIs (a
+  missing realm counts as a missing client). `destroy`: delete only this branch's client; branch `feat` never touches
   `feat-x`. The realm and its users stay. A realm or client that does not exist is not an
   error (nothing to do, silent). A kcadm call that cannot log in, cannot reach the server, or
   returns something that is not JSON raises a short `WtError` (`keycloak: <reason>`), for
   `destroy` and `verify` alike: a stopped server is never read as "client not found". A failing
-  kcadm call is reported as `kcadm.sh <args>`, never with the login script or any password. Resources are recorded as `["<realm>/<clientId>"]` so
+  kcadm call is reported on one line with the cause first, `keycloak: <reason> (kcadm.sh <verb>
+  <resource>)` (for example `(kcadm.sh get clients)`), without realm, client or ids, and never with
+  the login script or any password. Resources are recorded as `["<realm>/<clientId>"]` so
   `down` works even after `shared.keycloak` leaves the config.
 - **Template values.** `keycloak.url` (`http://localhost:<port>`), `keycloak.issuer`
   (`<url>/realms/<realm>`, the same for every branch: one login works across the branch
