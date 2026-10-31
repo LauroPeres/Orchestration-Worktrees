@@ -36,15 +36,25 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 PORT_WINDOW = 1000  # room for worktree indexes 0..9 of 100 services
+PORT_WINDOW_FLOOR = 15000
+# The OS hands out ephemeral ports (client sockets, bind(0)) from a range that starts at 32768 on
+# Linux and at 49152 on macOS. A window below the lowest start never overlaps either one, so a
+# port the formula picks cannot be taken by an unrelated connection.
+LOWEST_EPHEMERAL_PORT = 32768
 
 
-def _window_is_free(base: int) -> bool:
-    for port in range(base, base + PORT_WINDOW):
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+def _window_is_free(base: int, size: int = PORT_WINDOW) -> bool:
+    """True when every port in [base, base + size) can be bound right now.
+
+    A bind attempt (no SO_REUSEADDR, like a server that did not set it) also rejects ports that
+    are bound but not listening or held as the local end of a connection, which a connect misses.
+    """
+    for port in range(base, base + size):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
                 return False
-        except OSError:
-            continue
     return True
 
 
@@ -53,7 +63,7 @@ def private_port_base(monkeypatch: pytest.MonkeyPatch) -> int:
     """Move the host-port formula to a free private window, so tests never meet a real stack."""
     rng = random.Random()
     for _ in range(50):
-        base = rng.randrange(15000, 60000 - PORT_WINDOW)
+        base = rng.randrange(PORT_WINDOW_FLOOR, LOWEST_EPHEMERAL_PORT - PORT_WINDOW)
         if _window_is_free(base):
             break
     monkeypatch.setattr(naming, "PORT_BASE", base)
