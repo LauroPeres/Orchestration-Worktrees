@@ -171,6 +171,21 @@ def test_keycloak_realm_and_client_reject_dash_or_dot_first(tmp_path: Path, bad:
             load_config(write(tmp_path, data))
 
 
+@pytest.mark.parametrize("key", ["realm", "client"])
+def test_keycloak_name_accepts_64_characters(tmp_path: Path, key: str) -> None:
+    keycloak = {"realm": "shop", "client": "web", key: "a" * 64}
+    cfg = load_config(write(tmp_path, {**BASE, "shared": {"keycloak": keycloak}})).config
+    assert cfg.shared.keycloak is not None
+    assert getattr(cfg.shared.keycloak, key) == "a" * 64
+
+
+@pytest.mark.parametrize("key", ["realm", "client"])
+def test_keycloak_name_rejects_65_characters_naming_the_field(tmp_path: Path, key: str) -> None:
+    keycloak = {"realm": "shop", "client": "web", key: "a" * 65}
+    with pytest.raises(WtError, match=rf"shared\.keycloak\.{key}: .*at most 64 characters"):
+        load_config(write(tmp_path, {**BASE, "shared": {"keycloak": keycloak}}))
+
+
 def test_keycloak_realm_and_client_accept_dots_dashes_and_case(tmp_path: Path) -> None:
     data = {**BASE, "shared": {"keycloak": {"realm": "Shop.v1_x-2", "client": "Web-App"}}}
     cfg = load_config(write(tmp_path, data)).config

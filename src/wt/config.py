@@ -21,6 +21,9 @@ DOMAIN = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
 # realm and client id: no "/" (recorded as "<realm>/<id>"), no leading "-" or "." (not an option
 # or a "." / ".." path segment for kcadm)
 KEYCLOAK_NAME = r"^[A-Za-z0-9_][A-Za-z0-9._-]*$"
+# Keycloak rejects a realm of ~251+ characters (server error) and a client id of 251+
+# (`unknown_error`); 64 is far below that and plenty for a name.
+MAX_KEYCLOAK_NAME = 64
 
 
 class Strict(BaseModel):
@@ -77,8 +80,8 @@ class Redis(Strict):
 
 
 class Keycloak(Strict):
-    realm: str = Field(pattern=KEYCLOAK_NAME)
-    client: str = Field(pattern=KEYCLOAK_NAME)
+    realm: str = Field(pattern=KEYCLOAK_NAME, max_length=MAX_KEYCLOAK_NAME)
+    client: str = Field(pattern=KEYCLOAK_NAME, max_length=MAX_KEYCLOAK_NAME)
 
 
 class Shared(Strict):
