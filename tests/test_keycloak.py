@@ -219,6 +219,27 @@ def test_ensure_server_starts_waits_then_creates_realm(fake: FakeProc) -> None:
     ] in fake.kc()
 
 
+def test_ensure_server_without_the_section_only_starts_and_waits_for_the_login(
+    fake: FakeProc,
+) -> None:
+    provider(with_keycloak=False).ensure_server()
+    cmds = [" ".join(c) for c in fake.calls]
+    up = next(i for i, c in enumerate(cmds) if "compose" in c and " up " in c)
+    login = next(i for i, c in enumerate(cmds) if c.endswith("get realms/master"))
+    assert up < login
+    assert fake.kc() == [["get", "realms/master"]]  # no realm is created
+
+
+def test_ensure_server_without_the_section_still_fails_when_the_login_is_refused(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.on("get realms/master", LOGIN_REFUSED)
+    ticks = iter(range(0, 1000, 100))
+    monkeypatch.setattr("wt.providers.keycloak.time.monotonic", lambda: next(ticks))
+    with pytest.raises(WtError, match="did not accept the admin login"):
+        provider(with_keycloak=False).ensure_server()
+
+
 def test_ensure_server_treats_existing_realm_as_done(fake: FakeProc) -> None:
     fake.on("create realms", proc.Result(1, "", "Realm shop already exists"))
     provider().ensure_server()
@@ -501,6 +522,56 @@ def test_destroy_uses_recorded_names_when_config_is_gone(fake: FakeProc) -> None
     kc = fake.kc()
     assert kc[0][kc[0].index("-r") + 1] == "old"
     assert ["delete", f"clients/{UUID}", "-r", "old"] in kc
+
+
+def test_down_after_the_section_left_the_config_deletes_the_recorded_client(
+    fake: FakeProc,
+) -> None:
+    c = ctx()
+    with c.state.edit() as state:
+        state.branches["feat/cart"] = BranchState(
+            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["shop/web-feat-cart"]}
+        )
+    fake.on("get clients", clients((UUID, "web-feat-cart", []), ("id-x", "web-feat-cart-x", [])))
+    p = provider(with_keycloak=False)
+    p.ensure_server()  # what the orchestrator calls before destroy
+    p.destroy(c)
+    kc = fake.kc()
+    assert ["delete", f"clients/{UUID}", "-r", "shop"] in kc
+    assert [cmd for cmd in kc if cmd[0] == "delete"] == [
+        ["delete", f"clients/{UUID}", "-r", "shop"]
+    ]
+    assert not any(cmd[1] == "realms" for cmd in kc if cmd[0] in ("create", "delete", "update"))
+
+
+def test_destroy_without_the_section_is_silent_when_the_recorded_realm_is_gone(
+    fake: FakeProc,
+) -> None:
+    c = ctx()
+    with c.state.edit() as state:
+        state.branches["feat/cart"] = BranchState(
+            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["shop/web-feat-cart"]}
+        )
+    fake.on("get clients", REALM_NOT_FOUND)
+    provider(with_keycloak=False).destroy(c)
+    assert not any(cmd[0] == "delete" for cmd in fake.kc())
+
+
+def test_destroy_without_the_section_skips_malformed_names_and_keeps_going(
+    fake: FakeProc,
+) -> None:
+    c = ctx()
+    with c.state.edit() as state:
+        state.branches["feat/cart"] = BranchState(
+            branch="feat/cart",
+            slug="feat-cart",
+            providers={"keycloak": ["", "/web", "shop/", "no-slash", "shop/web-feat-cart"]},
+        )
+    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    provider(with_keycloak=False).destroy(c)
+    gets = [cmd for cmd in fake.kc() if cmd[0] == "get"]
+    assert len(gets) == 1
+    assert ["delete", f"clients/{UUID}", "-r", "shop"] in fake.kc()
 
 
 def test_destroy_ignores_malformed_recorded_names(fake: FakeProc) -> None:

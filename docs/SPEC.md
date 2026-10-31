@@ -374,7 +374,9 @@ record is not removed, and the command exits non-zero with the message
 `wt down <branch>` again.`` Running `wt down <branch>` again after the fix finishes the job.
 The `<short reason>` is one line of at most about 120 characters: for a failed command the last
 non-empty line of its output (where Docker and kcadm put the cause), never the command line; for
-any other error its first line. `down` never continues past a failed provider step, because it
+any other error its first line. When the line is longer, the START and the END are kept with `...` between them (the first 50
+and the last 67 characters): Docker puts the cause, for example `address already in use`, at the
+end, while path errors such as `not a git repository: <long path>` put it at the start. `down` never continues past a failed provider step, because it
 would then delete the record and orphan the resource.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
@@ -656,8 +658,11 @@ port rules of §13 (compose isolation) and §14 (ports).
    free it`. The one exception is a port this worktree already records as its own: for a `run:`
    service only while its recorded process is alive (a stale `up` or `degraded` status does not
    count, so a stranger that took the port after the process died is refused); for a compose
-   service while the recorded status is `up` or `degraded` (its container publishes the port and
-   there is no host process to check).
+   service while the branch status is not `stopped` or `removing` (its container publishes the
+   port and there is no host process to check; after an interrupted `up` the status is `creating`
+   or `failed` while the containers may already run, and `up` must reuse them). A stranger that
+   takes the port of a `failed` branch whose containers are gone is not caught here: `docker compose
+   up` fails with Docker's own bind error and the branch stays `failed`.
    `naming.auto_port`, `AUTO_PORT_RANGE` and the probing in `host.pick_port` are removed; this
    replaces §14 "Ports".
 5. **Compose publish.** The override keeps `ports: !reset`, but sets it to
@@ -743,7 +748,11 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
   not with a broker-side pattern. `destroy` also cleans the prefix or group names recorded in the
   branch state when the config no longer enables them (only names wt recorded itself). A Kafka
   group that still has a live consumer is not deleted (the tool exits 0 and prints
-  `GroupNotEmptyException`): `destroy` logs a warning naming the group and does not abort `down`.
+  `GroupNotEmptyException`): `destroy` retries for up to 20 s (a stopped consumer leaves the group
+  when the broker notices it) and, if members remain, raises `consumer group <group> still has
+  members`, so `down` stops with the branch kept as `removing` (see 'Down failures') and the group is
+  not forgotten. The retry runs inside `file_lock("kafka")`, so for up to 20 s it can delay an `up`
+  of another branch that uses Kafka and `doctor`.
 - **Locks and waits.** `file_lock("redis")` / `file_lock("kafka")`, also used by doctor.
   `redis-cli PING` answers PONG; Kafka answers
   `kafka-broker-api-versions.sh --bootstrap-server localhost:9092`.
@@ -798,7 +807,9 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
   kcadm call is reported on one line with the cause first, `keycloak: <reason> (kcadm.sh <verb>
   <resource>)` (for example `(kcadm.sh get clients)`), without realm, client or ids, and never with
   the login script or any password. Resources are recorded as `["<realm>/<clientId>"]` so
-  `down` works even after `shared.keycloak` leaves the config.
+  `down` works even after `shared.keycloak` leaves the config: without the section
+  `ensure_server()` only starts the server and waits for the login (no realm is created) and
+  `destroy` deletes the recorded clients.
 - **Template values.** `keycloak.url` (`http://localhost:<port>`), `keycloak.issuer`
   (`<url>/realms/<realm>`, the same for every branch: one login works across the branch
   subdomains), `keycloak.realm`, `keycloak.client_id` and `keycloak.internal_url`

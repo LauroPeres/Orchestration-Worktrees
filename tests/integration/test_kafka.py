@@ -10,6 +10,7 @@ import pytest
 
 from wt import compose
 from wt.config import Config
+from wt.errors import WtError
 from wt.naming import Names
 from wt.providers import kafka
 from wt.providers.base import BranchContext
@@ -183,7 +184,7 @@ def test_without_topic_prefix_destroy_deletes_only_groups(server: str) -> None:
     kafka.tool("kafka-topics.sh", "--delete", "--topic", "shared-topic")
 
 
-def test_destroy_warns_while_a_consumer_holds_the_group(server: str) -> None:
+def test_destroy_raises_while_a_consumer_holds_the_group_then_removes_it(server: str) -> None:
     provider, ctx = make("feat/held", topic_prefix=False)
     messages: list[str] = []
     provider.log = messages.append
@@ -202,8 +203,10 @@ def test_destroy_warns_while_a_consumer_holds_the_group(server: str) -> None:
             topic,
             "--group",
             group,
+            # Outlives the 20 s retry window; it exits by itself because `docker exec` cannot
+            # kill the in-container JVM.
             "--timeout-ms",
-            "20000",  # exits by itself once idle: docker exec cannot kill the in-container JVM
+            "60000",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -214,16 +217,12 @@ def test_destroy_warns_while_a_consumer_holds_the_group(server: str) -> None:
             time.sleep(1)
         assert group in groups()
         time.sleep(3)
-        provider.destroy(ctx)
+        with pytest.raises(WtError, match="still has members"):
+            provider.destroy(ctx)
         assert group in groups()
-        assert any(group in m and "consumer is still connected" in m for m in messages)
+        assert any(f"waiting for consumer group {group}" in m for m in messages)
     finally:
-        consumer.wait(timeout=60)
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        provider.destroy(ctx)
-        if group not in groups():
-            break
-        time.sleep(2)
+        consumer.wait(timeout=90)
+    provider.destroy(ctx)
     assert group not in groups()
     kafka.tool("kafka-topics.sh", "--delete", "--topic", topic)

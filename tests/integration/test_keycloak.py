@@ -18,7 +18,7 @@ from wt.naming import Names
 from wt.providers import keycloak
 from wt.providers.base import BranchContext
 from wt.providers.keycloak import KeycloakProvider
-from wt.state import StateStore
+from wt.state import BranchState, StateStore
 
 pytestmark = pytest.mark.docker
 
@@ -189,6 +189,38 @@ def test_destroy_leaves_the_other_branch_and_the_realm(server: str) -> None:
     assert discovery(keycloak.url())["issuer"] == f"{keycloak.url()}/realms/{REALM}"
     longer.destroy(longer_ctx)
     assert "web-feat-x" not in clients()
+
+
+def test_down_without_the_keycloak_section_deletes_the_recorded_client(server: str) -> None:
+    feat, feat_ctx = make("nosection")
+    sibling, sibling_ctx = make("nosection-sibling")
+    for provider, ctx in [(feat, feat_ctx), (sibling, sibling_ctx)]:
+        recorded = provider.create(ctx).names
+        with ctx.state.edit() as state:
+            state.branches[ctx.branch] = BranchState(
+                branch=ctx.branch, slug=ctx.names.slug, providers={"keycloak": recorded}
+            )
+    realms_before = json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout)
+    assert "web-nosection" in clients()
+
+    bare_cfg = Config.model_validate(
+        {
+            "project": "shop",
+            "domain": "shop.localhost",
+            "repos": {"api": "./api"},
+            "services": {"api": {"repo": "api", "compose": "c.yml"}},
+        }
+    )
+    bare = KeycloakProvider(bare_cfg)
+    bare.ensure_server()
+    bare.destroy(feat_ctx)
+
+    found = clients()
+    assert "web-nosection" not in found
+    assert "web-nosection-sibling" in found
+    assert json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout) == realms_before
+    sibling.destroy(sibling_ctx)
+    assert "web-nosection-sibling" not in clients()
 
 
 def test_no_login_config_file_is_left_in_the_container(server: str) -> None:

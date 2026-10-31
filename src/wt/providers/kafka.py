@@ -22,6 +22,9 @@ BIN = "/opt/kafka/bin"
 BOOTSTRAP = "localhost:9092"
 NAME = re.compile(r"^[a-z0-9._-]+$")
 PREFIX = re.compile(r"^[a-z0-9-]+\.$")  # what wt builds as a topic prefix
+# A group delete answers GroupNotEmpty until the broker notices the consumer left (SPEC §18).
+GROUP_RETRY_WINDOW = 20
+GROUP_RETRY_INTERVAL = 2
 
 
 def container() -> str:
@@ -193,14 +196,22 @@ class KafkaProvider:
                 self._delete_topics(prefix)
 
     def _delete_group(self, group: str) -> None:
-        result = tool("kafka-consumer-groups.sh", "--delete", "--group", group, check=False)
-        output = f"{result.stdout}{result.stderr}"
-        if "GroupNotEmpty" in output:
-            # The tool exits 0 here; a live consumer keeps the group, so warn, never abort `down`.
-            self.log(
-                f"warning: consumer group {group} was not deleted: a consumer is still connected"
-            )
-        elif not result.ok and "does not exist" not in output:
+        deadline = time.monotonic() + GROUP_RETRY_WINDOW
+        waiting = False
+        while True:
+            result = tool("kafka-consumer-groups.sh", "--delete", "--group", group, check=False)
+            output = f"{result.stdout}{result.stderr}"
+            # The tool exits 0 on GroupNotEmpty. A consumer that is already gone can still be a
+            # member until the broker notices it, so wait for that before giving up.
+            if "GroupNotEmpty" not in output:
+                break
+            if time.monotonic() >= deadline:
+                raise WtError(f"consumer group {group} still has members")
+            if not waiting:
+                waiting = True
+                self.log(f"waiting for consumer group {group} to lose its members")
+            time.sleep(GROUP_RETRY_INTERVAL)
+        if not result.ok and "does not exist" not in output:
             raise proc.CommandError(
                 ["kafka-consumer-groups.sh", "--delete", "--group", group], result
             )
