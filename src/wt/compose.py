@@ -105,7 +105,7 @@ def list_services(compose_file: Path) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def up(
+def up(  # noqa: PLR0913
     project: str,
     files: list[Path],
     *,

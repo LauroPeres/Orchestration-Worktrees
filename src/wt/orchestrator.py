@@ -482,7 +482,7 @@ class Orchestrator:
             ports[name] = port
         return ports
 
-    def _start_steps(
+    def _start_steps(  # noqa: PLR0913
         self,
         branch: str,
         names: Names,
@@ -516,7 +516,7 @@ class Orchestrator:
                         raise WtError(f"service {name!r} is not healthy: {report.detail}")
         return routes
 
-    def _up_run_service(
+    def _up_run_service(  # noqa: PLR0913
         self,
         branch: str,
         names: Names,
@@ -613,7 +613,7 @@ class Orchestrator:
             self._record(branch, change)
         return worktrees
 
-    def _up_compose_group(
+    def _up_compose_group(  # noqa: PLR0913
         self,
         branch: str,
         names: Names,
@@ -750,7 +750,7 @@ class Orchestrator:
                     git.delete_branch(source, branch)
             return True
 
-    def _down_locked(self, branch: str, *, force: bool) -> dict[str, Path] | None:
+    def _down_locked(self, branch: str, *, force: bool) -> dict[str, Path] | None:  # noqa: C901, PLR0912
         """The body of `down`; None when there was nothing to remove, else repo -> main folder."""
         names = self.names(branch)
         state = self.store.load()
@@ -1026,7 +1026,7 @@ class Orchestrator:
         if not stopped or added:
             new.up(branch)
 
-    def _drop_services(
+    def _drop_services(  # noqa: C901, PLR0913
         self,
         branch: str,
         names: Names,

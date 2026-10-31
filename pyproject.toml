@@ -26,6 +26,7 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.10",
     "types-pyyaml>=6.0",
+    "import-linter>=2.15",
 ]
 
 [build-system]
@@ -46,7 +47,21 @@ target-version = "py311"
 extend-exclude = ["docs"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "C901", "PLR0912", "PLR0913", "PLR0915"]
+
+# Size and complexity limits (clean-code). Never raise them to make a change pass: split the
+# function. The few legacy functions above them carry a `# noqa` listed in the architecture
+# skill, to be removed as they're refactored.
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-branches = 12
+max-statements = 50
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR0913", "PLR0915"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -57,3 +72,32 @@ files = ["src", "tests"]
 module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
+
+# Layer rules: a forbidden import fails `lint-imports` (CI, the checks and the post-edit hook).
+# interface -> core -> providers -> runtime -> model; a layer may import any layer below it.
+[tool.importlinter]
+root_package = "wt"
+
+[[tool.importlinter.contracts]]
+name = "Layers: interface -> core -> providers -> runtime -> model"
+type = "layers"
+layers = [
+    "wt.cli : wt.tui : wt.__main__",
+    "wt.orchestrator : wt.doctor",
+    "wt.providers",
+    "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects",
+    "wt.config : wt.catalog : wt.naming : wt.templating : wt.paths : wt.errors",
+]
+# Known exception (architecture skill): the "provider arrives in vX" hint reads the provider
+# registry. Remove this line when the hint moves to core or is dropped (needs a SPEC decision).
+ignore_imports = ["wt.templating -> wt.providers"]
+
+[[tool.importlinter.contracts]]
+name = "Providers stay independent of each other (shared code goes in base or server)"
+type = "independence"
+modules = [
+    "wt.providers.postgres",
+    "wt.providers.kafka",
+    "wt.providers.redis",
+    "wt.providers.keycloak",
+]
