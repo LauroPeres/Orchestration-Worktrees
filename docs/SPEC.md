@@ -466,7 +466,9 @@ Rules:
   processes sorted topologically; a cycle is an error).
 - The result is a normal `Config`, so the rest of wt does not change.
 - `wt catalog`: table of the catalog (service, repo, kind, infra, consumes, consumed by);
-  `wt catalog --check` validates it.
+  `wt catalog --check` validates it: the schema, then each service alone as a selection (unknown or
+  route-less dependency, env that already sets the consumes variable, cycle); every failing service is
+  reported by name and the exit code is non-zero if any failed. It does not render the templates.
 
 - Catalog services accept every `Service` key, plus `infra` (keys of `shared`) and `consumes`.
   Env var names in `consumes` match `^[A-Z_][A-Z0-9_]*$`.
@@ -572,7 +574,8 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
   A failure in one repo (a missing path, a refused delete) is reported with the repo's name and does
   not stop the others; `remove` then fails once at the end listing them.
 - `--force` works as in `down` (dirty worktrees are removed).
-- State: status gains `stopped`. `ls` shows `stopped` as stored (like `creating`).
+- State: status gains `stopped`. `ls` shows `stopped` as stored (like `creating`) and does not probe
+  its services: their HEALTH is `-`.
 - `BranchStatus` (the `ls()` rows) gains `ports: list[int]`, the reserved host ports of the branch
   (`BranchState.ports`), sorted.
 
