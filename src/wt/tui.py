@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, Protocol, cast
+from typing import ClassVar, Protocol, Self, cast
 
 from rich.text import Text
 from textual import on, work
@@ -10,6 +10,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.css.query import NoMatches
+from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Input, Label, SelectionList, Static
 from textual.widgets.selection_list import Selection
@@ -78,6 +79,18 @@ SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
 CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
 NEEDS_CATALOG = "configure needs a catalog project (uses: in worktree.yaml)"
 NOTHING_CHECKED = "check at least one service"
+
+
+def choice_label(choice: Choice) -> Text:
+    """`service (repo)`, plus `(required by x, y)` for a service only the stack consumes."""
+    label = f"{choice.service} ({choice.repo})"
+    if choice.required_by:
+        label += f" (required by {', '.join(choice.required_by)})"
+    return Text(label)
+
+
+def required_note(service: str, required_by: tuple[str, ...]) -> str:
+    return f"{service} is required by {', '.join(required_by)}"
 
 
 def actions_text(actions: str = ACTIONS) -> Text:
@@ -245,6 +258,30 @@ class InputScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class ChoiceList(SelectionList[str]):
+    """Selection list whose `locked` services stay checked; a toggle attempt is reported."""
+
+    class Refused(Message):
+        """The user tried to toggle a locked service."""
+
+        def __init__(self, service: str) -> None:
+            super().__init__()
+            self.service = service
+
+    def __init__(
+        self, selections: list[Selection[str]], locked: dict[str, tuple[str, ...]]
+    ) -> None:
+        super().__init__(*selections, id="choices")
+        self.locked = locked
+
+    def toggle(self, selection: Selection[str] | str) -> Self:
+        value = selection.value if isinstance(selection, Selection) else selection
+        if value in self.locked:
+            self.post_message(self.Refused(value))
+            return self
+        return super().toggle(selection)
+
+
 class ConfigureScreen(ModalScreen[list[str] | None]):
     """Check-box list of the catalog services; dismisses with the checked names, None on Escape."""
 
@@ -273,16 +310,14 @@ class ConfigureScreen(ModalScreen[list[str] | None]):
     def __init__(self, choices: list[Choice]) -> None:
         super().__init__()
         self.choices = choices
+        self.locked = {c.service: c.required_by for c in choices if c.required_by}
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text("Services"))
-            yield SelectionList[str](
-                *[
-                    Selection(Text(f"{c.service} ({c.repo})"), c.service, c.selected)
-                    for c in self.choices
-                ],
-                id="choices",
+            yield ChoiceList(
+                [Selection(choice_label(c), c.service, c.selected) for c in self.choices],
+                self.locked,
             )
             yield Static(actions_text(CONFIGURE_HINTS), id="hints")
             yield Static("", id="error")
@@ -290,8 +325,15 @@ class ConfigureScreen(ModalScreen[list[str] | None]):
     def on_mount(self) -> None:
         self.query_one("#choices", SelectionList).focus()
 
+    @on(ChoiceList.Refused)
+    def _refused(self, event: ChoiceList.Refused) -> None:
+        self.query_one("#error", Static).update(
+            Text(required_note(event.service, self.locked[event.service]))
+        )
+
     def action_confirm(self) -> None:
-        uses = list(self.query_one("#choices", SelectionList).selected)
+        checked = self.query_one("#choices", SelectionList).selected
+        uses = [service for service in checked if service not in self.locked]
         if not uses:
             self.query_one("#error", Static).update(Text(NOTHING_CHECKED))
             return
