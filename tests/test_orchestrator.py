@@ -13,13 +13,17 @@ import pytest
 import yaml
 
 from tests.conftest import (
+    _BASES_SEEN,
+    _PROBED_WINDOWS,
     COMPOSE,
     LOWEST_EPHEMERAL_PORT,
     PORT_WINDOW,
     PORT_WINDOW_FLOOR,
     SHARED,
+    WINDOW_TRIES,
     FakeDocker,
     FakeProvider,
+    _pick_free_window,
     _window_is_free,
 )
 from tests.conftest import git as git_run
@@ -1846,6 +1850,26 @@ def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
 def test_private_port_window_stays_below_the_ephemeral_range(private_port_base: int) -> None:
     assert private_port_base >= PORT_WINDOW_FLOOR
     assert private_port_base + PORT_WINDOW <= LOWEST_EPHEMERAL_PORT
+
+
+def test_private_port_window_is_probed_once_per_run(private_port_base: int) -> None:
+    assert {private_port_base} == _BASES_SEEN  # a different base means a per-test probe
+    assert 1 <= len(_PROBED_WINDOWS) <= WINDOW_TRIES
+    assert _PROBED_WINDOWS[-1] == private_port_base
+
+
+def test_pick_free_window_fails_loudly_when_no_window_is_free() -> None:
+    probed: list[int] = []
+    with pytest.raises(RuntimeError, match="no free window"):
+        _pick_free_window(lambda base: False, probed)
+    assert len(probed) == WINDOW_TRIES
+
+
+def test_pick_free_window_stops_at_the_first_free_window() -> None:
+    probed: list[int] = []
+    base = _pick_free_window(lambda base: len(probed) == 3, probed)
+    assert probed == [*probed[:2], base]
+    assert len(probed) == 3
 
 
 def test_window_is_free_rejects_a_port_that_is_bound_but_not_listening() -> None:
