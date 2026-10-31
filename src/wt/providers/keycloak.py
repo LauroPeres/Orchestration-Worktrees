@@ -165,14 +165,15 @@ def kcadm(*args: str, check: bool = True) -> proc.Result:
     return res
 
 
-def wait_ready(timeout: float = 120.0) -> None:
+def wait_ready(timeout: float = 120.0, total: float | None = None) -> None:
     deadline = time.monotonic() + timeout
     while True:
         if kcadm("get", "realms/master", check=False).ok:
             return
         if time.monotonic() >= deadline:
             raise WtError(
-                f"Keycloak did not accept the admin login in {timeout:.0f}s ({container()}). "
+                f"Keycloak did not accept the admin login in {(total or timeout):.0f}s "
+                f"({container()}). "
                 f"If {password_file()} was deleted while the volume {volume()} stayed, the "
                 "stored admin password no longer matches: restore the file or remove the volume."
             )
@@ -189,8 +190,8 @@ def ensure_realm(realm: str) -> None:
 
 
 def ensure_server(realm: str | None = None, timeout: int = 120) -> None:
-    server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(timeout)
+    left = server.up(container(), server_dir(), compose_doc(), timeout)
+    wait_ready(left, total=timeout)
     if realm is not None:
         ensure_realm(realm)
 

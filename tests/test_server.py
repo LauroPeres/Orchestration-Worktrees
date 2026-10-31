@@ -1,4 +1,5 @@
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -34,3 +35,34 @@ def test_up_writes_compose_ensures_network_and_starts(
         "up", "-d", "--wait", "--wait-timeout", "30",
     ]  # fmt: skip
     assert cwd == folder
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 500.0
+
+
+def run_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, took: float, timeout: int) -> float:
+    clock = Clock()
+
+    def run(cmd: list[str], **kwargs: object) -> proc.Result:
+        clock.now += took
+        return proc.Result(0, "", "")
+
+    monkeypatch.setattr(proc, "run", run)
+    monkeypatch.setattr(compose, "ensure_network", lambda: None)
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    return server.up("t-redis", tmp_path, {"services": {}}, timeout)
+
+
+def test_up_returns_the_seconds_left_of_the_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert run_up(tmp_path, monkeypatch, took=50, timeout=60) == pytest.approx(10)
+
+
+def test_up_never_returns_less_than_one_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert run_up(tmp_path, monkeypatch, took=59.5, timeout=60) == 1.0
+    assert run_up(tmp_path, monkeypatch, took=75, timeout=60) == 1.0

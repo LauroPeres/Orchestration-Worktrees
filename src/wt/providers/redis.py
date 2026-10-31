@@ -71,19 +71,21 @@ def cli(*args: str, check: bool = True) -> proc.Result:
     return proc.run(["docker", "exec", container(), "redis-cli", *args], check=check)
 
 
-def wait_ready(timeout: float = 60.0) -> None:
+def wait_ready(timeout: float = 60.0, total: float | None = None) -> None:
     deadline = time.monotonic() + timeout
     while True:
         if cli("ping", check=False).ok:
             return
         if time.monotonic() >= deadline:
-            raise WtError(f"Redis did not become ready in {timeout:.0f}s ({container()})")
+            raise WtError(
+                f"Redis did not become ready in {(total or timeout):.0f}s ({container()})"
+            )
         time.sleep(1)
 
 
 def ensure_server(timeout: int = 60) -> None:
-    server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(timeout)
+    left = server.up(container(), server_dir(), compose_doc(), timeout)
+    wait_ready(left, total=timeout)
 
 
 class RedisProvider:

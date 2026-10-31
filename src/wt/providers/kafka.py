@@ -93,19 +93,21 @@ def tool(script: str, *args: str, check: bool = True) -> proc.Result:
     )
 
 
-def wait_ready(timeout: float = 90.0) -> None:
+def wait_ready(timeout: float = 90.0, total: float | None = None) -> None:
     deadline = time.monotonic() + timeout
     while True:
         if tool("kafka-broker-api-versions.sh", check=False).ok:
             return
         if time.monotonic() >= deadline:
-            raise WtError(f"Kafka did not become ready in {timeout:.0f}s ({container()})")
+            raise WtError(
+                f"Kafka did not become ready in {(total or timeout):.0f}s ({container()})"
+            )
         time.sleep(1)
 
 
 def ensure_server(timeout: int = 90) -> None:
-    server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(timeout)
+    left = server.up(container(), server_dir(), compose_doc(), timeout)
+    wait_ready(left, total=timeout)
 
 
 def _checked(name: str) -> str:

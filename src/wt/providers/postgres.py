@@ -148,7 +148,7 @@ def _rows(result: proc.Result) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def wait_ready(timeout: float = 60.0) -> None:
+def wait_ready(timeout: float = 60.0, total: float | None = None) -> None:
     deadline = time.monotonic() + timeout
     while True:
         ready = proc.run(
@@ -169,7 +169,9 @@ def wait_ready(timeout: float = 60.0) -> None:
         if ready.ok:
             return
         if time.monotonic() >= deadline:
-            raise WtError(f"Postgres did not become ready in {timeout:.0f}s ({container()})")
+            raise WtError(
+                f"Postgres did not become ready in {(total or timeout):.0f}s ({container()})"
+            )
         time.sleep(1)
 
 
@@ -200,8 +202,8 @@ def repair_connections(databases: list[str]) -> None:
 
 
 def ensure_server(databases: list[str], timeout: int = 60) -> None:
-    server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(timeout)
+    left = server.up(container(), server_dir(), compose_doc(), timeout)
+    wait_ready(left, total=timeout)
     repair_connections(databases)
 
 
