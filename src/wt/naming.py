@@ -90,3 +90,12 @@ class Names:
 
     def router(self, service: str) -> str:
         return f"{self.key}--{service}"
+
+
+def service_ref(service: str, attr: str) -> str:
+    """Template text for one attribute of a service.
+
+    Always the subscript form: Jinja reads `services.a-b.url` as `services.a - b.url`, and
+    service names may hold hyphens. `repr` quotes the name safely for a Jinja string literal.
+    """
+    return f"{{{{ services[{service!r}].{attr} }}}}"

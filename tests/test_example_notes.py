@@ -31,7 +31,7 @@ def test_bootstrap_and_load_config(tmp_path: Path) -> None:
     assert loaded.remotes == {}
     assert cfg.services["front"].needs == ["back"]
     assert cfg.services["back"].compose_service == "api"
-    assert cfg.services["front"].env["API_URL"] == "{{ services.back.url }}"
+    assert cfg.services["front"].env["API_URL"] == "{{ services['back'].url }}"
     assert cfg.services["back"].env["FRONT_ORIGIN"] == "{{ services.front.url }}"
     assert cfg.services["back"].env["DATABASE_URL"] == "{{ postgres.url('notes') }}"
     assert cfg.services["back"].env["BRANCH"] == "{{ branch }}"

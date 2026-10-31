@@ -1,5 +1,6 @@
 """Resolve {{ }} values in worktree.yaml, per branch."""
 
+import re
 import shlex
 from typing import Any
 
@@ -22,6 +23,18 @@ _shell_env = SandboxedEnvironment(
 )
 
 
+def _hyphen_hint(value: str, context: dict[str, Any]) -> str:
+    """Point at the subscript form when a template reads `services.<hyphenated name>`."""
+    names = context.get("services")
+    if not isinstance(names, dict):
+        return ""
+    written = {m.group(1) for m in re.finditer(r"services\.([A-Za-z0-9_-]+)", value)}
+    hyphenated = sorted(n for n in names if "-" in n and n in written)
+    return "".join(
+        f" (a hyphenated service name needs brackets: use services['{n}'].url)" for n in hyphenated
+    )
+
+
 def render(value: str, context: dict[str, Any], where: str, quote: bool = False) -> str:
     """`quote=True` shell-quotes each `{{ }}` value; use it only for `run:` commands."""
     env = _shell_env if quote else _env
@@ -32,6 +45,7 @@ def render(value: str, context: dict[str, Any], where: str, quote: bool = False)
         for name, version in UPCOMING.items():
             if name not in REGISTRY and f"'{name}'" in str(exc):
                 hint = f" (the {name} provider arrives in {version})"
+        hint += _hyphen_hint(value, context)
         known = ", ".join(sorted(context))
         raise WtError(f"{where}: {exc}{hint}. Available: {known}") from exc
     except TemplateError as exc:

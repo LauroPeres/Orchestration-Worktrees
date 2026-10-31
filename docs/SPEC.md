@@ -457,7 +457,8 @@ Rules:
 - `uses` + every service reachable through `consumes` = the stack; their repos come from the
   catalog; `infra` of all of them is merged into `shared` (union of databases; two different
   `strategy`/`base_branch` values are an error); a local `shared:` is an error with `uses`.
-- `consumes: {dep: VAR}` adds `VAR: "{{ services.dep.url }}"` to the consumer's env (error if
+- `consumes: {dep: VAR}` adds `VAR: "{{ services['dep'].url }}"` to the consumer's env (the
+  subscript form, so a hyphenated name such as `music-back` works; error if
   `dep` has no route, or if `env` already sets VAR).
 - The env of a consumed service may use `{{ services.<consumer>.url }}` (for CORS).
 - Start order: infra (Traefik, providers) first, then services in dependency order: a
@@ -814,7 +815,7 @@ a staging URL. This replaces §17 Contract 1 (exact `uses`), Contract 2 (`remote
   `with_uses` and `configure`, so dropping a consumer also drops a dependency that was not selected
   explicitly. Service order is the selection entries, then their dependencies (§15); the service
   index stays the position in the catalog (§17 D-b).
-- **Environment and order.** `consumes: {dep: VAR}` always sets `VAR: "{{ services.dep.url }}"` (the
+- **Environment and order.** `consumes: {dep: VAR}` always sets `VAR: "{{ services['dep'].url }}"` (the
   local URL of the running dependency) and adds `dep` to `needs`, so the dependency starts first. The
   literal-`remote` branch of §17 Contract 1 is gone. `infra` is merged from the whole stack.
 - **`remote:` is optional.** It must still be an `http://` or `https://` URL when present. The error

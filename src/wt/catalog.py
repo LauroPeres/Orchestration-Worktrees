@@ -11,6 +11,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from wt.config import MAX_SERVICES, NAME, Service, Shared, Strict, _format_errors, find_cycle
 from wt.errors import WtError
+from wt.naming import service_ref
 from wt.paths import wt_home
 
 CATALOG_NAME = "catalog.yaml"
@@ -200,7 +201,7 @@ def _service_data(
             raise WtError(f"service {name!r}: env already sets {var} (used by consumes)")
         if chosen[dep].subdomain is None:
             raise WtError(f"service {name!r} consumes {dep!r}, which has no 'subdomain' (no route)")
-        env[var] = f"{{{{ services.{dep}.url }}}}"
+        env[var] = service_ref(dep, "url")
         if dep not in needs:
             needs.append(dep)
     data["env"] = env

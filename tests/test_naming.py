@@ -8,6 +8,7 @@ from wt.naming import (
     Names,
     fit,
     host_port,
+    service_ref,
     slugify,
 )
 
@@ -104,3 +105,15 @@ def test_host_port_limits() -> None:
         host_port(-1, 0)
     with pytest.raises(WtError):
         host_port(0, -1)
+
+
+@pytest.mark.parametrize(
+    ("service", "attr", "expected"),
+    [
+        ("api", "url", "{{ services['api'].url }}"),
+        ("music-back", "port", "{{ services['music-back'].port }}"),
+        ("a'b", "host", '{{ services["a\'b"].host }}'),
+    ],
+)
+def test_service_ref_is_always_the_subscript_form(service: str, attr: str, expected: str) -> None:
+    assert service_ref(service, attr) == expected
