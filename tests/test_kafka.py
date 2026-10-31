@@ -6,6 +6,7 @@ from wt import compose, proc
 from wt.config import Config
 from wt.errors import WtError
 from wt.naming import Names
+from wt.projects import KnownProject
 from wt.providers import kafka
 from wt.providers.base import BranchContext
 from wt.providers.kafka import KafkaProvider
@@ -69,10 +70,41 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     return f
 
 
-def ctx(branch: str = "feat/cart") -> BranchContext:
+def ctx(branch: str = "feat/cart", project: str = "shop") -> BranchContext:
     return BranchContext(
-        Names("shop", branch, "shop.localhost"), branch, "main", StateStore("shop")
+        Names(project, branch, f"{project}.localhost"), branch, "main", StateStore(project)
     )
+
+
+def record(c: BranchContext, *names: str) -> None:
+    """Record provider resources for the branch, as an earlier `up` (or 0.5.0) would have."""
+    with c.state.edit() as state:
+        state.branches[c.branch] = BranchState(
+            branch=c.branch, slug=c.names.slug, providers={"kafka": list(names)}
+        )
+
+
+def bare_provider() -> KafkaProvider:
+    """A provider whose `shared.kafka` section is gone: only recorded names can be cleaned."""
+    return KafkaProvider(
+        Config.model_validate(
+            {
+                "project": "shop",
+                "domain": "shop.localhost",
+                "repos": {"api": "./api"},
+                "services": {"api": {"repo": "api", "compose": "c.yml"}},
+            }
+        ),
+        lambda message: None,
+    )
+
+
+def deleted_topics(fake: FakeProc) -> list[str]:
+    return [t[t.index("--topic") + 1] for t in fake.tools() if "--topic" in t and "--delete" in t]
+
+
+def deleted_groups(fake: FakeProc) -> list[str]:
+    return [t[t.index("--group") + 1] for t in fake.tools() if t[0] == "kafka-consumer-groups.sh"]
 
 
 def provider(**opts: object) -> KafkaProvider:
@@ -147,17 +179,34 @@ def test_wait_ready_times_out_after_90s_by_default(
 
 def test_group_and_topic_names() -> None:
     p = provider(groups=["worker", "audit"])
-    assert p.group("worker", ctx()) == "worker-feat-cart"
+    assert p.group("worker", ctx()) == "worker-shop.feat-cart"
     assert p.topic("cart", ctx()) == "cart"
-    assert provider(topic_prefix=True).topic("cart", ctx()) == "feat-cart.cart"
+    assert provider(topic_prefix=True).topic("cart", ctx()) == "shop.feat-cart.cart"
+
+
+def test_two_projects_with_the_same_branch_get_different_names() -> None:
+    p = provider(topic_prefix=True)
+    assert p.group("worker", ctx("main", "shop")) == "worker-shop.main"
+    assert p.group("worker", ctx("main", "blog")) == "worker-blog.main"
+    assert p.topic("cart", ctx("main", "shop")) == "shop.main.cart"
+    assert p.topic("cart", ctx("main", "blog")) == "blog.main.cart"
+
+
+def test_project_and_slug_never_blur_into_each_other() -> None:
+    p = provider(topic_prefix=True)
+    assert p.group("worker", ctx("c", "a-b")) != p.group("worker", ctx("b-c", "a"))
+    assert p.prefix(ctx("c", "a-b")) != p.prefix(ctx("b-c", "a"))
 
 
 def test_resources_are_groups_plus_prefix() -> None:
     assert provider(groups=["worker", "audit"]).create(ctx()).names == [
-        "worker-feat-cart",
-        "audit-feat-cart",
+        "worker-shop.feat-cart",
+        "audit-shop.feat-cart",
     ]
-    assert provider(topic_prefix=True).create(ctx()).names == ["worker-feat-cart", "feat-cart."]
+    assert provider(topic_prefix=True).create(ctx()).names == [
+        "worker-shop.feat-cart",
+        "shop.feat-cart.",
+    ]
 
 
 def test_template_vars_by_kind(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -168,8 +217,8 @@ def test_template_vars_by_kind(monkeypatch: pytest.MonkeyPatch) -> None:
     run_vars = p.template_vars(ctx(), "run")["kafka"]
     assert compose_vars["bootstrap"] == "wt-kafka:9092"
     assert run_vars["bootstrap"] == "127.0.0.1:59092"
-    assert run_vars["group"]("worker") == "worker-feat-cart"
-    assert run_vars["topic"]("cart") == "feat-cart.cart"
+    assert run_vars["group"]("worker") == "worker-shop.feat-cart"
+    assert run_vars["topic"]("cart") == "shop.feat-cart.cart"
     assert provider().template_vars(ctx(), "run")["kafka"]["topic"]("cart") == "cart"
 
 
@@ -202,8 +251,8 @@ def test_verify_with_prefix_creates_and_deletes_probe_topic(fake: FakeProc) -> N
         "kafka-topics.sh",
         "kafka-topics.sh",
     ]
-    assert "--create" in tools[1] and "feat-cart.wt-probe" in tools[1]
-    assert "--delete" in tools[2] and "feat-cart.wt-probe" in tools[2]
+    assert "--create" in tools[1] and "shop.feat-cart.wt-probe" in tools[1]
+    assert "--delete" in tools[2] and "shop.feat-cart.wt-probe" in tools[2]
 
 
 def test_verify_fails_when_broker_does_not_answer(fake: FakeProc) -> None:
@@ -222,23 +271,30 @@ def test_verify_fails_when_probe_topic_cannot_be_created(fake: FakeProc) -> None
 def test_destroy_deletes_groups_and_exact_prefix_topics(fake: FakeProc) -> None:
     fake.on(
         "--list",
-        proc.Result(0, "feat-cart.a\nfeat-cart.b\nfeat-cart-x.a\nother\nfeat.c\n", ""),
+        proc.Result(
+            0,
+            "shop.feat-cart.a\nshop.feat-cart.b\nshop.feat-cart-x.a\nother\nfeat.c\n",
+            "",
+        ),
     )
     provider(topic_prefix=True).destroy(ctx())
-    tools = fake.tools()
-    groups = [t for t in tools if t[0] == "kafka-consumer-groups.sh"]
-    assert len(groups) == 1 and "--delete" in groups[0] and "worker-feat-cart" in groups[0]
-    deleted = [t[t.index("--topic") + 1] for t in tools if "--delete" in t and "--topic" in t]
-    assert deleted == ["feat-cart.a", "feat-cart.b"]
+    groups = [t for t in fake.tools() if t[0] == "kafka-consumer-groups.sh"]
+    assert len(groups) == 1 and "--delete" in groups[0] and "worker-shop.feat-cart" in groups[0]
+    assert deleted_topics(fake) == ["shop.feat-cart.a", "shop.feat-cart.b"]
 
 
 def test_destroy_of_feat_never_touches_feat_x_topics(fake: FakeProc) -> None:
-    fake.on("--list", proc.Result(0, "feat-x.a\nfeat.a\n", ""))
+    fake.on("--list", proc.Result(0, "shop.feat-x.a\nshop.feat.a\n", ""))
     provider(topic_prefix=True).destroy(ctx("feat"))
-    deleted = [
-        t[t.index("--topic") + 1] for t in fake.tools() if "--topic" in t and "--delete" in t
-    ]
-    assert deleted == ["feat.a"]
+    assert deleted_topics(fake) == ["shop.feat.a"]
+
+
+def test_destroy_of_feat_in_shop_never_touches_other_projects(fake: FakeProc) -> None:
+    topics = ["shop.feat.a", "sh.feat.a", "blog.feat.a", "feat.a", "xshop.feat.a", "shop.feat"]
+    fake.on("--list", proc.Result(0, "\n".join(topics) + "\n", ""))
+    provider(topic_prefix=True).destroy(ctx("feat"))
+    assert deleted_topics(fake) == ["shop.feat.a"]
+    assert deleted_groups(fake) == ["worker-shop.feat"]
 
 
 def test_destroy_without_topic_prefix_deletes_only_groups(fake: FakeProc) -> None:
@@ -247,14 +303,16 @@ def test_destroy_without_topic_prefix_deletes_only_groups(fake: FakeProc) -> Non
 
 
 def test_destroy_tolerates_missing_group(fake: FakeProc) -> None:
-    fake.on("kafka-consumer-groups.sh", proc.Result(1, "", "Group worker-feat-cart does not exist"))
+    fake.on(
+        "kafka-consumer-groups.sh", proc.Result(1, "", "Group worker-shop.feat-cart does not exist")
+    )
     provider().destroy(ctx())
 
 
 NOT_EMPTY = proc.Result(
     0,
     "Error: Deletion of some consumer groups failed:\n"
-    "* Group 'worker-feat-cart' could not be deleted due to: "
+    "* Group 'worker-shop.feat-cart' could not be deleted due to: "
     "java.util.concurrent.ExecutionException: "
     "org.apache.kafka.common.errors.GroupNotEmptyException: The group is not empty.\n",
     "",
@@ -299,7 +357,7 @@ def test_destroy_retries_while_a_consumer_is_still_a_member_then_succeeds(
 def test_destroy_accepts_a_group_that_disappears_while_retrying(
     fake: FakeProc, clock: Clock
 ) -> None:
-    results = iter([NOT_EMPTY, proc.Result(1, "", "Group worker-feat-cart does not exist")])
+    results = iter([NOT_EMPTY, proc.Result(1, "", "Group worker-shop.feat-cart does not exist")])
     fake.on_each("kafka-consumer-groups.sh", lambda: next(results))
     provider().destroy(ctx())
     assert len(group_deletes(fake)) == 2
@@ -311,7 +369,7 @@ def test_destroy_raises_when_members_remain_after_the_retry_window(
     fake.on("kafka-consumer-groups.sh", NOT_EMPTY)
     with pytest.raises(WtError) as err:
         provider().destroy(ctx())
-    assert str(err.value) == "consumer group worker-feat-cart still has members"
+    assert str(err.value) == "consumer group worker-shop.feat-cart still has members"
     assert sum(clock.sleeps) == kafka.GROUP_RETRY_WINDOW
     assert kafka.GROUP_RETRY_WINDOW == 20 and kafka.GROUP_RETRY_INTERVAL == 2
 
@@ -337,7 +395,7 @@ def test_destroy_tells_once_that_it_is_waiting_for_the_consumer(
     fake.on_each("kafka-consumer-groups.sh", lambda: next(results))
     messages: list[str] = []
     KafkaProvider(config(), messages.append).destroy(ctx())
-    assert len(messages) == 1 and "worker-feat-cart" in messages[0]
+    assert len(messages) == 1 and "worker-shop.feat-cart" in messages[0]
 
 
 def test_destroy_raises_on_other_group_errors(fake: FakeProc) -> None:
@@ -353,26 +411,145 @@ def test_destroy_is_safe_when_no_topics(fake: FakeProc) -> None:
 
 def test_destroy_uses_recorded_resources_when_config_is_gone(fake: FakeProc) -> None:
     c = ctx()
-    with c.state.edit() as state:
-        state.branches["feat/cart"] = BranchState(
-            branch="feat/cart",
-            slug="feat-cart",
-            providers={"kafka": ["old-feat-cart", "feat-cart.", "*", "bad name"]},
-        )
-    fake.on("--list", proc.Result(0, "feat-cart.a\n", ""))
-    bare = KafkaProvider(
-        Config.model_validate(
-            {
-                "project": "shop",
-                "domain": "shop.localhost",
-                "repos": {"api": "./api"},
-                "services": {"api": {"repo": "api", "compose": "c.yml"}},
-            }
-        ),
-        lambda message: None,
+    record(c, "old-shop.feat-cart", "shop.feat-cart.", "*", "bad name")
+    fake.on("--list", proc.Result(0, "shop.feat-cart.a\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_groups(fake) == ["old-shop.feat-cart"]
+    assert deleted_topics(fake) == ["shop.feat-cart.a"]
+
+
+def test_destroy_cleans_names_recorded_by_0_5_0(fake: FakeProc) -> None:
+    c = ctx()
+    record(c, "worker-feat-cart", "feat-cart.")
+    fake.on("--list", proc.Result(0, "feat-cart.a\nfeat-cart-x.a\nshop.feat-cart.b\nother\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_groups(fake) == ["worker-feat-cart"]
+    assert deleted_topics(fake) == ["feat-cart.a"]
+
+
+def test_old_topic_prefix_does_not_match_a_longer_sibling(fake: FakeProc) -> None:
+    c = ctx("feat")
+    record(c, "feat.")
+    fake.on("--list", proc.Result(0, "feat-x.a\nfeat.a\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_topics(fake) == ["feat.a"]
+
+
+def test_destroy_cleans_old_and_new_recorded_names_together(fake: FakeProc) -> None:
+    c = ctx()
+    record(c, "worker-feat-cart", "feat-cart.", "worker-shop.feat-cart", "shop.feat-cart.")
+    fake.on("--list", proc.Result(0, "feat-cart.a\nshop.feat-cart.b\nshop.feat-cart-x.c\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_groups(fake) == ["worker-feat-cart", "worker-shop.feat-cart"]
+    assert deleted_topics(fake) == ["feat-cart.a", "shop.feat-cart.b"]
+
+
+def test_destroy_skips_a_malformed_recorded_prefix(fake: FakeProc) -> None:
+    c = ctx()
+    record(c, "a.b.c.", ".", "Shop.feat.", "shop.feat cart.", "shop.feat-cart.")
+    fake.on("--list", proc.Result(0, "a.b.c.x\nshop.feat-cart.a\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_topics(fake) == ["shop.feat-cart.a"]
+
+
+def knows_projects(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
+    monkeypatch.setattr(
+        "wt.providers.base.known_projects", lambda: [KnownProject(n, None) for n in names]
     )
-    bare.destroy(c)
-    tools = fake.tools()
-    groups = [t[t.index("--group") + 1] for t in tools if t[0] == "kafka-consumer-groups.sh"]
-    assert groups == ["old-feat-cart"]
-    assert any("feat-cart.a" in t for t in tools)
+
+
+def destroy_logging(c: BranchContext, **opts: object) -> list[str]:
+    logged: list[str] = []
+    KafkaProvider(config(**{"groups": [], **opts}), logged.append).destroy(c)
+    return logged
+
+
+def test_old_topic_prefix_named_like_the_current_project_is_kept(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    knows_projects(monkeypatch)
+    c = ctx("app", "app")
+    record(c, "app.")
+    fake.on("--list", proc.Result(0, "app.main.a\napp.x\n", ""))
+    logged = destroy_logging(c)
+    assert deleted_topics(fake) == []
+    assert logged == ["kept app.: it could belong to project app; delete by hand if it is yours"]
+
+
+def test_old_topic_prefix_of_an_unknown_name_is_deleted_as_before(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    knows_projects(monkeypatch, "blog")
+    c = ctx()
+    record(c, "legacy.")
+    fake.on("--list", proc.Result(0, "legacy.a\nlegacy.b\n", ""))
+    logged = destroy_logging(c)
+    assert deleted_topics(fake) == ["legacy.a", "legacy.b"]
+    assert logged == []
+
+
+def test_old_topic_prefix_named_like_another_known_project_is_kept(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    knows_projects(monkeypatch, "blog")
+    c = ctx()
+    record(c, "blog.")
+    fake.on("--list", proc.Result(0, "blog.main.a\n", ""))
+    logged = destroy_logging(c)
+    assert deleted_topics(fake) == []
+    assert logged[0].startswith("kept blog.:") and "project blog" in logged[0]
+
+
+@pytest.mark.parametrize("failure", [WtError("corrupt"), OSError("denied")])
+def test_unavailable_projects_index_falls_back_to_the_current_project(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    def broken() -> list[KnownProject]:
+        raise failure
+
+    monkeypatch.setattr("wt.providers.base.known_projects", broken)
+    c = ctx("main", "shop")
+    record(c, "shop.", "legacy.")
+    fake.on("--list", proc.Result(0, "shop.main.a\nlegacy.a\n", ""))
+    logged = destroy_logging(c)
+    assert deleted_topics(fake) == ["legacy.a"]
+    assert len(logged) == 1 and logged[0].startswith("kept shop.:")
+
+
+def test_the_two_segment_topic_prefix_is_never_skipped(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    knows_projects(monkeypatch, "shop", "app")
+    c = ctx("main", "app")
+    record(c, "app.main.")
+    fake.on("--list", proc.Result(0, "app.main.a\napp.other.b\n", ""))
+    logged = destroy_logging(c, topic_prefix=False)
+    assert deleted_topics(fake) == ["app.main.a"]
+    assert logged == []
+
+
+def test_old_consumer_groups_are_exact_matches_and_always_deleted(
+    fake: FakeProc, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    knows_projects(monkeypatch, "app")
+    c = ctx("app", "app")
+    record(c, "worker-app")
+    logged = destroy_logging(c, topic_prefix=False)
+    assert deleted_groups(fake) == ["worker-app"]
+    assert logged == []
+
+
+@pytest.mark.parametrize("bad", ["shop.feat.\n", "shop.\n"])
+def test_a_recorded_topic_prefix_must_match_in_full(fake: FakeProc, bad: str) -> None:
+    c = ctx()
+    record(c, bad)
+    fake.on("--list", proc.Result(0, "shop.feat.a\n", ""))
+    bare_provider().destroy(c)
+    assert deleted_topics(fake) == []
+
+
+def test_a_recorded_group_name_with_a_trailing_newline_is_rejected(fake: FakeProc) -> None:
+    c = ctx()
+    record(c, "worker-shop.feat\n")
+    bare_provider().destroy(c)
+    assert deleted_groups(fake) == []

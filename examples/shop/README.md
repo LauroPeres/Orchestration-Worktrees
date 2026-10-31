@@ -71,14 +71,14 @@ again to bring it back.
 
 ## 6. Events and the worker
 
-Each `POST /items` publishes an event to the Kafka topic `<slug>.items`, for example `main.items`
-or `feat-cart.items`. A Kafka failure is logged and does not fail the request.
+Each `POST /items` publishes an event to the Kafka topic `<project>.<slug>.items`, for example
+`shop.main.items` or `shop.feat-cart.items`. A Kafka failure is logged and does not fail the request.
 
 The `worker` service is a compose service of the `api` repo (same image, `python worker.py`). It
-joins the consumer group `worker-<slug>` and, for each event, does two things in Redis:
+joins the consumer group `worker-<project>.<slug>` and, for each event, does two things in Redis:
 
-- `INCR <slug>:events`, the counter
-- `SET <slug>:last`, the name of the last item
+- `INCR <project>:<slug>:events`, the counter
+- `SET <project>:<slug>:last`, the name of the last item
 
 Add an item on each branch (add `-k` to `curl` if you use the self-signed certificate):
 
@@ -87,24 +87,25 @@ curl -X POST https://api.main.shop.localhost/items -H 'Content-Type: application
 curl -X POST https://api.feat-cart.shop.localhost/items -H 'Content-Type: application/json' -d '{"name": "lamp"}'
 ```
 
-Read the counters. Each branch has its own prefix (`main:` and `feat-cart:`):
+Read the counters. Each branch has its own prefix, which starts with the project (`shop:main:` and `shop:feat-cart:`):
 
 ```bash
-docker exec wt-redis redis-cli GET main:events
-docker exec wt-redis redis-cli GET feat-cart:events
-docker exec wt-redis redis-cli GET feat-cart:last
+docker exec wt-redis redis-cli GET shop:main:events
+docker exec wt-redis redis-cli GET shop:feat-cart:events
+docker exec wt-redis redis-cli GET shop:feat-cart:last
 ```
 
 A key prints nothing until its first event.
 
-`wt down feat/cart` removes only the `feat-cart:` Redis keys, the `worker-feat-cart` consumer group
-and the `feat-cart.*` topics. The `main` keys, group and topics stay. Redis and Kafka have no base
+`wt down feat/cart` removes only the `shop:feat-cart:` Redis keys, the `worker-shop.feat-cart`
+consumer group and the `shop.feat-cart.*` topics. The `main` keys, group and topics stay, and so
+does every other project's `feat/cart`, because the project is part of each name. Redis and Kafka have no base
 branch, so `wt down main` cleans `main`'s slice the same way.
 
 ## 7. Sign in (Keycloak)
 
 The web page shows a "Sign in" link to the shared Keycloak. It uses the branch's own client
-(`web-main`, `web-feat-cart`) and sends the page's own address as the redirect URI, so it opens the
+(`web-shop.main`, `web-shop.feat-cart`) and sends the page's own address as the redirect URI, so it opens the
 Keycloak login form only because `wt up` registered that redirect URI for that branch. Nothing is
 enforced: the page keeps no session and handles no token. Add users in the Keycloak console (see
 [Keycloak per branch](../../README.md#keycloak-per-branch-sharedkeycloak)).

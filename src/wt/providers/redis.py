@@ -13,12 +13,17 @@ from wt.config import Redis as RedisConfig
 from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
 from wt.providers import server
-from wt.providers.base import BranchContext, Check, Kind, Resources
+from wt.providers.base import BranchContext, Check, Kind, Resources, keeps_one_segment_prefix
 
 DEFAULT_IMAGE = "redis:7-alpine"
 DEFAULT_PORT = 56379
 BATCH = 500
-PREFIX = re.compile(r"^[a-z0-9-]+:$")  # what wt builds; keeps SCAN patterns free of globs
+# What wt builds (`<project>:<slug>:`) and, for branches recorded by 0.5.0, `<slug>:`; keeps SCAN
+# patterns free of globs.
+PREFIX = re.compile(
+    r"[a-z0-9-]+(:[a-z0-9-]+)?:"
+)  # used with fullmatch: `$` accepts a final newline
+SEPARATOR = ":"
 
 
 def container() -> str:
@@ -98,10 +103,10 @@ class RedisProvider:
         self.log = log
 
     def prefix(self, ctx: BranchContext) -> str:
-        """`feat/cart` -> `feat-cart:`; empty when isolation is off (`prefix: false`)."""
+        """`feat/cart` in project `shop` -> `shop:feat-cart:`; empty when `prefix: false`."""
         if self.cfg is not None and not self.cfg.prefix:
             return ""
-        return f"{ctx.names.slug}:"
+        return f"{ctx.names.project}:{ctx.names.slug}:"
 
     def ensure_server(self) -> None:
         ensure_server()
@@ -138,7 +143,9 @@ class RedisProvider:
         if current:
             wanted.append(current)
         for prefix in dict.fromkeys(wanted):
-            if PREFIX.match(prefix):
+            if PREFIX.fullmatch(prefix) and not keeps_one_segment_prefix(
+                prefix, SEPARATOR, ctx, self.log
+            ):
                 self._delete_prefix(prefix)
 
     def _delete_prefix(self, prefix: str) -> None:

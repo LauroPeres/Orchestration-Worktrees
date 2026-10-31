@@ -63,23 +63,25 @@ def module_home(server: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WT_HOME", server)
 
 
-def make(branch: str, realm: str = REALM) -> tuple[KeycloakProvider, BranchContext]:
+def make(
+    branch: str, realm: str = REALM, project: str = "shop"
+) -> tuple[KeycloakProvider, BranchContext]:
     cfg = Config.model_validate(
         {
-            "project": "shop",
+            "project": project,
             "domain": "shop.localhost",
             "repos": {"api": "./api"},
             "services": {"api": {"repo": "api", "compose": "c.yml"}},
             "shared": {"keycloak": {"realm": realm, "client": "web"}},
         }
     )
-    names = Names("shop", branch, "shop.localhost")
+    names = Names(project, branch, "shop.localhost")
     port = keycloak.host_port()
     urls = (
         f"https://web.{names.branch_domain}:{port}",
         f"https://api.{names.branch_domain}:{port}",
     )
-    return KeycloakProvider(cfg), BranchContext(names, branch, "main", StateStore("shop"), urls)
+    return KeycloakProvider(cfg), BranchContext(names, branch, "main", StateStore(project), urls)
 
 
 def leftover_configs() -> str:
@@ -133,14 +135,17 @@ def test_create_makes_one_client_per_branch_and_is_idempotent(server: str) -> No
     feat, feat_ctx = make("feat")
     longer, longer_ctx = make("feat-x")
     for provider, ctx in [(feat, feat_ctx), (longer, longer_ctx)]:
-        assert provider.create(ctx).names == [f"{REALM}/web-{ctx.names.slug}"]
-        assert provider.create(ctx).names == [f"{REALM}/web-{ctx.names.slug}"]
+        client = provider.client_id(ctx)
+        assert provider.create(ctx).names == [f"{REALM}/{client}"]
+        assert provider.create(ctx).names == [f"{REALM}/{client}"]
         check = provider.verify(ctx)
         assert check.ok, check.detail
     found = clients()
-    assert set(found["web-feat"]) == {u + "/*" for u in feat_ctx.urls}
-    assert set(found["web-feat-x"]) == {u + "/*" for u in longer_ctx.urls}
-    assert list(found).count("web-feat") == 1
+    feat_id, longer_id = feat.client_id(feat_ctx), longer.client_id(longer_ctx)
+    assert feat_id == "web-shop.feat"  # the one literal: a rename of the scheme is caught
+    assert set(found[feat_id]) == {u + "/*" for u in feat_ctx.urls}
+    assert set(found[longer_id]) == {u + "/*" for u in longer_ctx.urls}
+    assert list(found).count(feat_id) == 1
 
 
 def test_issuer_matches_from_host_and_from_the_wt_network(server: str) -> None:
@@ -166,13 +171,14 @@ def test_issuer_matches_from_host_and_from_the_wt_network(server: str) -> None:
 
 
 def test_redirect_uri_is_enforced_per_client(server: str) -> None:
-    _, feat_ctx = make("feat")
-    _, longer_ctx = make("feat-x")
+    feat, feat_ctx = make("feat")
+    longer, longer_ctx = make("feat-x")
     own = feat_ctx.urls[0] + "/callback"
     other = longer_ctx.urls[0] + "/callback"
-    assert auth_status("web-feat", own) == 200
-    assert auth_status("web-feat-x", other) == 200
-    assert auth_status("web-feat", other) != 200
+    feat_id, longer_id = feat.client_id(feat_ctx), longer.client_id(longer_ctx)
+    assert auth_status(feat_id, own) == 200
+    assert auth_status(longer_id, other) == 200
+    assert auth_status(feat_id, other) != 200
 
 
 def test_destroy_leaves_the_other_branch_and_the_realm(server: str) -> None:
@@ -180,15 +186,16 @@ def test_destroy_leaves_the_other_branch_and_the_realm(server: str) -> None:
     longer, longer_ctx = make("feat-x")
     feat.destroy(feat_ctx)
     feat.destroy(feat_ctx)  # safe to repeat
+    feat_id, longer_id = feat.client_id(feat_ctx), longer.client_id(longer_ctx)
     found = clients()
-    assert "web-feat" not in found
-    assert "web-feat-x" in found
+    assert feat_id not in found
+    assert longer_id in found
     check = longer.verify(longer_ctx)
     assert check.ok, check.detail
     assert not feat.verify(feat_ctx).ok
     assert discovery(keycloak.url())["issuer"] == f"{keycloak.url()}/realms/{REALM}"
     longer.destroy(longer_ctx)
-    assert "web-feat-x" not in clients()
+    assert longer_id not in clients()
 
 
 def test_down_without_the_keycloak_section_deletes_the_recorded_client(server: str) -> None:
@@ -201,7 +208,7 @@ def test_down_without_the_keycloak_section_deletes_the_recorded_client(server: s
                 branch=ctx.branch, slug=ctx.names.slug, providers={"keycloak": recorded}
             )
     realms_before = json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout)
-    assert "web-nosection" in clients()
+    assert feat.client_id(feat_ctx) in clients()
 
     bare_cfg = Config.model_validate(
         {
@@ -216,11 +223,58 @@ def test_down_without_the_keycloak_section_deletes_the_recorded_client(server: s
     bare.destroy(feat_ctx)
 
     found = clients()
-    assert "web-nosection" not in found
-    assert "web-nosection-sibling" in found
+    assert feat.client_id(feat_ctx) not in found
+    assert sibling.client_id(sibling_ctx) in found
     assert json.loads(keycloak.kcadm("get", "realms", "--fields", "realm").stdout) == realms_before
     sibling.destroy(sibling_ctx)
-    assert "web-nosection-sibling" not in clients()
+    assert sibling.client_id(sibling_ctx) not in clients()
+
+
+def test_same_branch_in_two_projects_keeps_separate_clients(server: str) -> None:
+    shop, shop_ctx = make("main", project="shop")
+    blog, blog_ctx = make("main", project="blog")
+    shop_id, blog_id = shop.client_id(shop_ctx), blog.client_id(blog_ctx)
+    assert shop_id != blog_id
+    shop.create(shop_ctx)
+    blog.create(blog_ctx)
+    assert {shop_id, blog_id} <= set(clients())
+
+    shop.destroy(shop_ctx)
+    found = clients()
+    assert shop_id not in found and blog_id in found
+    assert blog.verify(blog_ctx).ok
+
+    blog.destroy(blog_ctx)
+    assert blog_id not in clients()
+
+
+def test_destroy_cleans_a_branch_recorded_by_0_5_0_without_the_project(server: str) -> None:
+    provider, ctx = make("legacy")
+    other, other_ctx = make("legacy", project="blog")
+    other.create(other_ctx)
+    kcadm_args = (
+        "create",
+        "clients",
+        "-r",
+        REALM,
+        "-s",
+        "clientId=web-legacy",
+        "-s",
+        "enabled=true",
+    )
+    keycloak.kcadm(*kcadm_args)  # the 0.5.0 client id: `<client>-<slug>`
+    with ctx.state.edit() as state:
+        state.branches[ctx.branch] = BranchState(
+            branch=ctx.branch, slug=ctx.names.slug, providers={"keycloak": [f"{REALM}/web-legacy"]}
+        )
+
+    provider.destroy(ctx)
+    found = clients()
+    assert "web-legacy" not in found
+    assert other.client_id(other_ctx) in found
+
+    other.destroy(other_ctx)
+    assert other.client_id(other_ctx) not in clients()
 
 
 def test_no_login_config_file_is_left_in_the_container(server: str) -> None:
@@ -263,8 +317,8 @@ def test_stopped_server_raises_then_destroy_works_after_restart(server: str) -> 
         keycloak.wait_ready()
     gone.destroy(gone_ctx)
     found = clients()
-    assert "web-stopgone" not in found
-    assert "web-stopkept" in found
+    assert gone.client_id(gone_ctx) not in found
+    assert kept.client_id(kept_ctx) in found
     assert kept.verify(kept_ctx).ok
     kept.destroy(kept_ctx)
     assert discovery(keycloak.url())["issuer"] == f"{keycloak.url()}/realms/{REALM}"

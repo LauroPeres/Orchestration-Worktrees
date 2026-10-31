@@ -15,7 +15,7 @@ from wt.naming import Names
 from wt.providers import redis
 from wt.providers.base import BranchContext
 from wt.providers.redis import RedisProvider
-from wt.state import StateStore
+from wt.state import BranchState, StateStore
 
 pytestmark = pytest.mark.docker
 
@@ -51,18 +51,20 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
         mp.undo()
 
 
-def make(branch: str, prefix: bool = True) -> tuple[RedisProvider, BranchContext]:
+def make(
+    branch: str, prefix: bool = True, project: str = "shop"
+) -> tuple[RedisProvider, BranchContext]:
     cfg = Config.model_validate(
         {
-            "project": "shop",
+            "project": project,
             "domain": "shop.localhost",
             "repos": {"api": "./api"},
             "services": {"api": {"repo": "api", "compose": "c.yml"}},
             "shared": {"redis": {"prefix": prefix}},
         }
     )
-    names = Names("shop", branch, "shop.localhost")
-    return RedisProvider(cfg), BranchContext(names, branch, "main", StateStore("shop"))
+    names = Names(project, branch, "shop.localhost")
+    return RedisProvider(cfg), BranchContext(names, branch, "main", StateStore(project))
 
 
 def keys(pattern: str = "*") -> set[str]:
@@ -92,13 +94,13 @@ def test_destroy_deletes_only_the_branch_prefix(server: str) -> None:
     redis.cli("set", "unrelated", "v")
 
     short.destroy(short_ctx)
-    assert keys("feat:*") == set()
-    assert len(keys("feat-x:*")) == 3  # `feat` must not touch `feat-x:`
+    assert keys(f"{short.prefix(short_ctx)}*") == set()
+    assert len(keys(f"{longer.prefix(longer_ctx)}*")) == 3  # `feat` must not touch `feat-x`
 
     cart.destroy(cart_ctx)
     cart.destroy(cart_ctx)  # safe to repeat
-    assert keys("feat-cart:*") == set()
-    assert len(keys("feat-other:*")) == 3
+    assert keys("shop:feat-cart:*") == set()  # the one literal: a rename of the scheme is caught
+    assert len(keys(f"{other.prefix(other_ctx)}*")) == 3
     assert "unrelated" in keys()
 
     other.destroy(other_ctx)
@@ -107,23 +109,55 @@ def test_destroy_deletes_only_the_branch_prefix(server: str) -> None:
     redis.cli("del", "unrelated")
 
 
+def test_same_branch_in_two_projects_keeps_separate_keys(server: str) -> None:
+    shop, shop_ctx = make("main", project="shop")
+    blog, blog_ctx = make("main", project="blog")
+    assert shop.prefix(shop_ctx) != blog.prefix(blog_ctx)
+    for provider, ctx in [(shop, shop_ctx), (blog, blog_ctx)]:
+        provider.create(ctx)
+        redis.cli("set", f"{provider.prefix(ctx)}events", ctx.names.project)
+
+    shop.destroy(shop_ctx)
+    assert keys("shop:main:*") == set()
+    assert redis.cli("get", "blog:main:events").stdout.strip() == "blog"
+
+    blog.destroy(blog_ctx)
+    assert keys() == set()
+
+
+def test_destroy_cleans_a_branch_recorded_by_0_5_0_without_the_project(server: str) -> None:
+    provider, ctx = make("legacy", project="shop")
+    other, other_ctx = make("legacy", project="blog")
+    redis.cli("set", "legacy:old", "v")  # the 0.5.0 name: `<slug>:`
+    redis.cli("set", "blog:legacy:new", "v")
+    with ctx.state.edit() as state:
+        state.branches[ctx.branch] = BranchState(
+            branch=ctx.branch, slug=ctx.names.slug, providers={"redis": ["legacy:"]}
+        )
+
+    provider.destroy(ctx)
+    assert keys() == {"blog:legacy:new"}
+    other.destroy(other_ctx)
+    assert keys() == set()
+
+
 def test_without_prefix_verify_warns_and_destroy_deletes_nothing(server: str) -> None:
     provider, ctx = make("feat/cart", prefix=False)
     assert provider.create(ctx).names == []
     check = provider.verify(ctx)
     assert check.ok and check.warnings
-    redis.cli("set", "feat-cart:k", "v")
+    redis.cli("set", "shop:feat-cart:k", "v")
     redis.cli("set", "plain", "v")
     provider.destroy(ctx)
-    assert keys() == {"feat-cart:k", "plain"}
-    redis.cli("del", "feat-cart:k", "plain")
+    assert keys() == {"shop:feat-cart:k", "plain"}
+    redis.cli("del", "shop:feat-cart:k", "plain")
 
 
 def test_template_vars_connect_from_the_host(server: str) -> None:
     provider, ctx = make("feat/cart")
     tv = provider.template_vars(ctx, "run")["redis"]
     assert tv["url"] == f"redis://127.0.0.1:{redis.host_port()}"
-    assert tv["prefix"] == "feat-cart:"
+    assert tv["prefix"] == provider.prefix(ctx) == "shop:feat-cart:"
 
 
 FAIL_FAST_SECONDS = 60  # a taken port must fail clearly, not hang for the readiness wait

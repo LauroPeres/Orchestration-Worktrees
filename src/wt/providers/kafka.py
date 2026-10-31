@@ -13,15 +13,18 @@ from wt.config import Kafka as KafkaConfig
 from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
 from wt.providers import server
-from wt.providers.base import BranchContext, Check, Kind, Resources
+from wt.providers.base import BranchContext, Check, Kind, Resources, keeps_one_segment_prefix
 
 DEFAULT_IMAGE = "apache/kafka:3.9.1"
 DEFAULT_PORT = 59092
 CLUSTER_ID = "wtKafkaSingleNode0001Q"  # any fixed 22-char base64 id; one node, one cluster
 BIN = "/opt/kafka/bin"
 BOOTSTRAP = "localhost:9092"
-NAME = re.compile(r"^[a-z0-9._-]+$")
-PREFIX = re.compile(r"^[a-z0-9-]+\.$")  # what wt builds as a topic prefix
+NAME = re.compile(r"[a-z0-9._-]+")  # used with fullmatch: `$` accepts a final newline
+# What wt builds as a topic prefix (`<project>.<slug>.`) and, for branches recorded by 0.5.0,
+# `<slug>.`.
+PREFIX = re.compile(r"[a-z0-9-]+(\.[a-z0-9-]+)?\.")
+SEPARATOR = "."
 # A group delete answers GroupNotEmpty until the broker notices the consumer left (SPEC §18).
 GROUP_RETRY_WINDOW = 20
 GROUP_RETRY_INTERVAL = 2
@@ -114,7 +117,7 @@ def ensure_server(timeout: int = 90) -> None:
 
 
 def _checked(name: str) -> str:
-    if not NAME.match(name):
+    if not NAME.fullmatch(name):
         raise WtError(f"kafka: invalid name {name!r}; use lowercase letters, digits, '.', '_', '-'")
     return name
 
@@ -137,8 +140,13 @@ class KafkaProvider:
         return self.cfg is not None and self.cfg.topic_prefix
 
     def prefix(self, ctx: BranchContext) -> str:
-        """`feat/cart` -> `feat-cart.`; empty when topics are not prefixed."""
-        return f"{ctx.names.slug}." if self.topic_prefix else ""
+        """`feat/cart` in project `shop` -> `shop.feat-cart.`; empty without `topic_prefix`."""
+        return f"{self.scope(ctx)}." if self.topic_prefix else ""
+
+    @staticmethod
+    def scope(ctx: BranchContext) -> str:
+        """`<project>.<slug>`: neither part can hold a `.`, so two projects never collide."""
+        return f"{ctx.names.project}.{ctx.names.slug}"
 
     def group(self, name: str, ctx: BranchContext) -> str:
         if name not in self.groups:
@@ -146,7 +154,7 @@ class KafkaProvider:
                 f"kafka.group({name!r}): unknown group; configured: "
                 f"{', '.join(sorted(self.groups)) or 'none'}"
             )
-        return f"{_checked(name)}-{ctx.names.slug}"
+        return f"{_checked(name)}-{self.scope(ctx)}"
 
     def topic(self, name: str, ctx: BranchContext) -> str:
         return f"{self.prefix(ctx)}{_checked(name)}"
@@ -189,10 +197,12 @@ class KafkaProvider:
             for recorded in bs.providers.get(self.name, []):
                 (prefixes if recorded.endswith(".") else groups).append(recorded)
         for group in dict.fromkeys(groups):
-            if NAME.match(group):
+            if NAME.fullmatch(group):
                 self._delete_group(group)
         for prefix in dict.fromkeys(prefixes):
-            if PREFIX.match(prefix):
+            if PREFIX.fullmatch(prefix) and not keeps_one_segment_prefix(
+                prefix, SEPARATOR, ctx, self.log
+            ):
                 self._delete_topics(prefix)
 
     def _delete_group(self, group: str) -> None:
@@ -220,7 +230,7 @@ class KafkaProvider:
         listing = tool("kafka-topics.sh", "--list").stdout.splitlines()
         for topic in listing:
             # Exact prefix match here, never a broker-side pattern: `feat.` != `feat-x.`.
-            if topic.startswith(prefix) and NAME.match(topic):
+            if topic.startswith(prefix) and NAME.fullmatch(topic):
                 tool("kafka-topics.sh", "--delete", "--topic", topic)
 
     def template_vars(self, ctx: BranchContext, kind: Kind) -> dict[str, Any]:

@@ -65,9 +65,11 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     return f
 
 
-def ctx(branch: str = "feat/cart", urls: tuple[str, ...] = URLS) -> BranchContext:
+def ctx(
+    branch: str = "feat/cart", urls: tuple[str, ...] = URLS, project: str = "shop"
+) -> BranchContext:
     return BranchContext(
-        Names("shop", branch, "shop.localhost"), branch, "main", StateStore("shop"), urls
+        Names(project, branch, f"{project}.localhost"), branch, "main", StateStore(project), urls
     )
 
 
@@ -383,22 +385,33 @@ def test_kcadm_failure_without_output_still_has_a_reason(fake: FakeProc) -> None
         keycloak.kcadm("get", "realms/shop")
 
 
-def test_client_id_uses_branch_slug() -> None:
-    assert provider().client_id(ctx("feat/Cart")) == "web-feat-cart"
+def test_client_id_uses_project_and_branch_slug() -> None:
+    assert provider().client_id(ctx("feat/Cart")) == "web-shop.feat-cart"
+
+
+def test_two_projects_with_the_same_branch_get_different_client_ids() -> None:
+    p = provider()
+    assert p.client_id(ctx("main", project="shop")) == "web-shop.main"
+    assert p.client_id(ctx("main", project="blog")) == "web-blog.main"
+
+
+def test_project_and_slug_never_blur_into_each_other() -> None:
+    p = provider()
+    assert p.client_id(ctx("c", project="a-b")) != p.client_id(ctx("b-c", project="a"))
 
 
 def test_create_makes_a_public_standard_flow_client(fake: FakeProc) -> None:
     fake.on("get clients", clients())
     fake.on("create clients", proc.Result(0, f"Created new client with id '{UUID}'\n", ""))
     res = provider().create(ctx())
-    assert res.names == ["shop/web-feat-cart"]
+    assert res.names == ["shop/web-shop.feat-cart"]
     lookup, create = fake.kc()
     assert lookup[:2] == ["get", "clients"]
-    assert "clientId=web-feat-cart" in lookup and lookup[lookup.index("-r") + 1] == "shop"
+    assert "clientId=web-shop.feat-cart" in lookup and lookup[lookup.index("-r") + 1] == "shop"
     assert create[:2] == ["create", "clients"]
     assert create[create.index("-r") + 1] == "shop"
     sets = [create[i + 1] for i, a in enumerate(create) if a == "-s"]
-    assert "clientId=web-feat-cart" in sets
+    assert "clientId=web-shop.feat-cart" in sets
     assert "publicClient=true" in sets
     assert "standardFlowEnabled=true" in sets
     assert f"redirectUris={json.dumps(rendered())}" in sets
@@ -407,7 +420,7 @@ def test_create_makes_a_public_standard_flow_client(fake: FakeProc) -> None:
 
 
 def test_create_updates_an_existing_client(fake: FakeProc) -> None:
-    fake.on("get clients", clients((UUID, "web-feat-cart", ["https://old/*"])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", ["https://old/*"])))
     provider().create(ctx())
     _, update = fake.kc()
     assert update[:2] == ["update", f"clients/{UUID}"]
@@ -418,7 +431,7 @@ def test_create_updates_an_existing_client(fake: FakeProc) -> None:
 
 
 def test_create_matches_client_id_exactly_not_by_prefix(fake: FakeProc) -> None:
-    fake.on("get clients", clients(("other-id", "web-feat-cart-x", ["https://x/*"])))
+    fake.on("get clients", clients(("other-id", "web-shop.feat-cart-x", ["https://x/*"])))
     provider().create(ctx())
     assert fake.kc()[1][:2] == ["create", "clients"]
 
@@ -429,13 +442,13 @@ def test_create_without_keycloak_section_fails() -> None:
 
 
 def test_verify_ok(fake: FakeProc) -> None:
-    fake.on("get clients", clients((UUID, "web-feat-cart", list(reversed(rendered())))))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", list(reversed(rendered())))))
     check = provider().verify(ctx())
     assert check.ok and not check.warnings
 
 
 def test_verify_detects_redirect_uri_mismatch(fake: FakeProc) -> None:
-    fake.on("get clients", clients((UUID, "web-feat-cart", ["https://old/*"])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", ["https://old/*"])))
     check = provider().verify(ctx())
     assert not check.ok and "redirect" in check.detail
 
@@ -443,13 +456,13 @@ def test_verify_detects_redirect_uri_mismatch(fake: FakeProc) -> None:
 def test_verify_detects_missing_client(fake: FakeProc) -> None:
     fake.on("get clients", clients())
     check = provider().verify(ctx())
-    assert not check.ok and "web-feat-cart" in check.detail
+    assert not check.ok and "web-shop.feat-cart" in check.detail
 
 
 def test_verify_reports_a_missing_realm_as_a_failed_check(fake: FakeProc) -> None:
     fake.on("get clients", REALM_NOT_FOUND)
     check = provider().verify(ctx())
-    assert not check.ok and "shop" in check.detail and "web-feat-cart" in check.detail
+    assert not check.ok and "shop" in check.detail and "web-shop.feat-cart" in check.detail
 
 
 @FAILURES
@@ -461,7 +474,7 @@ def test_verify_raises_when_kcadm_fails(fake: FakeProc, failure: proc.Result, re
 
 
 def test_verify_warns_when_no_routed_urls(fake: FakeProc) -> None:
-    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", [])))
     check = provider().verify(ctx(urls=()))
     assert check.ok and check.warnings
 
@@ -470,8 +483,8 @@ def test_destroy_deletes_only_the_exact_client(fake: FakeProc) -> None:
     fake.on(
         "get clients",
         clients(
-            ("id-x", "web-feat-cart-x", ["https://x/*"]),
-            (UUID, "web-feat-cart", ["https://y/*"]),
+            ("id-x", "web-shop.feat-cart-x", ["https://x/*"]),
+            (UUID, "web-shop.feat-cart", ["https://y/*"]),
         ),
     )
     provider().destroy(ctx())
@@ -479,8 +492,27 @@ def test_destroy_deletes_only_the_exact_client(fake: FakeProc) -> None:
     assert deletes == [["delete", f"clients/{UUID}", "-r", "shop"]]
 
 
+def test_destroy_of_feat_in_shop_never_touches_siblings_or_other_projects(
+    fake: FakeProc,
+) -> None:
+    fake.on(
+        "get clients",
+        clients(
+            ("id-x", "web-shop.feat-x", []),
+            ("id-sh", "web-sh.feat", []),
+            ("id-blog", "web-blog.feat", []),
+            ("id-old", "web-feat", []),
+            (UUID, "web-shop.feat", []),
+        ),
+    )
+    provider().destroy(ctx("feat"))
+    assert [c for c in fake.kc() if c[0] == "delete"] == [
+        ["delete", f"clients/{UUID}", "-r", "shop"]
+    ]
+
+
 def test_destroy_never_touches_a_longer_branch(fake: FakeProc) -> None:
-    fake.on("get clients", clients(("id-x", "web-feat-x", ["https://x/*"])))
+    fake.on("get clients", clients(("id-x", "web-shop.feat-x", ["https://x/*"])))
     provider().destroy(ctx("feat"))
     assert not any(c[0] == "delete" for c in fake.kc())
 
@@ -506,7 +538,7 @@ def test_destroy_raises_when_kcadm_fails(fake: FakeProc, failure: proc.Result, r
 
 
 def test_destroy_raises_when_the_delete_itself_fails(fake: FakeProc) -> None:
-    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", [])))
     fake.on("delete clients", UNREACHABLE)
     with pytest.raises(WtError, match="Connection refused"):
         provider().destroy(ctx())
@@ -516,13 +548,35 @@ def test_destroy_uses_recorded_names_when_config_is_gone(fake: FakeProc) -> None
     c = ctx()
     with c.state.edit() as state:
         state.branches["feat/cart"] = BranchState(
-            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["old/web-feat-cart"]}
+            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["old/web-shop.feat-cart"]}
         )
-    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", [])))
     provider(with_keycloak=False).destroy(c)
     kc = fake.kc()
     assert kc[0][kc[0].index("-r") + 1] == "old"
     assert ["delete", f"clients/{UUID}", "-r", "old"] in kc
+
+
+def test_destroy_cleans_a_client_recorded_by_0_5_0_and_the_current_one(fake: FakeProc) -> None:
+    c = ctx()
+    with c.state.edit() as state:
+        state.branches["feat/cart"] = BranchState(
+            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["shop/web-feat-cart"]}
+        )
+    fake.on(
+        "get clients",
+        clients(
+            (UUID, "web-feat-cart", []),
+            ("id-new", "web-shop.feat-cart", []),
+            ("id-x", "web-feat-cart-x", []),
+        ),
+    )
+    provider().destroy(c)
+    deletes = [cmd for cmd in fake.kc() if cmd[0] == "delete"]
+    assert deletes == [
+        ["delete", f"clients/{UUID}", "-r", "shop"],
+        ["delete", "clients/id-new", "-r", "shop"],
+    ]
 
 
 def test_down_after_the_section_left_the_config_deletes_the_recorded_client(
@@ -531,9 +585,14 @@ def test_down_after_the_section_left_the_config_deletes_the_recorded_client(
     c = ctx()
     with c.state.edit() as state:
         state.branches["feat/cart"] = BranchState(
-            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["shop/web-feat-cart"]}
+            branch="feat/cart",
+            slug="feat-cart",
+            providers={"keycloak": ["shop/web-shop.feat-cart"]},
         )
-    fake.on("get clients", clients((UUID, "web-feat-cart", []), ("id-x", "web-feat-cart-x", [])))
+    fake.on(
+        "get clients",
+        clients((UUID, "web-shop.feat-cart", []), ("id-x", "web-shop.feat-cart-x", [])),
+    )
     p = provider(with_keycloak=False)
     p.ensure_server()  # what the orchestrator calls before destroy
     p.destroy(c)
@@ -551,7 +610,9 @@ def test_destroy_without_the_section_is_silent_when_the_recorded_realm_is_gone(
     c = ctx()
     with c.state.edit() as state:
         state.branches["feat/cart"] = BranchState(
-            branch="feat/cart", slug="feat-cart", providers={"keycloak": ["shop/web-feat-cart"]}
+            branch="feat/cart",
+            slug="feat-cart",
+            providers={"keycloak": ["shop/web-shop.feat-cart"]},
         )
     fake.on("get clients", REALM_NOT_FOUND)
     provider(with_keycloak=False).destroy(c)
@@ -566,9 +627,9 @@ def test_destroy_without_the_section_skips_malformed_names_and_keeps_going(
         state.branches["feat/cart"] = BranchState(
             branch="feat/cart",
             slug="feat-cart",
-            providers={"keycloak": ["", "/web", "shop/", "no-slash", "shop/web-feat-cart"]},
+            providers={"keycloak": ["", "/web", "shop/", "no-slash", "shop/web-shop.feat-cart"]},
         )
-    fake.on("get clients", clients((UUID, "web-feat-cart", [])))
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", [])))
     provider(with_keycloak=False).destroy(c)
     gets = [cmd for cmd in fake.kc() if cmd[0] == "get"]
     assert len(gets) == 1
@@ -593,7 +654,7 @@ def test_template_vars_by_kind(monkeypatch: pytest.MonkeyPatch) -> None:
         "url": "http://localhost:58080",
         "issuer": "http://localhost:58080/realms/shop",
         "realm": "shop",
-        "client_id": "web-feat-cart",
+        "client_id": "web-shop.feat-cart",
     }
     assert p.template_vars(ctx(), "compose") == {
         "keycloak": {**base, "internal_url": "http://wt-keycloak:8080"}

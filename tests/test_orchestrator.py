@@ -596,6 +596,71 @@ def test_down_destroy_failure_stops_and_keeps_the_branch(
     assert not worktree.exists()
 
 
+def _recorded(o: Orchestrator, branch: str = "feat/cart") -> list[str]:
+    return o.store.load().branches[branch].providers["postgres"]
+
+
+def test_up_records_the_names_the_provider_created(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    assert _recorded(o) == ["db_feat_cart"]
+
+
+def test_up_again_keeps_the_old_names_when_the_provider_renames(
+    orch, fake_provider: FakeProvider
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    fake_provider.resource_names = ["shop_feat_cart"]
+    o.up("feat/cart")
+    assert _recorded(o) == ["db_feat_cart", "shop_feat_cart"]
+
+
+def test_up_again_with_the_same_names_does_not_duplicate(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    o.up("feat/cart")
+    assert _recorded(o) == ["db_feat_cart"]
+
+
+def test_up_again_merges_overlapping_names_in_order(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    fake_provider.resource_names = ["a", "b"]
+    o.up("feat/cart")
+    fake_provider.resource_names = ["c", "b"]
+    o.up("feat/cart")
+    assert _recorded(o) == ["a", "b", "c"]
+
+
+def test_down_destroys_the_union_and_clears_the_record(orch, fake_provider: FakeProvider) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    fake_provider.resource_names = ["shop_feat_cart"]
+    o.up("feat/cart")
+    assert o.down("feat/cart") is True
+    assert fake_provider.recorded_at_destroy == [["db_feat_cart", "shop_feat_cart"]]
+    assert o.store.load().branches == {}
+
+
+def test_failed_destroy_keeps_the_whole_union_for_a_retry(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch(shared=SHARED)
+    o.up("feat/cart")
+    fake_provider.resource_names = ["shop_feat_cart"]
+    o.up("feat/cart")
+    working = fake_provider.destroy
+    monkeypatch.setattr(fake_provider, "destroy", _failing("drop failed"))
+    with pytest.raises(WtError, match=_clean_message("feat/cart")):
+        o.down("feat/cart")
+    assert _recorded(o) == ["db_feat_cart", "shop_feat_cart"]
+
+    monkeypatch.setattr(fake_provider, "destroy", working)
+    assert o.down("feat/cart") is True
+    assert fake_provider.recorded_at_destroy == [["db_feat_cart", "shop_feat_cart"]]
+    assert o.store.load().branches == {}
+
+
 def test_down_ensure_server_failure_has_the_same_shape(
     orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:

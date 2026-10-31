@@ -35,8 +35,8 @@ wt doctor                  # check docker, git, ports, certs, hosts resolution
 After `wt up feat/cart`:
 
 - `https://feat-cart.shop.localhost` → that branch's frontend
-- its own database `shop__feat_cart`, consumer group `orders-feat-cart`, Redis prefix `feat-cart:`
-- its own database `shop__feat_cart`, consumer group `orders__feat_cart`, Redis prefix `feat_cart:`
+- its own database `shop__feat_cart`, consumer group `orders-shop.feat-cart`, Redis prefix
+  `shop:feat-cart:`
 - `main` keeps running, untouched.
 
 ## 4. Configuration (`worktree.yaml`)
@@ -708,7 +708,7 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
   operation is a `docker exec` of the CLI tools inside the server container.
 - **Redis server.** Container `wt-redis` (official `redis` image, alpine tag) on the shared `wt`
   network, published on `127.0.0.1:56379`. State lives in a named volume.
-- **Redis isolation.** Key prefix `<branch-slug>:`. Resources = `[prefix]`. Template vars:
+- **Redis isolation.** Key prefix `<project>:<branch-slug>:` (project-scoped from v0.5.1, §20). Resources = `[prefix]`. Template vars:
   `redis.url` (`redis://wt-redis:6379` for `compose`, `redis://127.0.0.1:56379` for `run`) and
   `redis.prefix`. `verify`: PING, then SET/GET/DEL of a probe key under the prefix. `destroy`:
   delete every key under the prefix (SCAN + UNLINK through `redis-cli`); other prefixes are never
@@ -716,8 +716,9 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
 - **Kafka server.** Single-node KRaft container `wt-kafka` (official `apache/kafka` image) on the
   `wt` network, with one listener for containers (`wt-kafka:9092`) and one for host processes on
   `127.0.0.1:59092`. Topic auto-creation stays on, so apps create their own topics.
-- **Kafka isolation.** Consumer group `<group>-<branch-slug>` for each name in `groups`; with
-  `topic_prefix: true`, topics are named `<branch-slug>.<topic>`. Resources = the group names (and
+- **Kafka isolation.** Consumer group `<group>-<project>.<branch-slug>` for each name in `groups`;
+  with `topic_prefix: true`, topics are named `<project>.<branch-slug>.<topic>` (project-scoped from
+  v0.5.1, §20). Resources = the group names (and
   the prefix). Template vars: `kafka.bootstrap` (by `kind`, as above), `kafka.group('name')` (a
   name not in `groups` is a WtError) and `kafka.topic('name')`. `verify`: the broker answers
   and, with a prefix, a probe topic can be created and deleted. `destroy`: delete the branch's
@@ -738,7 +739,8 @@ Decided at the start of v0.4 (2026-10-27). Builds on §6 and §14. The config sh
 - **Kafka listeners.** `INTERNAL://<container>:9092` for compose services; `EXTERNAL` on container
   port 19092, published as `127.0.0.1:<WT_KAFKA_PORT>:19092` and advertised as
   `127.0.0.1:<WT_KAFKA_PORT>`; controller on 9093; `KAFKA_AUTO_CREATE_TOPICS_ENABLE=true`.
-- **Names.** Redis prefix `<slug>:`; Kafka group `<group>-<slug>`; topic `<slug>.<name>` when
+- **Names (project-scoped from v0.5.1, §20).** Redis prefix `<project>:<slug>:`; Kafka group
+  `<group>-<project>.<slug>`; topic `<project>.<slug>.<name>` when
   `topic_prefix`, else `<name>`. A name not in `groups` given to `kafka.group()` is a WtError.
 - **No base branch.** Redis and Kafka have none: `down` of any branch (the base too) cleans its own
   slice. With `prefix: false`, `redis.prefix` is `""`, `destroy` deletes nothing and `verify`
@@ -791,7 +793,8 @@ stays (`shared.keycloak: {realm, client}`); `realm` and `client` must match `^[A
   sslRequired=none`; `create realms` exits 1 with "already exists", which counts as done). wt
   never deletes the realm and never creates users, roles or identity providers; the user adds
   users in the console at `http://localhost:<port>` with the generated admin password.
-- **Client per branch.** `clientId = <client>-<branch-slug>`: a public client, standard flow, PKCE
+- **Client per branch.** `clientId = <client>-<project>.<branch-slug>` (project-scoped from v0.5.1,
+  §20): a public client, standard flow, PKCE
   allowed but not enforced (apps should still send it). `redirectUris` is `<url>/*` and
   `webOrigins` is `<url>` for every routed service of the branch that is selected (§17), where
   `<url>` is the service URL including the HTTPS port when it is not 443. `create` is idempotent:
@@ -883,4 +886,36 @@ already routed by another file fails `up` before anything is created, with
 `host <host> is already routed by <project>/<slug>; give one of the projects another domain` (the
 route file name only keeps the project and the slug). Two `up` started at the very same moment can
 still race; the check is a safeguard, not a lock.
+
+**Project-scoped names (v0.5.1).** The shared Redis, Kafka and Keycloak servers serve every project,
+but their per-branch names used only the branch slug, so `wt down main` in one project deleted the
+keys, groups, topics and client that another project's `main` owned. The project is now part of
+every name:
+
+| Provider | Name (project `shop`, branch `feat/cart`) |
+|---|---|
+| Redis | prefix `shop:feat-cart:` |
+| Kafka | group `<group>-shop.feat-cart`; with `topic_prefix`, topics `shop.feat-cart.<name>` |
+| Keycloak | client id `<client>-shop.feat-cart` |
+
+`.` and `:` cannot appear in a project or a slug (both are lowercase letters, digits and `-`), so
+`a-b` + `c` and `a` + `b-c` never produce the same name. `destroy` deletes exactly the recorded names
+(and the exact prefix match of §18 still holds), and it accepts both formats: a branch created by
+0.5.0 (old names, without the project) is still cleaned by `wt down`. The provider resources
+recorded for a branch accumulate (the union of what was recorded before and what `create` returns),
+so re-running `up` on a 0.5.0 branch with the new version keeps the old names recorded until `down`. For the same reason a name that
+leaves the config (a database removed from `databases:`) stays recorded and visible in `wt ls`
+until `down`.
+`realm` and `client` in `shared.keycloak` are limited to 64 characters (a `worktree.yaml` with a
+longer one now fails to load, where it used to fail only at `up` above about 200), so `<client>-<project>.<slug>`
+stays far under Keycloak's own limit. **Upgrading from 0.5.0:** run `wt down` on branches that use
+Redis, Kafka or Keycloak before upgrading when you can; otherwise their old keys, groups and clients
+are removed by the `wt down` of that same branch after the upgrade. A name recorded by 0.5.0 can be
+ambiguous: an old Redis prefix `x:` or Kafka topic prefix `x.` is a plain prefix match, and `x` may
+also be the name of a project that already uses the new format (`app` against `app:main:...`), the
+current project included. So `destroy` deletes an old one-segment prefix or topic prefix only when
+`x` is not the name of any known project (the current one and the projects wt knows); otherwise it
+leaves those keys or topics alone and logs `kept <prefix>: it could belong to project <x>; delete
+by hand if it is yours`. Old consumer groups and Keycloak clients are matched by exact name and are
+always deleted.
 
