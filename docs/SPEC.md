@@ -374,8 +374,9 @@ record is not removed, and the command exits non-zero with the message
 `wt down <branch>` again.`` Running `wt down <branch>` again after the fix finishes the job.
 The `<short reason>` is one line of at most about 120 characters: for a failed command the last
 non-empty line of its output (where Docker and kcadm put the cause), never the command line; for
-any other error its first line. When the line is longer, the END is kept, prefixed with `...`
-(Docker puts the cause, for example `address already in use`, at the end). `down` never continues past a failed provider step, because it
+any other error its first line. When the line is longer, the START and the END are kept with `...` between them (the first 50
+and the last 67 characters): Docker puts the cause, for example `address already in use`, at the
+end, while path errors such as `not a git repository: <long path>` put it at the start. `down` never continues past a failed provider step, because it
 would then delete the record and orphan the resource.
 
 **Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →

@@ -36,6 +36,8 @@ from wt.templating import render
 
 _REASON_MAX_CHARS = 120
 _REASON_ELLIPSIS = "..."
+_REASON_HEAD_CHARS = 50
+_REASON_TAIL_CHARS = _REASON_MAX_CHARS - _REASON_HEAD_CHARS - len(_REASON_ELLIPSIS)
 _NOT_RUNNING_STATUSES = ("stopped", "removing")
 
 Log = Callable[[str], None]
@@ -50,15 +52,16 @@ def _short_reason(exc: Exception) -> str:
     """One short line saying why `exc` happened (no command dumps).
 
     A failed command's first line is only its argv; docker and kcadm put the cause at the end of
-    the output, so that line wins when there is one. A long line keeps its end: docker puts the
-    cause (`address already in use`) last.
+    the output, so that line wins when there is one. A long line keeps its start and its end:
+    path errors put the cause first (`not a git repository: <path>`), docker puts it last
+    (`address already in use`).
     """
     lines = _non_empty_lines(str(exc))
     if isinstance(exc, proc.CommandError):
         lines = _non_empty_lines(exc.result.stderr or exc.result.stdout)[-1:] or lines
     reason = lines[0] if lines else type(exc).__name__
     if len(reason) > _REASON_MAX_CHARS:
-        return _REASON_ELLIPSIS + reason[-(_REASON_MAX_CHARS - len(_REASON_ELLIPSIS)) :]
+        return reason[:_REASON_HEAD_CHARS] + _REASON_ELLIPSIS + reason[-_REASON_TAIL_CHARS:]
     return reason
 
 

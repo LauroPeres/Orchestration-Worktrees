@@ -589,10 +589,10 @@ def test_down_cuts_a_long_reason(
     with pytest.raises(WtError, match=_clean_message("feat/cart")) as info:
         o.down("feat/cart")
     reason = str(info.value).split("(", 1)[1].split("). Try", 1)[0]
-    assert reason == "..." + "x" * 117
+    assert reason == "x" * 50 + "..." + "x" * 67
 
 
-def test_down_keeps_the_end_of_a_long_command_error_line(
+def test_down_keeps_the_start_and_the_end_of_a_long_command_error_line(
     orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cause = "failed to bind host port 127.0.0.1:21379/tcp: address already in use"
@@ -600,8 +600,28 @@ def test_down_keeps_the_end_of_a_long_command_error_line(
     error = proc.CommandError(_DOCKER_EXEC, proc.Result(1, "", f"{line}{cause}\n"))
     message = _down_failure_message(orch, fake_provider, monkeypatch, error)
     reason = message.split("(", 1)[1].split("). Try", 1)[0]
-    assert reason.startswith("...") and reason.endswith(cause) and len(reason) == 120
+    assert (
+        reason.startswith(line[:50] + "...") and reason.endswith(cause[-67:]) and len(reason) == 120
+    )
+    assert "address already in use" in reason
     assert "\n" not in reason and "docker exec" not in reason
+
+
+def test_down_keeps_the_start_of_a_long_path_error_where_the_cause_is(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = WtError("not a git repository: /private/var/folders/zz/" + "deep/" * 30 + "shop-api")
+    message = _down_failure_message(orch, fake_provider, monkeypatch, error)
+    reason = message.split("(", 1)[1].split("). Try", 1)[0]
+    assert reason.startswith("not a git repository: /private/var/folders/zz/")
+    assert reason.endswith("shop-api") and len(reason) == 120
+
+
+def test_down_keeps_a_line_one_over_the_limit_cut_to_the_limit(
+    orch, fake_provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    message = _down_failure_message(orch, fake_provider, monkeypatch, WtError("y" * 121))
+    assert f"({'y' * 50}...{'y' * 67})" in message
 
 
 def test_down_keeps_a_line_of_exactly_the_limit_whole(
@@ -1876,6 +1896,39 @@ def test_remove_reports_a_folder_that_is_not_a_git_repo_and_still_cleans_the_oth
     with pytest.raises(WtError, match="not a git repository"):
         o.remove("feat/x")
     assert "feat/x" not in _branches(tmp_path / "shop-ui")
+
+
+_DEEP_TMP_MIN_CHARS = 150  # a macOS runner's /private/var/folders/... path is about this long
+
+
+class TestUnderADeepTmpPath:
+    """The same failures as above, with a path long enough to push the message past the limit."""
+
+    @pytest.fixture
+    def tmp_path(self, tmp_path: Path) -> Path:
+        deep = tmp_path / "private" / "var" / "folders" / "zz" / ("deep-" * 12) / "pytest-of-runner"
+        deep.mkdir(parents=True)
+        assert len(str(deep)) >= _DEEP_TMP_MIN_CHARS
+        return deep
+
+    def test_remove_still_names_a_missing_repo_folder(self, dep_stack, tmp_path: Path) -> None:
+        o = dep_stack(["front", "lone"])
+        git_run(tmp_path / "shop-ui", "branch", "feat/x")
+        shutil.rmtree(tmp_path / "shop-api")
+        with pytest.raises(WtError, match="api") as caught:
+            o.remove("feat/x")
+        assert "does not exist" in str(caught.value)
+        assert "feat/x" not in _branches(tmp_path / "shop-ui")
+
+    def test_remove_still_names_a_folder_that_is_not_a_git_repo(
+        self, dep_stack, tmp_path: Path
+    ) -> None:
+        o = dep_stack(["front", "lone"])
+        git_run(tmp_path / "shop-ui", "branch", "feat/x")
+        shutil.rmtree(tmp_path / "shop-api" / ".git")
+        with pytest.raises(WtError, match="not a git repository"):
+            o.remove("feat/x")
+        assert "feat/x" not in _branches(tmp_path / "shop-ui")
 
 
 # --- per-worktree selection (§17 D-a, D-d) ---
