@@ -565,6 +565,12 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 - `remove` never deletes a protected branch: the Postgres `base_branch` (default `main`) and the
   branch checked out in each repo's main folder. It never deletes a branch that is checked out in
   a folder wt did not create. In those cases it does `down` and keeps the branch, with a note.
+- `remove` also works on a branch that is no longer in state (for example after `wt down <branch>`,
+  which keeps the git branch): it deletes the branch `<branch>` in every repo of the project where
+  it exists (the repos of the current selection for a catalog project), with the same protections and
+  notes as above, and says `nothing to remove` only when there was neither state nor any such branch.
+  A failure in one repo (a missing path, a refused delete) is reported with the repo's name and does
+  not stop the others; `remove` then fails once at the end listing them.
 - `--force` works as in `down` (dirty worktrees are removed).
 - State: status gains `stopped`. `ls` shows `stopped` as stored (like `creating`).
 - `BranchStatus` (the `ls()` rows) gains `ports: list[int]`, the reserved host ports of the branch
@@ -581,9 +587,10 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 - `u` = `up` of the selected row. `d` = `stop` (services down, worktree kept). `a` = an input box
   for the new worktree name, then `add` in the current project (outside a project: the project of
   the selected row, or, when the table is empty, the only usable project; with several, `a` says to run
-  `wt tui` inside one). `r` = a confirm box (`remove <branch>: deletes its containers, volumes,
-  databases, worktrees and the git branch; unpushed commits are lost. Remove? y/N`), then `remove`
-  with `--force`. Arrows select, `q` quits.
+  `wt tui` inside one). `r` = a confirm box (`remove <branch>: removes what wt created for it (containers,
+  volumes, databases, worktrees) and deletes the git branch in every repo of the project where it
+  exists; unpushed commits are lost. Remove? y/N`), then `remove` with `--force`. The CLI asks
+  the same question before `wt remove` (unless `--yes`). Arrows select, `q` quits.
 - One action at a time, in a worker thread; keys pressed while busy show a note on the message
   line. The table refreshes every 2 s and after each action.
 - Removed for now: services pane, log pane, `l` (logs), `n`, the refresh key, colors.
