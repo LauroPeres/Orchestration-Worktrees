@@ -56,17 +56,24 @@ In your repo:
 wt init            # writes a starter worktree.yaml
 $EDITOR worktree.yaml
 wt up my-branch    # prints a SERVICE / URL / CHECK table
-wt ls              # branches, URLs, health, databases (--no-probe skips HTTP checks, --paths shows folders)
+wt ls              # branches, URLs, health, databases
+                   # (--no-probe skips HTTP checks, --paths shows folders)
 wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
 wt tui                  # terminal UI: worktrees, services view, up/stop/add/remove
 wt add my-branch        # worktrees + reserved ports only, status "stopped"; nothing is started
 wt stop my-branch       # stops containers and processes; worktrees, volumes, databases, ports stay
 wt down my-branch       # --force also removes worktrees with uncommitted changes
-wt remove my-branch     # down + deletes the git branch (asks first; --yes, --force)
+wt remove my-branch     # down + deletes the git branch in every repo of the project where it exists
+                        # (asks first; --yes, --force); also works after a `wt down`
 ```
 
 Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
 your main checkout.
+
+If a shared server (Postgres, Redis, Kafka, Keycloak) cannot be reached while `wt down` cleans a
+branch, `down` stops there, keeps the branch as `removing` and says what failed, for example
+`keycloak: could not clean branch feat/x (Connection refused (kcadm.sh get clients)). Try`
+`wt doctor --fix`, then `wt down feat/x` again.` Run that and `down` finishes the job.
 
 `wt ls` counts `UP` as running/total over every service of a branch (compose containers and live
 `run:` processes, e.g. `2/2`). STATUS is live: when docker is reachable, it shows `up` when every
@@ -104,10 +111,10 @@ services:
 | `compose` | Compose file relative to the repo root. Set exactly one of `compose` or `run`. |
 | `run` | Command for a host process (see below). Templates allowed. |
 | `compose_service` | Service name in the compose file, if it differs from the key. |
-| `port` | Container port Traefik routes to (compose), or the host port of a `run:` service (a number, or `auto`, see [Ports](#ports)). Required when `subdomain` is set. |
+| `port` | Compose: container port to route to. `run:`: host port, a number or `auto` (see Ports). |
 | `subdomain` | `""` = branch root (`https://<branch>.<domain>`); unset = not routed. |
 | `health` | Path probed through Traefik after `up` (default `/`). |
-| `env` | Extra environment for the container. Values can use templates; a `$` in a value is literal. |
+| `env` | Extra environment. Values can use templates; a `$` in a value is literal. |
 
 Template values, resolved per branch: `project`, `branch`, `slug` (`feat-cart`), `ident`
 (`feat_cart`), `domain`, `branch_domain`, `port`, `url`, `host`, and
@@ -278,20 +285,22 @@ services whose URL it reads).
 project: notes
 domain: notes.localhost
 catalog: ./catalog.yaml
-uses: [front, back]            # exactly these; back's remote: is used if it were not selected
+uses: [front]                  # back comes in because front consumes it
 ```
 
 - A worktree.yaml has either `services:` (as above) or `uses:`, not both.
-- `uses:` is exactly what runs. `consumes` does not add services. Repos come from the catalog.
-- `consumes: {back: API_URL}` sets `API_URL` to the back's branch URL and starts the back first,
-  when `back` is selected.
-- When `back` is not selected, `API_URL` is the back's `remote:` URL.
-- Every catalog service that some service consumes must set `remote:` (an `http://` or
-  `https://` URL), or the catalog is invalid.
-- A worktree can change its selection with `configure` (`c` in the services view of `wt tui`).
-  The selection is stored per branch and starts from `uses:`.
+- A selected service brings the services it consumes, transitively: `uses: [front]` runs `front`
+  and `back`, `back` first. `down` and `stop` handle both. Repos come from the catalog.
+- `consumes: {back: API_URL}` sets `API_URL` to the back's own URL in that branch.
+- `remote:` (an `http://` or `https://` URL) is optional. A service that has to run locally ignores
+  it (wt warns once); it only gives the URL of a service nobody selected and nobody consumes.
+  There is no staging fallback: a dependency always runs next to its consumer.
+- In `configure` (`c` in the services view), a dependency that a selected service needs is shown
+  checked and locked (`required by front`).
+- A worktree can change its selection with `configure`. The selection is stored per branch and
+  starts from `uses:`.
 - `wt catalog` prints the catalog: service, repo, kind, infra, consumes and consumed by.
-  `wt catalog --check` validates it.
+  `wt catalog --check` validates it, including each service resolved on its own.
 
 The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-implementation-notes)
 and [§17](docs/SPEC.md#17-v03-services-view-per-worktree-selection-deterministic-ports).
@@ -338,7 +347,8 @@ Actions run in the background, one at a time; errors show on the message line an
 open. The table refreshes by itself.
 
 A `worktree` command opens the same TUI from any folder. Inside a project it opens that project.
-Outside a project it lists the worktrees of every project wt knows. The repos' own checkout (e.g. `main`) is not listed: only the worktrees wt created, by the name they were given.
+Outside a project it lists the worktrees of every project wt knows. The repos' own checkout
+(e.g. `main`) is not listed: only the worktrees wt created, by the name they were given.
 
 ## Ports
 
@@ -489,9 +499,9 @@ uv run ruff check && uv run ruff format --check && uv run mypy
 
 ## Benchmarks
 
-Measured on the author's machine with `examples/shop` (Postgres, Redis, Kafka, an API and a worker in
-Docker, and a web page as a host process), using a throwaway `WT_HOME`, `WT_INSTANCE` and free
-ports.
+Measured on the author's machine with `examples/shop` (Postgres, Redis, Kafka, an API and a
+worker in Docker, and a web page as a host process), using a throwaway `WT_HOME`, `WT_INSTANCE`
+and free ports.
 
 - Machine: AMD Ryzen 7 7435HS (16 threads), 15 GiB RAM,
   Linux 7.2.11-arch1-1 (native, not WSL2), Docker 29.9.2 on the host kernel.
@@ -525,10 +535,10 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 
 | Version | Scope |
 |---|---|
-| v0.1 ✔ | CLI skeleton, config, naming, git worktrees, docker compose runtime, Traefik routes + TLS, `up/down/ls/doctor` |
-| v0.2 ✔ | Postgres provider (template clone + verify), host-process runtime, `examples/shop` (api + web) |
-| v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes` |
-| v0.4 | Kafka + Redis providers ✔, worker in the example ✔, README architecture diagram ✔, benchmarks ✔ |
+| v0.1 ✔ | CLI, config, naming, git worktrees, compose runtime, Traefik + TLS, `up/down/ls/doctor` |
+| v0.2 ✔ | Postgres provider (clone + verify), host-process runtime, `examples/shop` |
+| v0.3 ✔ | Fixes (Traefik mounts, live `ls`), `wt tui`, user catalog (`uses:`), `examples/notes` |
+| v0.4 ✔ | Kafka + Redis providers, shop worker, README diagram, benchmarks |
 | v0.5 | Keycloak provider ✔ (shared realm, one client per branch; the shop has a Sign in link) |
 | later | shared dependency caches, plugin entry points, native Windows |
 
