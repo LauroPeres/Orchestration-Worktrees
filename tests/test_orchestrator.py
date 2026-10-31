@@ -66,6 +66,99 @@ def test_up_twice_is_safe(orch, docker: FakeDocker) -> None:
     assert docker.ups == ["wt-shop-feat-cart-api"] * 2
 
 
+def route_for_another_project(project: str, branch: str, domain: str, host_name: str) -> Path:
+    """A route file another project wrote, so its hosts count as taken."""
+    other = naming.Names(project, branch, domain)
+    route = router.Route("api", host_name, "http://elsewhere:8000")
+    return router.write_routes(other, [route], None)
+
+
+def test_up_refuses_a_host_another_project_routes(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    route_for_another_project("blog", "feat/cart", "shop.localhost", "api.feat-cart.shop.localhost")
+    o = orch()
+    with pytest.raises(
+        WtError,
+        match=r"host api\.feat-cart\.shop\.localhost is already routed by blog/feat-cart; "
+        "give one of the projects another domain",
+    ):
+        o.up("feat/cart")
+    assert o.store.load().branches == {}
+    assert docker.ups == []
+    assert not (isolated_home / "shop").exists()
+    assert not router.route_file(naming.Names("shop", "feat/cart", "shop.localhost")).exists()
+
+
+def test_up_host_check_ignores_the_letter_case_of_the_other_route(orch, docker: FakeDocker) -> None:
+    route_for_another_project("blog", "feat/cart", "shop.localhost", "API.Feat-Cart.Shop.localhost")
+    with pytest.raises(WtError, match="already routed by blog/feat-cart"):
+        orch().up("feat/cart")
+
+
+def test_up_refuses_the_apex_host_and_names_the_first_conflict_in_service_order(
+    orch, docker: FakeDocker
+) -> None:
+    apex = {"site": {"repo": "api", "compose": "docker-compose.yml", "port": 80, "subdomain": ""}}
+    o = orch(extra_services=apex)
+    route_for_another_project("blog", "feat/cart", "shop.localhost", "feat-cart.shop.localhost")
+    with pytest.raises(WtError, match=r"host feat-cart\.shop\.localhost is already"):
+        o.up("feat/cart")
+    route_for_another_project("docs", "feat/cart", "shop.localhost", "api.feat-cart.shop.localhost")
+    with pytest.raises(WtError, match=r"host api\.feat-cart\.shop\.localhost is already routed"):
+        o.up("feat/cart")  # `api` comes before `site` in the config
+
+
+def test_up_accepts_another_project_with_a_different_domain(orch, docker: FakeDocker) -> None:
+    route_for_another_project("blog", "feat/cart", "blog.localhost", "api.feat-cart.blog.localhost")
+    route_for_another_project("blog", "main", "shop.localhost", "api.main.shop.localhost")
+    o = orch()
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up"
+
+
+def test_up_ignores_an_unreadable_route_file_of_another_project(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    dynamic = isolated_home / "traefik" / "dynamic"
+    dynamic.mkdir(parents=True)
+    (dynamic / "blog--feat-cart.yml").write_bytes(b"\xff\xfe: [unclosed")
+    o = orch()
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up"
+
+
+def test_up_again_does_not_conflict_with_its_own_route_file(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    assert router.route_file(naming.Names("shop", "feat/cart", "shop.localhost")).is_file()
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up"
+
+
+def test_up_of_a_stopped_branch_does_not_conflict_with_itself(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    o.stop("feat/cart")
+    o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up"
+
+
+def test_up_of_a_stopped_branch_notices_a_host_taken_meanwhile(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    o.stop("feat/cart")
+    route_for_another_project("blog", "feat/cart", "shop.localhost", "api.feat-cart.shop.localhost")
+    with pytest.raises(WtError, match="already routed by blog/feat-cart"):
+        o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "stopped"
+
+
+def test_add_does_not_check_hosts(orch, docker: FakeDocker) -> None:
+    route_for_another_project("blog", "feat/cart", "shop.localhost", "api.feat-cart.shop.localhost")
+    assert orch().add("feat/cart") is True
+
+
 def test_template_error_creates_nothing(orch, docker: FakeDocker, isolated_home: Path) -> None:
     o = orch(env={"DB": "{{ nope.x }}"})
     with pytest.raises(WtError, match=r"'nope' is undefined"):
