@@ -873,3 +873,14 @@ it, else `<container> does not publish port N`. `wt doctor` reports the same con
 (`<container> runs without its published ports`) and `wt doctor --fix` recreates the container. The
 check applies to the ports wt publishes on `127.0.0.1` (and the HTTP/HTTPS ports of Traefik), not to
 containers of the user's services.
+
+**Duplicate hosts (v0.5.1).** Every route file Traefik reads lives in one shared folder, so two
+projects with the same `domain` and the same branch would write identical `Host(...)` rules and
+the answering backend would be undefined, while verification still passes. Before `up` writes a
+branch's route file, wt compares the hosts it is about to route with the hosts of every other route
+file in that folder (the files of other projects and branches; its own file is ignored). A host
+already routed by another file fails `up` before anything is created, with
+`host <host> is already routed by <project>/<slug>; give one of the projects another domain` (the
+route file name only keeps the project and the slug). Two `up` started at the very same moment can
+still race; the check is a safeguard, not a lock.
+
