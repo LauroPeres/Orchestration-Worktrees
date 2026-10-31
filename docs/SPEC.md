@@ -627,8 +627,12 @@ port rules of §13 (compose isolation) and §14 (ports).
    services and to compose services with `port` (the container port). An explicit integer `port`
    on a run service is used as is (§14 Ports rule). All host ports go to `BranchState.ports`.
    There is no probing. A port that another state branch records, or that is not free on the
-   host (unless this worktree already records it and is `up` or `degraded`), fails `up` or `add`
-   with `port 10101 for service 'back' (worktree index 1) is in use; free it`.
+   host, fails `up` or `add` with `port 10101 for service 'back' (worktree index 1) is in use;
+   free it`. The one exception is a port this worktree already records as its own: for a `run:`
+   service only while its recorded process is alive (a stale `up` or `degraded` status does not
+   count, so a stranger that took the port after the process died is refused); for a compose
+   service while the recorded status is `up` or `degraded` (its container publishes the port and
+   there is no host process to check).
    `naming.auto_port`, `AUTO_PORT_RANGE` and the probing in `host.pick_port` are removed; this
    replaces §14 "Ports".
 5. **Compose publish.** The override keeps `ports: !reset`, but sets it to

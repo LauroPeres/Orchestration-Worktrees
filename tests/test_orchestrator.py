@@ -12,12 +12,21 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.conftest import COMPOSE, SHARED, FakeDocker, FakeProvider
+from tests.conftest import (
+    COMPOSE,
+    LOWEST_EPHEMERAL_PORT,
+    PORT_WINDOW,
+    PORT_WINDOW_FLOOR,
+    SHARED,
+    FakeDocker,
+    FakeProvider,
+    _window_is_free,
+)
 from tests.conftest import git as git_run
 from wt import compose, git, health, host, naming, proc, router, tls
 from wt.config import load_config
 from wt.errors import WtError
-from wt.orchestrator import Orchestrator
+from wt.orchestrator import Orchestrator, ServiceReport
 from wt.providers.base import Check
 from wt.state import ProcessState
 
@@ -591,8 +600,19 @@ def run_service(**extra: object) -> dict[str, object]:
 
 
 @pytest.fixture
-def run_orch(orch, docker: FakeDocker) -> Iterator[Callable[..., Orchestrator]]:
+def run_orch(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[..., Orchestrator]]:
     built: list[Orchestrator] = []
+    launched: list[ProcessState] = []
+    real_start = host.start
+
+    def recording_start(*args: Any, **kwargs: Any) -> ProcessState:
+        ps = real_start(*args, **kwargs)
+        launched.append(ps)
+        return ps
+
+    monkeypatch.setattr(host, "start", recording_start)
 
     def build(services: dict[str, object] | None = None, **kwargs: Any) -> Orchestrator:
         o: Orchestrator = orch(extra_services=services or run_service(), **kwargs)
@@ -600,10 +620,19 @@ def run_orch(orch, docker: FakeDocker) -> Iterator[Callable[..., Orchestrator]]:
         return o
 
     yield build
-    for o in built:
-        for bs in o.store.load().branches.values():
-            for ps in bs.processes.values():
-                host.stop(ps, grace=0.2)
+    recorded = [
+        ps for o in built for bs in o.store.load().branches.values() for ps in bs.processes.values()
+    ]
+    stop_errors: list[str] = []
+    for ps in [*recorded, *launched]:  # one failing stop must not leave the others running
+        try:
+            host.stop(ps, grace=0.2)
+        except OSError as error:
+            stop_errors.append(f"pid {ps.pid}: {error}")
+    # `stop` waits for the process group to vanish, not for its listening socket to close.
+    open_ports = [ps.port for ps in launched if ps.port is not None and not port_closes(ps.port)]
+    assert not stop_errors, f"host.stop failed: {stop_errors}"
+    assert not open_ports, f"ports still answer after stop: {open_ports}"
 
 
 def wait_until(check: Callable[[], bool], timeout: float = 10.0) -> bool:
@@ -615,10 +644,33 @@ def wait_until(check: Callable[[], bool], timeout: float = 10.0) -> bool:
     return False
 
 
+LOG_TAIL_LINES = 20
+
+
+def why(o: Orchestrator, branch: str, reports: list[ServiceReport]) -> str:
+    """Assertion message for a run service that did not come up: report details and log tails."""
+    lines = [f"{r.service}: {r.outcome} - {r.detail}" for r in reports]
+    state = o.store.load().branches.get(branch)
+    for name, ps in (state.processes if state else {}).items():
+        log = Path(ps.log)
+        tail = (
+            log.read_text(errors="replace").splitlines()[-LOG_TAIL_LINES:]
+            if log.is_file()
+            else ["<no log>"]
+        )
+        lines += [f"--- {name} log ---", *tail]
+    return "\n".join(lines)
+
+
+def port_closes(port: int) -> bool:
+    return wait_until(lambda: not host.tcp_ok(port))
+
+
 def test_run_service_is_started_and_recorded(run_orch, isolated_home: Path) -> None:
     o = run_orch()
-    reports = {r.service: r for r in o.up("feat/cart")}
-    assert reports["web"].outcome == "ok"  # unrouted with a port: TCP connect
+    done = o.up("feat/cart")
+    reports = {r.service: r for r in done}
+    assert reports["web"].outcome == "ok", why(o, "feat/cart", done)  # unrouted: TCP connect
     ps = o.store.load().branches["feat/cart"].processes["web"]
     assert host.alive(ps)
     assert ps.port == naming.host_port(0, 2)  # index 0, third service
@@ -636,8 +688,9 @@ def test_run_service_runs_in_worktree_with_rendered_env(run_orch, isolated_home:
         }
     }
     o = run_orch(services)
-    reports = {r.service: r for r in o.up("feat/cart")}
-    assert reports["job"].outcome == "ok"  # no port: alive
+    done = o.up("feat/cart")
+    reports = {r.service: r for r in done}
+    assert reports["job"].outcome == "ok", why(o, "feat/cart", done)  # no port: alive
     ps = o.store.load().branches["feat/cart"].processes["job"]
     assert ps.port is None
     worktree = isolated_home / "shop" / "worktrees" / "feat-cart" / "api"
@@ -1271,9 +1324,9 @@ def test_up_after_add_reuses_worktree_and_ports(run_orch, docker: FakeDocker) ->
     o = run_orch()
     o.add("feat/cart")
     before = o.store.load().branches["feat/cart"]
-    o.up("feat/cart")
+    done = o.up("feat/cart")
     after = o.store.load().branches["feat/cart"]
-    assert after.status == "up"
+    assert after.status == "up", why(o, "feat/cart", done)
     assert after.ports == before.ports
     assert after.repos["api"].path == before.repos["api"].path
 
@@ -1292,8 +1345,8 @@ def test_stop_keeps_worktrees_and_ports_and_removes_the_route(
     assert Path(bs.repos["api"].path).is_dir()
     assert not list((isolated_home / "traefik" / "dynamic").iterdir())
     assert not host.alive(before.processes["web"])
-    o.up("feat/cart")
-    assert o.store.load().branches["feat/cart"].status == "up"
+    done = o.up("feat/cart")
+    assert o.store.load().branches["feat/cart"].status == "up", why(o, "feat/cart", done)
 
 
 def test_stop_unknown_branch_is_an_error(orch, docker: FakeDocker) -> None:
@@ -1788,3 +1841,85 @@ def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
     rows = {r.branch: r for r in o.ls(probe=False)}
     assert rows["main"].main_checkout
     assert not rows["feat/cart"].main_checkout
+
+
+def test_private_port_window_stays_below_the_ephemeral_range(private_port_base: int) -> None:
+    assert private_port_base >= PORT_WINDOW_FLOOR
+    assert private_port_base + PORT_WINDOW <= LOWEST_EPHEMERAL_PORT
+
+
+def test_window_is_free_rejects_a_port_that_is_bound_but_not_listening() -> None:
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        port = holder.getsockname()[1]
+        assert not _window_is_free(port, size=1)
+    assert _window_is_free(port, size=1)
+
+
+def test_window_is_free_rejects_a_port_held_by_a_client_connection() -> None:
+    with socket.socket() as server, socket.socket() as client:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        client.connect(server.getsockname())
+        client_port = client.getsockname()[1]  # nothing listens here, only the client holds it
+        assert not _window_is_free(client_port, size=1)
+
+
+@contextmanager
+def stranger_listening(port: int) -> Iterator[None]:
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen()
+        yield
+
+
+def test_up_refuses_a_port_a_stranger_took_after_add(run_orch) -> None:
+    o = run_orch()
+    o.add("feat/cart")
+    port = o.store.load().branches["feat/cart"].ports["web"]
+    assert port == naming.host_port(0, 2)
+    with stranger_listening(port), pytest.raises(WtError, match=f"port {port}.*in use"):
+        o.up("feat/cart")
+
+
+def test_up_refuses_a_stranger_on_the_port_of_an_exited_process(run_orch) -> None:
+    o = run_orch()
+    o.up("feat/cart")
+    bs = o.store.load().branches["feat/cart"]
+    ps, port = bs.processes["web"], bs.ports["web"]
+    host.stop(ps, grace=0.2)
+    assert wait_until(lambda: not host.tcp_ok(port))
+    assert bs.status == "up"  # recorded status is stale: the process is gone
+    with stranger_listening(port), pytest.raises(WtError, match=f"port {port}.*in use"):
+        o.up("feat/cart")
+
+
+def test_status_does_not_accept_a_stranger_answering_for_a_dead_process(run_orch) -> None:
+    o = run_orch()
+    o.up("feat/cart")
+    bs = o.store.load().branches["feat/cart"]
+    ps = bs.processes["web"]
+    host.stop(ps, grace=0.2)
+    assert wait_until(lambda: not host.tcp_ok(ps.port))
+    with stranger_listening(ps.port):
+        report = o._check_process("web", ps, 1)
+    assert report.outcome == "fail" and "exited" in report.detail
+
+
+def test_up_accepts_the_port_of_its_own_compose_container(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart")
+    port = o.store.load().branches["feat/cart"].ports["api"]
+    assert port == naming.host_port(0, 0)
+    with stranger_listening(port):  # the fake docker publishes nothing: stand in for the container
+        assert {r.service: r.outcome for r in o.up("feat/cart")} == {"api": "ok", "db": "ok"}
+
+
+def test_up_refuses_a_stranger_on_a_compose_port_after_add(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.add("feat/cart")
+    port = o.store.load().branches["feat/cart"].ports["api"]
+    with stranger_listening(port), pytest.raises(WtError, match=f"port {port}.*in use"):
+        o.up("feat/cart")
+    assert docker.ups == []

@@ -467,14 +467,7 @@ class Orchestrator:
                 ports[name] = svc.port if own_live else host.pick_port(name, taken, svc.port)
                 continue
             port = naming.host_port(index, self.loaded.service_index(name))
-            ours = (
-                mine is not None
-                and mine.ports.get(name) == port
-                and (
-                    (process is not None and host.alive(process))
-                    or mine.status in ("up", "degraded")
-                )
-            )
+            ours = _owns_port(mine, name, port, svc, process)
             if port in taken or not (ours or host.port_free(port)):
                 raise WtError(
                     f"port {port} for service '{name}' (worktree index {index}) is in use; free it"
@@ -1079,6 +1072,21 @@ def _is_worktree_of(repo: Path, path: Path) -> bool:
 
 def _env_hash(env: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()
+
+
+def _owns_port(
+    mine: BranchState | None, name: str, port: int, svc: Service, process: ProcessState | None
+) -> bool:
+    """Is `port` held by this branch's own service, so a busy socket there is not a stranger?
+
+    A run service owns it only while its recorded process is alive: the branch status goes stale
+    when the process dies, and a stranger may have taken the port since. A compose service's
+    container publishes the port, so the recorded status is the evidence."""
+    if mine is None or mine.ports.get(name) != port:
+        return False
+    if svc.run is not None:
+        return process is not None and host.alive(process)
+    return mine.status in ("up", "degraded")
 
 
 def _same_process(ps: ProcessState, command: str, port: int | None, env_hash: str) -> bool:
