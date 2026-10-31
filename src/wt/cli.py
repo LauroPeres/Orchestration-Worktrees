@@ -1,5 +1,6 @@
 """wt command line."""
 
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
@@ -40,7 +41,7 @@ class NoLimitConsole(Console):
 
 
 console = NoLimitConsole(highlight=False)
-err = Console(stderr=True, highlight=False)
+err = NoLimitConsole(stderr=True, highlight=False)
 
 OUTCOME = {"ok": "[green]ok[/]", "fail": "[red]fail[/]", "skipped": "[dim]skipped[/]"}
 LEVEL = {
@@ -218,11 +219,9 @@ def ls_(
         services = row.services or [ServiceReport("-", "skipped", "")]
         for i, svc in enumerate(services):
             first = i == 0
-            health = (
-                "-"
-                if no_probe or svc.service == "-"
-                else (f"{OUTCOME[svc.outcome]} [dim]{escape(svc.detail)}[/]")
-            )
+            # a skipped service was not probed (stopped branch): there is no health to show
+            unprobed = no_probe or svc.service == "-" or svc.outcome == "skipped"
+            health = "-" if unprobed else f"{OUTCOME[svc.outcome]} [dim]{escape(svc.detail)}[/]"
             containers = f"{row.running}/{row.total}" if row.docker_ok else "docker unavailable"
             table.add_row(
                 row.branch if first else "",
@@ -350,6 +349,44 @@ def worktree_command(
     open_tui(config)
 
 
+def _check_catalog(path: Path) -> None:
+    """Load the catalog, then resolve every service alone, as `wt` does when it is selected."""
+    try:
+        loaded = load_catalog(path)
+    except WtError as exc:
+        console.print(f"[red]catalog invalid:[/] {escape(str(exc))}")
+        raise typer.Exit(1) from None
+    failures = _service_failures(loaded.path, list(loaded.catalog.services))
+    for name, message in failures.items():
+        console.print(f"[red]catalog invalid:[/] service {escape(repr(name))}: {escape(message)}")
+    if failures:
+        raise typer.Exit(1)
+    console.print(f"[green]catalog ok:[/] {escape(str(loaded.path))}")
+
+
+def _service_failures(catalog_file: Path, names: list[str]) -> dict[str, str]:
+    """Why each service fails to resolve on its own (services that resolve are left out)."""
+    failures: dict[str, str] = {}
+    with tempfile.TemporaryDirectory() as folder:
+        probe = Path(folder) / CONFIG_NAME
+        probe.write_text(
+            yaml.safe_dump(
+                {
+                    "project": "catalog-check",
+                    "domain": "catalog-check.localhost",
+                    "catalog": str(catalog_file),
+                    "uses": names[:1],
+                }
+            )
+        )
+        for name in names:
+            try:
+                load_config(probe, uses=[name])
+            except WtError as exc:
+                failures[name] = str(exc)
+    return failures
+
+
 @app.command()
 def catalog(
     ctx: typer.Context,
@@ -367,12 +404,7 @@ def catalog(
         explicit = value if isinstance(value, str) else None
     path = catalog_path(explicit, config.parent if config else None)
     if check:
-        try:
-            loaded = load_catalog(path)
-        except WtError as exc:
-            console.print(f"[red]catalog invalid:[/] {escape(str(exc))}")
-            raise typer.Exit(1) from None
-        console.print(f"[green]catalog ok:[/] {escape(str(loaded.path))}")
+        _check_catalog(path)
         return
     table = Table(box=None, pad_edge=False)
     for col in ("SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED BY", "REMOTE"):

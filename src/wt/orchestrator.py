@@ -354,7 +354,7 @@ class Orchestrator:
                     for other, bs in state.branches.items():
                         if other != branch and bs.slug == names.slug:
                             raise WtError(
-                                f"branch {branch!r} and the running branch {other!r} map to "
+                                f"branch {branch!r} and the existing branch {other!r} map to "
                                 f"the same name {names.slug!r}; run `wt down {other}` first"
                             )
                     state.config_path = str(self.loaded.path)
@@ -826,7 +826,7 @@ class Orchestrator:
         for other, other_bs in state.branches.items():
             if other != branch and other_bs.slug == names.slug:
                 raise WtError(
-                    f"branch {branch!r} and the running branch {other!r} map to "
+                    f"branch {branch!r} and the existing branch {other!r} map to "
                     f"the same name {names.slug!r}; run `wt down {other}` instead"
                 )
         bs = state.branches.get(branch)
@@ -970,7 +970,8 @@ class Orchestrator:
                 url = me.service_url(names, svc)
                 if url is None or svc.subdomain is None:
                     continue
-                if not probe:
+                # a stopped branch has nothing listening: probing would only print noise
+                if not probe or bs.status == "stopped":
                     result.services.append(ServiceReport(name, "skipped", "", url, _kind(svc)))
                     continue
                 check = health.probe(

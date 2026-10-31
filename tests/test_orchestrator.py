@@ -77,8 +77,10 @@ def test_template_error_creates_nothing(orch, docker: FakeDocker, isolated_home:
 def test_slug_collision(orch, docker: FakeDocker) -> None:
     o = orch()
     o.up("feat/cart")
-    with pytest.raises(WtError, match="same name"):
+    with pytest.raises(WtError, match="same name") as err:
         o.up("feat-cart")
+    assert "the existing branch 'feat/cart'" in str(err.value)
+    assert "running branch" not in str(err.value)
 
 
 def test_unhealthy_is_degraded(orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -361,8 +363,12 @@ def test_down_leaves_a_folder_that_is_not_a_worktree(orch, docker: FakeDocker, f
 def test_down_refuses_slug_owned_by_another_branch(orch, docker: FakeDocker) -> None:
     o = orch()
     o.up("feat/x")
-    with pytest.raises(WtError, match="same name"):
+    with pytest.raises(WtError, match="same name") as err:
         o.down("feat-x")
+    assert str(err.value) == (
+        "branch 'feat-x' and the existing branch 'feat/x' map to the same name 'feat-x'; "
+        "run `wt down feat/x` instead"
+    )
     assert docker.downs == []
     assert "feat/x" in o.store.load().branches
 
@@ -1225,6 +1231,55 @@ def test_ls_status_degraded_recovers_to_up(
     assert [r.status for r in o.ls(probe=False)] == ["up"]
     monkeypatch.setattr(health, "probe", lambda *a, **k: health.Check(False, "HTTP 502"))
     assert [r.status for r in o.ls()] == ["degraded"]
+
+
+def test_ls_of_an_added_branch_makes_no_probe_and_shows_no_health(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.add("feat/cart")
+    calls: list[object] = []
+
+    def spy(*a: object, **k: object) -> health.Check:
+        calls.append(a)
+        return health.Check(False, "HTTP 404")
+
+    monkeypatch.setattr(health, "probe", spy)
+    [row] = o.ls()
+    assert row.status == "stopped"
+    assert calls == []
+    assert [(s.service, s.outcome, s.detail) for s in row.services] == [("api", "skipped", "")]
+
+
+def test_ls_of_a_stopped_branch_makes_no_probe(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    o.stop("feat/cart")
+    monkeypatch.setattr(health, "probe", lambda *a, **k: pytest.fail("probed a stopped branch"))
+    [row] = o.ls()
+    assert row.status == "stopped"
+    assert [s.outcome for s in row.services] == ["skipped"]
+
+
+@pytest.mark.parametrize("stored", ["creating", "failed", "degraded", "up"])
+def test_ls_still_probes_a_branch_that_is_not_stopped(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch, stored: str
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _store_status(o, stored)
+    calls: list[object] = []
+
+    def spy(*a: object, **k: object) -> health.Check:
+        calls.append(a)
+        return health.Check(True, "HTTP 200")
+
+    monkeypatch.setattr(health, "probe", spy)
+    [row] = o.ls()
+    assert len(calls) == 1
+    assert [s.outcome for s in row.services] == ["ok"]
 
 
 def test_ls_status_other_states_are_shown_as_stored(orch, docker: FakeDocker) -> None:
