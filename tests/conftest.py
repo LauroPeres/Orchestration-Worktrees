@@ -241,6 +241,8 @@ class FakeProvider:
     refuse: bool = False
     check: Check = field(default_factory=lambda: Check(True, "fine", []))
     kinds: list[str] = field(default_factory=list)
+    resource_names: list[str] | None = None  # what `create` returns; default `db_<ident>`
+    recorded_at_destroy: list[list[str]] = field(default_factory=list)
 
     def ensure_server(self) -> None:
         self.events.append("ensure")
@@ -253,7 +255,7 @@ class FakeProvider:
         self.events.append("create")
         if self.fail_create:
             raise WtError("create failed")
-        return Resources([f"db_{ctx.names.ident}"])
+        return Resources(self.resource_names or [f"db_{ctx.names.ident}"])
 
     def verify(self, ctx: BranchContext) -> Check:
         self.events.append("verify")
@@ -261,6 +263,9 @@ class FakeProvider:
 
     def destroy(self, ctx: BranchContext) -> None:
         self.events.append("destroy")
+        # Real providers read the recorded names from the state, so the fake captures the same view.
+        bs = ctx.state.load().branches.get(ctx.branch)
+        self.recorded_at_destroy.append(list(bs.providers.get(self.name, [])) if bs else [])
 
     def template_vars(self, ctx: BranchContext, kind: str) -> dict[str, object]:
         self.kinds.append(kind)

@@ -48,6 +48,12 @@ def _non_empty_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def _accumulate(recorded: list[str], created: list[str]) -> list[str]:
+    """Recorded names first, then the new ones. A provider that renames its resources between
+    versions must not orphan what an older version created: `down` destroys the whole union."""
+    return list(dict.fromkeys([*recorded, *created]))
+
+
 def _short_reason(exc: Exception) -> str:
     """One short line saying why `exc` happened (no command dumps).
 
@@ -467,7 +473,7 @@ class Orchestrator:
             def finished(
                 bs: BranchState, n: str = provider.name, r: list[str] = created.names
             ) -> None:
-                bs.providers[n] = r
+                bs.providers[n] = _accumulate(bs.providers.get(n, []), r)
 
             self._record(branch, finished)
             check = provider.verify(ctx)
