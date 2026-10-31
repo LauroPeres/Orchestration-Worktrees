@@ -31,7 +31,7 @@ class CommandError(WtError):
         super().__init__(f"command failed ({result.returncode}): {' '.join(args)}\n{tail}")
 
 
-def run(
+def run(  # noqa: PLR0913
     args: Sequence[str],
     *,
     cwd: Path | None = None,
@@ -73,7 +73,7 @@ def run(
     return result
 
 
-def _run_streaming(
+def _run_streaming(  # noqa: C901
     args: Sequence[str],
     *,
     cwd: Path | None,

@@ -99,7 +99,7 @@ class Config(Strict):
     shared: Shared = Field(default_factory=Shared)
 
     @model_validator(mode="after")
-    def _check(self) -> Self:
+    def _check(self) -> Self:  # noqa: C901, PLR0912
         for name in [*self.repos, *self.services]:
             if not re.match(NAME, name):
                 raise ValueError(f"name {name!r} must match {NAME}")
@@ -208,7 +208,7 @@ def _format_errors(exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:
+def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:  # noqa: C901
     """`uses` replaces the `uses:` of the file (a per-worktree selection)."""
     path = path.resolve()
     try:

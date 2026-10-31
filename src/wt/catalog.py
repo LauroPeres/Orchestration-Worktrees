@@ -44,7 +44,7 @@ class Catalog(Strict):
     services: dict[str, CatalogService] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _check(self) -> Self:
+    def _check(self) -> Self:  # noqa: C901
         for name in [*self.repos, *self.services]:
             if not re.match(NAME, name):
                 raise ValueError(f"name {name!r} must match {NAME}")
@@ -160,7 +160,7 @@ def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any
     return merged
 
 
-def resolve(
+def resolve(  # noqa: C901, PLR0912
     raw: dict[str, Any], config_path: Path
 ) -> tuple[dict[str, Any], dict[str, str], tuple[str, ...]]:
     """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
