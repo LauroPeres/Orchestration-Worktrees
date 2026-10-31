@@ -1,14 +1,12 @@
 """End to end against a real Docker daemon: `pytest -m docker`."""
 
 import json
-import os
 import shutil
 import socket
 import subprocess
 import sys
 import urllib.request
 from collections.abc import Iterator, Mapping
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -378,26 +376,12 @@ def test_configure_drops_a_service_and_adds_it_back(
     }
 
 
-def container_started_at(container: str) -> float:
-    out = docker("inspect", container, "--format", "{{.State.StartedAt}}").stdout.strip()
-    return datetime.fromisoformat(out[:26] + "+00:00").timestamp()  # drop nanoseconds
-
-
-def process_started_at(pid: int) -> float:
-    """Epoch start time of a process from /proc (boot time + start ticks)."""
-    ticks = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
-    boot = next(
-        int(line.split()[1])
-        for line in Path("/proc/stat").read_text().splitlines()
-        if line.startswith("btime")
-    )
-    return boot + ticks / os.sysconf("SC_CLK_TCK")
-
-
 def test_consumer_alone_brings_its_dependency_and_down_removes_both(
     consumer_only_stack: Orchestrator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     orch = consumer_only_stack
+    lines: list[str] = []
+    orch.log = lines.append
     reports = up_retrying(orch, "main", monkeypatch)
     assert {r.service for r in reports} == {"api", "web"}
     assert {r.outcome for r in reports} == {"ok"}, reports
@@ -412,8 +396,11 @@ def test_consumer_alone_brings_its_dependency_and_down_removes_both(
         "api": "healthy",
     }
     web_pid = bs.processes["web"].pid
-    (api_id,) = api_containers(orch, "main")
-    assert container_started_at(api_id) < process_started_at(web_pid)  # dependency first
+    assert len(api_containers(orch, "main")) == 1
+    # Order by the log, not by comparing Docker and /proc clocks (they differ by up to 1 s).
+    api_started = next(i for i, m in enumerate(lines) if m.startswith("compose up "))
+    web_started = next(i for i, m in enumerate(lines) if "starting process [bold]web" in m)
+    assert api_started < web_started  # dependency first
 
     assert orch.down("main", force=True)
     assert api_containers(orch, "main") == []
