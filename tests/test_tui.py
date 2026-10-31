@@ -3,7 +3,7 @@ import threading
 from types import SimpleNamespace
 from typing import Any
 
-from textual.widgets import DataTable, SelectionList, Static
+from textual.widgets import DataTable, Label, SelectionList, Static
 
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
@@ -148,6 +148,13 @@ def test_a_asks_for_name_and_cancel_does_nothing() -> None:
     asyncio.run(scenario())
 
 
+REMOVE_QUESTION = (
+    "remove feat-a: removes what wt created for it (containers, volumes, databases, "
+    "worktrees) and deletes the git branch in every repo of the project where it exists; "
+    "unpushed commits are lost. Remove? y/N"
+)
+
+
 def test_r_confirms_then_removes_with_force() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
@@ -156,8 +163,13 @@ def test_r_confirms_then_removes_with_force() -> None:
             await settle(pilot)
             await pilot.press("r")
             await pilot.pause()
-            assert CONFIRM_REMOVE.format(branch="feat-a").startswith("remove feat-a: deletes")
+            assert CONFIRM_REMOVE.format(branch="feat-a") == REMOVE_QUESTION
+            shown = str(app.screen.query_one("#dialog Label", Label).render())
+            assert shown.replace("\n", " ") == REMOVE_QUESTION
+            assert orch.calls == []  # nothing runs before the answer
             await pilot.press("n")
+            await settle(pilot)
+            await pilot.press("r", "escape")
             await settle(pilot)
             await pilot.press("r", "enter")  # Enter is "no" (default N)
             await settle(pilot)

@@ -22,8 +22,9 @@ from wt.orchestrator import BranchStatus, Choice, RepoRow
 REFRESH_SECONDS = 2.0
 ACTIONS = "enter: services  u: up  d: down  a: add  r: remove  q: quit"
 CONFIRM_REMOVE = (
-    "remove {branch}: deletes its containers, volumes, databases, worktrees and the git "
-    "branch; unpushed commits are lost. Remove? y/N"
+    "remove {branch}: removes what wt created for it (containers, volumes, databases, "
+    "worktrees) and deletes the git branch in every repo of the project where it exists; "
+    "unpushed commits are lost. Remove? y/N"
 )
 
 

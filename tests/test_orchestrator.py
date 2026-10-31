@@ -1588,11 +1588,106 @@ def test_remove_refuses_dirty_worktree_without_force(
     assert "feat/cart" not in git_run(tmp_path / "shop-api", "branch", "--list")
 
 
-def test_remove_unknown_branch_deletes_nothing(orch, docker: FakeDocker, tmp_path: Path) -> None:
+def _logged(o: Orchestrator) -> list[str]:
+    logs: list[str] = []
+    o.log = logs.append
+    return logs
+
+
+def _branches(repo: Path) -> list[str]:
+    return git_run(repo, "branch", "--format=%(refname:short)").split()
+
+
+def test_remove_of_a_name_that_exists_nowhere_says_nothing_to_remove(
+    orch, docker: FakeDocker
+) -> None:
+    o = orch()
+    logs = _logged(o)
+    assert o.remove("feat/nope") is False
+    assert logs == ["branch feat/nope not found; nothing to remove"]
+
+
+def test_remove_after_down_deletes_the_branch_it_kept(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    assert o.down("feat/cart") is True
+    assert "feat/cart" in _branches(tmp_path / "shop-api")  # down keeps the git branch
+    logs = _logged(o)
+    assert o.remove("feat/cart") is True
+    assert "feat/cart" not in _branches(tmp_path / "shop-api")
+    assert not any("nothing to remove" in m for m in logs)
+    assert o.remove("feat/cart") is False  # idempotent: the second run has nothing left
+
+
+def test_down_alone_keeps_the_branch_and_reports_nothing_for_an_unknown_one(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
     o = orch()
     git_run(tmp_path / "shop-api", "branch", "feat/old")
-    assert o.remove("feat/old") is False
-    assert "feat/old" in git_run(tmp_path / "shop-api", "branch", "--list")
+    logs = _logged(o)
+    assert o.down("feat/old") is False
+    assert logs == ["branch feat/old not found; nothing to remove"]
+    assert "feat/old" in _branches(tmp_path / "shop-api")
+
+
+def test_remove_without_state_deletes_the_branch_in_every_repo(dep_stack, tmp_path: Path) -> None:
+    o = dep_stack(["front", "lone"])
+    for repo in ("shop-api", "shop-ui"):
+        git_run(tmp_path / repo, "branch", "feat/x")
+    assert o.remove("feat/x") is True
+    assert all("feat/x" not in _branches(tmp_path / r) for r in ("shop-api", "shop-ui"))
+
+
+def test_remove_without_state_deletes_a_branch_that_exists_in_one_repo(
+    dep_stack, tmp_path: Path
+) -> None:
+    o = dep_stack(["front", "lone"])
+    git_run(tmp_path / "shop-ui", "branch", "feat/x")
+    logs = _logged(o)
+    assert o.remove("feat/x") is True
+    assert "feat/x" not in _branches(tmp_path / "shop-ui")
+    assert logs == ["deleting branch 'feat/x' in repo 'ui'"]
+
+
+def test_remove_after_down_keeps_the_branch_checked_out_in_the_main_folder(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    o = orch()
+    git_run(tmp_path / "shop-api", "checkout", "-q", "-b", "dev")
+    o.up("dev")
+    o.down("dev")
+    logs = _logged(o)
+    assert o.remove("dev") is False  # nothing was deleted
+    assert "dev" in _branches(tmp_path / "shop-api")
+    assert logs == ["keeping branch 'dev' in repo 'api': checked out elsewhere"]
+
+
+def test_remove_after_down_keeps_the_postgres_base_branch(
+    orch, fake_provider: FakeProvider, tmp_path: Path
+) -> None:
+    o = orch(shared={"postgres": {"databases": ["shop"], "base_branch": "develop"}})
+    git_run(tmp_path / "shop-api", "branch", "develop")
+    o.up("develop")
+    o.down("develop")
+    logs = _logged(o)
+    assert o.remove("develop") is False
+    assert "develop" in _branches(tmp_path / "shop-api")
+    assert logs == ["keeping branch 'develop' in repo 'api': Postgres base branch"]
+
+
+def test_remove_after_down_keeps_a_branch_checked_out_in_a_foreign_folder(
+    orch, docker: FakeDocker, tmp_path: Path
+) -> None:
+    o = orch()
+    foreign = tmp_path / "foreign"
+    git_run(tmp_path / "shop-api", "worktree", "add", "-b", "feat/x", str(foreign))
+    logs = _logged(o)
+    assert o.remove("feat/x") is False
+    assert foreign.is_dir()
+    assert "feat/x" in _branches(tmp_path / "shop-api")
+    assert logs == ["keeping branch 'feat/x' in repo 'api': checked out elsewhere"]
 
 
 def test_remove_keeps_the_branch_checked_out_in_the_main_folder(
@@ -1625,6 +1720,88 @@ def test_remove_keeps_a_branch_checked_out_in_a_foreign_folder(
     assert o.remove("feat/x") is True
     assert foreign.is_dir()
     assert "feat/x" in git_run(tmp_path / "shop-api", "branch", "--list")
+
+
+def _fail_delete_in(monkeypatch: pytest.MonkeyPatch, *repos: Path) -> None:
+    real = git.delete_branch
+
+    def delete(repo: Path, branch: str) -> None:
+        if repo in repos:
+            raise WtError(f"cannot delete {branch} in {repo.name}")
+        real(repo, branch)
+
+    monkeypatch.setattr(git, "delete_branch", delete)
+
+
+def test_remove_continues_after_a_refused_delete_and_names_the_failed_repo(
+    dep_stack, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = dep_stack(["front", "lone"])
+    for repo in ("shop-api", "shop-ui"):
+        git_run(tmp_path / repo, "branch", "feat/x")
+    _fail_delete_in(monkeypatch, (tmp_path / "shop-api").resolve())
+    logs = _logged(o)
+    with pytest.raises(WtError) as caught:
+        o.remove("feat/x")
+    assert "api" in str(caught.value)
+    assert "cannot delete feat/x in shop-api" in str(caught.value)
+    assert "'ui'" not in str(caught.value)
+    assert "feat/x" in _branches(tmp_path / "shop-api")
+    assert "feat/x" not in _branches(tmp_path / "shop-ui")  # the other repo was still cleaned
+    assert any("repo 'api'" in m and "[red]" in m for m in logs)
+    assert "deleting branch 'feat/x' in repo 'ui'" in logs
+
+
+def test_remove_in_state_path_also_collects_the_failures(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart")
+    _fail_delete_in(monkeypatch, (tmp_path / "shop-api").resolve())
+    with pytest.raises(WtError, match="api"):
+        o.remove("feat/cart")
+    assert o.store.load().branches == {}  # down already happened
+    assert "feat/cart" in _branches(tmp_path / "shop-api")
+
+
+def test_remove_lists_every_failed_repo_when_all_fail(
+    dep_stack, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = dep_stack(["front", "lone"])
+    repos = [(tmp_path / r).resolve() for r in ("shop-api", "shop-ui")]
+    for repo in repos:
+        git_run(repo, "branch", "feat/x")
+    _fail_delete_in(monkeypatch, *repos)
+    with pytest.raises(WtError) as caught:
+        o.remove("feat/x")
+    assert "shop-api" in str(caught.value)
+    assert "shop-ui" in str(caught.value)
+    assert all("feat/x" in _branches(repo) for repo in repos)
+
+
+def test_remove_reports_a_missing_repo_folder_and_still_cleans_the_others(
+    dep_stack, tmp_path: Path
+) -> None:
+    o = dep_stack(["front", "lone"])
+    git_run(tmp_path / "shop-ui", "branch", "feat/x")
+    shutil.rmtree(tmp_path / "shop-api")
+    logs = _logged(o)
+    with pytest.raises(WtError, match="api") as caught:
+        o.remove("feat/x")
+    assert "does not exist" in str(caught.value)
+    assert "feat/x" not in _branches(tmp_path / "shop-ui")
+    assert any("repo 'api'" in m and "[red]" in m for m in logs)
+
+
+def test_remove_reports_a_folder_that_is_not_a_git_repo_and_still_cleans_the_others(
+    dep_stack, tmp_path: Path
+) -> None:
+    o = dep_stack(["front", "lone"])
+    git_run(tmp_path / "shop-ui", "branch", "feat/x")
+    shutil.rmtree(tmp_path / "shop-api" / ".git")
+    with pytest.raises(WtError, match="not a git repository"):
+        o.remove("feat/x")
+    assert "feat/x" not in _branches(tmp_path / "shop-ui")
 
 
 # --- per-worktree selection (§17 D-a, D-d) ---

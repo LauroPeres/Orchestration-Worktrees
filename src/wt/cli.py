@@ -185,8 +185,9 @@ def remove(
     """Do `down` for BRANCH, then delete the git branch (unpushed commits are lost)."""
     if not yes:
         typer.confirm(
-            f"remove {branch}: deletes its containers, volumes, databases, worktrees and the "
-            "git branch; unpushed commits are lost. Remove?",
+            f"remove {branch}: removes what wt created for it (containers, volumes, databases, "
+            "worktrees) and deletes the git branch in every repo of the project where it exists; "
+            "unpushed commits are lost. Remove?",
             abort=True,
         )
     if Orchestrator(_load(ctx), log=_log).remove(branch, force=force):

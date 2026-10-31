@@ -11,7 +11,7 @@ from wt import __version__, cli, compose, host, proc
 from wt.cli import app
 from wt.config import load_config
 from wt.errors import WtError
-from wt.orchestrator import ServiceReport
+from wt.orchestrator import Orchestrator, ServiceReport
 
 runner = CliRunner()
 
@@ -394,6 +394,58 @@ def test_add_stop_remove_commands(orch, docker: FakeDocker, tmp_path: Path) -> N
     removed = runner.invoke(app, [*cfg, "remove", "feat/cart", "--yes"])
     assert removed.exit_code == 0, removed.output
     assert "no branches" in runner.invoke(app, [*cfg, "ls", "--no-probe"]).output
+
+
+REMOVE_QUESTION = (
+    "remove feat/cart: removes what wt created for it (containers, volumes, databases, "
+    "worktrees) and deletes the git branch in every repo of the project where it exists; "
+    "unpushed commits are lost. Remove? [y/N]"
+)
+
+
+def _record_removes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+    calls: list[tuple[str, bool]] = []
+
+    def fake_remove(self: Any, branch: str, *, force: bool = False) -> bool:
+        calls.append((branch, force))
+        return True
+
+    monkeypatch.setattr(Orchestrator, "remove", fake_remove)
+    return calls
+
+
+@pytest.mark.parametrize("answer", ["n\n", "\n"])
+def test_remove_asks_the_full_question_and_no_calls_nothing(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: str
+) -> None:
+    orch()
+    calls = _record_removes(monkeypatch)
+    result = runner.invoke(app, [*_cfg(tmp_path), "remove", "feat/cart"], input=answer)
+    assert result.exit_code != 0, result.output
+    assert REMOVE_QUESTION in result.output
+    assert calls == []
+
+
+def test_remove_yes_skips_the_question(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    calls = _record_removes(monkeypatch)
+    result = runner.invoke(app, [*_cfg(tmp_path), "remove", "feat/cart", "--yes", "--force"])
+    assert result.exit_code == 0, result.output
+    assert "Remove?" not in result.output
+    assert calls == [("feat/cart", True)]
+
+
+def test_remove_confirmed_calls_remove_once(
+    orch, docker: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    orch()
+    calls = _record_removes(monkeypatch)
+    result = runner.invoke(app, [*_cfg(tmp_path), "remove", "feat/cart"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert REMOVE_QUESTION in result.output
+    assert calls == [("feat/cart", False)]
 
 
 def test_stop_unknown_branch_fails(orch, docker: FakeDocker, tmp_path: Path) -> None:
