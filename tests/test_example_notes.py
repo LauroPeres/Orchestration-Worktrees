@@ -26,7 +26,9 @@ def test_bootstrap_and_load_config(tmp_path: Path) -> None:
     cfg = loaded.config
     assert cfg.project == "notes"
     assert cfg.domain == "notes.localhost"
+    assert loaded.uses == ("front",)  # the front consumes the back, so the back comes in too
     assert set(cfg.services) == {"back", "front"}
+    assert loaded.remotes == {}
     assert cfg.services["front"].needs == ["back"]
     assert cfg.services["back"].compose_service == "api"
     assert cfg.services["front"].env["API_URL"] == "{{ services.back.url }}"

@@ -24,7 +24,7 @@ class CatalogService(Service):
     )
 
     remote: str | None = Field(
-        default=None, description="URL consumers get when this service is not selected"
+        default=None, description="URL of this service when it is not in the stack (optional)"
     )
 
     @model_validator(mode="after")
@@ -44,7 +44,7 @@ class Catalog(Strict):
     services: dict[str, CatalogService] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def _check(self) -> Self:  # noqa: C901
+    def _check(self) -> Self:
         for name in [*self.repos, *self.services]:
             if not re.match(NAME, name):
                 raise ValueError(f"name {name!r} must match {NAME}")
@@ -59,13 +59,6 @@ class Catalog(Strict):
                     raise ValueError(f"service {name!r} cannot consume itself")
                 if dep not in self.services:
                     raise ValueError(f"service {name!r} consumes unknown service {dep!r}")
-        for name, svc in self.services.items():
-            for dep in svc.consumes:
-                if self.services[dep].remote is None:
-                    raise ValueError(
-                        f"service {dep!r} is consumed by {name!r} and needs 'remote:' "
-                        "(the URL used when it is not selected)"
-                    )
         return self
 
 
@@ -160,13 +153,65 @@ def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any
     return merged
 
 
-def resolve(  # noqa: C901, PLR0912
-    raw: dict[str, Any], config_path: Path
-) -> tuple[dict[str, Any], dict[str, str], tuple[str, ...]]:
+def expand_uses(catalog: Catalog, uses: list[str]) -> list[str]:
+    """The stack: the selection, then every service it reaches through `consumes`.
+
+    Selection entries keep their given order; dependencies follow in discovery order.
+    """
+    for name in uses:
+        if name not in catalog.services:
+            raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
+    stack = list(dict.fromkeys(uses))
+    for name in stack:  # grows while it is walked: breadth-first through the dependencies
+        stack += [dep for dep in catalog.services[name].consumes if dep not in stack]
+    cycle = find_cycle({name: list(catalog.services[name].consumes) for name in stack})
+    if cycle:
+        raise WtError("cycle through catalog consumes: " + " -> ".join(cycle))
+    return stack
+
+
+@dataclass(frozen=True)
+class Resolved:
+    raw: dict[str, Any]  # the dict of a normal Config
+    remotes: dict[str, str]  # catalog services outside the stack -> their remote ("" if none)
+    order: tuple[str, ...]  # catalog service names in catalog order (the service index)
+    warnings: tuple[str, ...]
+
+
+def _ignored_remotes(chosen: dict[str, CatalogService], explicit: list[str]) -> tuple[str, ...]:
+    """One warning per dependency pulled in by the stack whose `remote:` no longer applies."""
+    warnings = []
+    for dep, svc in chosen.items():
+        if dep in explicit or svc.remote is None:
+            continue
+        consumer = next(name for name, other in chosen.items() if dep in other.consumes)
+        warnings.append(f"remote of {dep!r} is ignored: {consumer!r} needs it, so it runs locally")
+    return tuple(warnings)
+
+
+def _service_data(
+    name: str, svc: CatalogService, chosen: dict[str, CatalogService]
+) -> dict[str, Any]:
+    data = svc.model_dump(exclude={"infra", "consumes", "remote"}, exclude_unset=True)
+    env = dict(data.get("env", {}))
+    needs = list(data.get("needs", []))
+    for dep, var in svc.consumes.items():
+        if var in env:
+            raise WtError(f"service {name!r}: env already sets {var} (used by consumes)")
+        if chosen[dep].subdomain is None:
+            raise WtError(f"service {name!r} consumes {dep!r}, which has no 'subdomain' (no route)")
+        env[var] = f"{{{{ services.{dep}.url }}}}"
+        if dep not in needs:
+            needs.append(dep)
+    data["env"] = env
+    data["needs"] = needs
+    return data
+
+
+def resolve(raw: dict[str, Any], config_path: Path) -> Resolved:
     """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
 
-    Also returns the remote URL of every catalog service that is not selected ("" if none), and
-    the catalog's service names in catalog order (the service index follows it).
+    The stack is the closure of `uses` through `consumes` (SPEC section 20).
     """
     if "services" in raw:
         raise WtError("set exactly one of 'services' or 'uses', not both")
@@ -181,34 +226,8 @@ def resolve(  # noqa: C901, PLR0912
     catalog = loaded.catalog
     if len(catalog.services) > MAX_SERVICES:
         raise WtError(f"the catalog has {len(catalog.services)} services; at most 100 services")
-    for name in uses:
-        if name not in catalog.services:
-            raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
-    chosen = {name: catalog.services[name] for name in dict.fromkeys(uses)}
-    cycle = find_cycle({n: [d for d in s.consumes if d in chosen] for n, s in chosen.items()})
-    if cycle:
-        raise WtError("cycle through catalog consumes: " + " -> ".join(cycle))
-    services: dict[str, Any] = {}
-    for name, svc in chosen.items():
-        data = svc.model_dump(exclude={"infra", "consumes", "remote"}, exclude_unset=True)
-        env = dict(data.get("env", {}))
-        needs = list(data.get("needs", []))
-        for dep, var in svc.consumes.items():
-            if var in env:
-                raise WtError(f"service {name!r}: env already sets {var} (used by consumes)")
-            if dep not in chosen:
-                env[var] = catalog.services[dep].remote or ""
-                continue
-            if chosen[dep].subdomain is None:
-                raise WtError(
-                    f"service {name!r} consumes {dep!r}, which has no 'subdomain' (no route)"
-                )
-            env[var] = f"{{{{ services.{dep}.url }}}}"
-            if dep not in needs:
-                needs.append(dep)
-        data["env"] = env
-        data["needs"] = needs
-        services[name] = data
+    chosen = {name: catalog.services[name] for name in expand_uses(catalog, uses)}
+    services = {name: _service_data(name, svc, chosen) for name, svc in chosen.items()}
     out = {k: v for k, v in raw.items() if k not in ("uses", "catalog")}
     out["repos"] = {
         r: str(loaded.repos[r]) for r in dict.fromkeys(s["repo"] for s in services.values())
@@ -218,4 +237,9 @@ def resolve(  # noqa: C901, PLR0912
     if shared:
         out["shared"] = shared
     remotes = {n: s.remote or "" for n, s in catalog.services.items() if n not in chosen}
-    return out, remotes, tuple(catalog.services)
+    return Resolved(
+        raw=out,
+        remotes=remotes,
+        order=tuple(catalog.services),
+        warnings=_ignored_remotes(chosen, uses),
+    )

@@ -1723,18 +1723,36 @@ def test_add_uses_the_branch_selection_when_known(
 
 
 def test_unselected_service_renders_its_remote(
-    catalog_orch: Orchestrator, docker: FakeDocker
+    make_repo, tmp_path: Path, docker: FakeDocker
 ) -> None:
-    o = catalog_orch.__class__(catalog_orch.loaded.with_uses(["web"]), log=lambda m: None)
+    """A service that is neither selected nor consumed by a selected one keeps its remote."""
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(
+        """\
+repos: {api: ./shop-api}
+services:
+  a:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: api
+    env: {OTHER: "{{ services.b.url }}|{{ services.b.host }}|{{ services.b.port }}"}
+  b:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: db
+    port: 5432
+    subdomain: dbx
+    remote: https://db.staging.example
+"""
+    )
+    path = tmp_path / "worktree.yaml"
+    path.write_text("project: s\ndomain: s.localhost\ncatalog: ./catalog.yaml\nuses: [a]\n")
+    o = Orchestrator(load_config(path), log=lambda m: None)
     names = o.names("feat/x")
-    ctx = o.template_context(names, o.cfg.services["web"])
-    assert ctx["services"]["db"] == {
-        "url": "https://db.staging.example",
-        "host": "",
-        "port": None,
-    }
+    ctx = o.template_context(names, o.cfg.services["a"])
+    assert ctx["services"]["b"] == {"url": "https://db.staging.example", "host": "", "port": None}
     envs, _ = o._render(names, {})
-    assert envs["web"]["DB_URL"] == "https://db.staging.example||None"
+    assert envs["a"]["OTHER"] == "https://db.staging.example||None"
 
 
 def test_unselected_service_without_remote_renders_empty(
@@ -1882,17 +1900,19 @@ def test_configure_removes_a_run_service(cfg_orch: Orchestrator, docker: FakeDoc
     assert _calls(o) == []
 
 
-def test_configure_consumer_restarts_with_the_remote(
+def test_configure_only_the_consumer_brings_the_dependency_in(
     cfg_orch: Orchestrator, docker: FakeDocker
 ) -> None:
     o = cfg_orch
     o.up("feat/x")
     o.configure("feat/x", ["front"])
     after = o.store.load().branches["feat/x"]
-    assert after.uses == ["front"]
+    assert after.uses == ["front"]  # the explicit selection only
+    assert "api" in after.compose_projects  # the dependency still runs
     bo = o._for("feat/x")
+    assert list(bo.cfg.services) == ["front", "api"]
     envs, _ = bo._render(bo.names("feat/x"), {"front": after.processes["front"].port or 0})
-    assert envs["front"]["API_URL"] == "https://api.staging.example"
+    assert envs["front"]["API_URL"] == "https://api.feat-x.shop.localhost"
 
 
 def test_configure_drops_one_compose_service_of_a_kept_repo(
@@ -2044,8 +2064,10 @@ def test_services_creating_branch_is_starting(cfg_orch: Orchestrator, monkeypatc
 def test_services_follow_the_branch_selection(cfg_orch: Orchestrator, monkeypatch) -> None:
     o = cfg_orch
     o.up("feat/x")
-    o.configure("feat/x", ["front"])
-    assert [r.name for r in o.services("feat/x")] == ["ui"]
+    o.configure("feat/x", ["front"])  # its dependency api comes with it
+    assert [r.name for r in o.services("feat/x")] == ["ui", "api"]
+    o.configure("feat/x", ["api"])
+    assert [r.name for r in o.services("feat/x")] == ["api"]
 
 
 def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
@@ -2157,3 +2179,317 @@ def test_up_refuses_a_stranger_on_a_compose_port_after_add(orch, docker: FakeDoc
     with stranger_listening(port), pytest.raises(WtError, match=f"port {port}.*in use"):
         o.up("feat/cart")
     assert docker.ups == []
+
+
+# ---- dependencies run together (SPEC section 20) -----------------------------------------
+
+DEPENDENCY_CATALOG = f"""\
+repos: {{api: ./shop-api, ui: ./shop-ui}}
+services:
+  back:
+    repo: ui
+    run: "{sys.executable} {SERVE} {{{{ port }}}}"
+    port: auto
+    subdomain: back
+    remote: https://back.staging.example
+  front:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: db
+    port: 80
+    subdomain: front
+    consumes: {{back: BACK_URL}}
+  admin:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: api
+    consumes: {{back: BACK_URL}}
+  lone:
+    repo: ui
+    run: "sleep 60"
+"""
+BACK_WARNING = "warning: remote of 'back' is ignored: 'front' needs it, so it runs locally"
+FRONT_PROJECT = "wt-shop-feat-x-api"
+
+
+@pytest.fixture
+def dep_logs() -> list[str]:
+    return []
+
+
+@pytest.fixture
+def dep_stack(
+    make_repo, tmp_path: Path, docker: FakeDocker, dep_logs: list[str]
+) -> Iterator[Callable[[list[str]], Orchestrator]]:
+    """Builds an orchestrator over a catalog where `front` and `admin` consume `back`."""
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    make_repo("shop-ui", {"docker-compose.yml": COMPOSE})
+    (tmp_path / "catalog.yaml").write_text(DEPENDENCY_CATALOG)
+    built: list[Orchestrator] = []
+
+    def build(uses: list[str]) -> Orchestrator:
+        path = tmp_path / "worktree.yaml"
+        path.write_text(
+            f"project: shop\ndomain: shop.localhost\ncatalog: ./catalog.yaml\n"
+            f"uses: [{', '.join(uses)}]\n"
+        )
+        built.append(Orchestrator(load_config(path), log=dep_logs.append))
+        return built[-1]
+
+    yield build
+    if built:  # every orchestrator of a test shares one project state
+        for bs in built[0].store.load().branches.values():
+            for ps in bs.processes.values():
+                host.stop(ps, grace=0.2)
+
+
+def _process(o: Orchestrator, branch: str, service: str) -> ProcessState:
+    return o.store.load().branches[branch].processes[service]
+
+
+def test_up_of_the_consumer_starts_the_dependency_first(dep_stack, start_events: list[str]) -> None:
+    o = dep_stack(["front"])
+    reports = o.up("feat/x")
+    assert [e.split(":")[0] for e in start_events] == ["process ui", f"compose {FRONT_PROJECT}"]
+    assert {r.service: r.outcome for r in reports} == {"front": "ok", "back": "ok"}
+    assert o.store.load().branches["feat/x"].uses is None  # the closure is never stored
+
+
+def test_the_consumer_env_is_the_dependency_local_url(dep_stack, docker: FakeDocker) -> None:
+    dep_stack(["front"]).up("feat/x")
+    override = docker.files[0][1].read_text()
+    assert "BACK_URL: https://back.feat-x.shop.localhost" in override
+    assert "staging" not in override
+
+
+def test_down_removes_the_consumer_and_its_dependency(dep_stack, docker: FakeDocker) -> None:
+    o = dep_stack(["front"])
+    o.up("feat/x")
+    back = _process(o, "feat/x", "back")
+    assert o.down("feat/x") is True
+    assert not host.alive(back)
+    assert docker.downs == [FRONT_PROJECT]
+    assert o.store.load().branches == {}
+
+
+def test_stop_ls_and_services_cover_the_dependency(dep_stack, docker: FakeDocker) -> None:
+    o = dep_stack(["front"])
+    o.up("feat/x")
+    assert [r.service for r in o.ls(probe=False)[0].services] == ["front", "back"]
+    assert [r.name for r in o.services("feat/x")] == ["api", "ui"]
+    back = _process(o, "feat/x", "back")
+    o.stop("feat/x")
+    assert not host.alive(back)
+    assert docker.kept_downs == [FRONT_PROJECT]
+
+
+def test_down_cleans_a_stack_whose_start_failed(dep_stack, docker: FakeDocker) -> None:
+    o = dep_stack(["front"])
+    docker.fail_up = True
+    with pytest.raises(WtError):
+        o.up("feat/x")
+    assert o.store.load().branches["feat/x"].status == "failed"
+    back = _process(o, "feat/x", "back")  # started before the consumer, so it must be cleaned
+    assert o.down("feat/x") is True
+    assert not host.alive(back)
+    assert o.store.load().branches == {}
+
+
+def test_ignored_remote_is_warned_once_per_up(dep_stack, dep_logs: list[str]) -> None:
+    o = dep_stack(["front"])
+    o.up("feat/x")
+    o.ls(probe=False)
+    o.ls(probe=False)
+    assert dep_logs.count(BACK_WARNING) == 1
+
+
+def test_no_warning_when_nothing_is_ignored(dep_stack, dep_logs: list[str]) -> None:
+    dep_stack(["front", "back"]).up("feat/x")
+    assert not [m for m in dep_logs if m.startswith("warning:")]
+
+
+def test_ignored_remote_is_warned_once_per_add(dep_stack, dep_logs: list[str]) -> None:
+    assert dep_stack(["front"]).add("feat/x") is True
+    assert dep_logs.count(BACK_WARNING) == 1
+
+
+def test_ignored_remote_is_warned_once_per_configure(dep_stack, dep_logs: list[str]) -> None:
+    o = dep_stack(["lone"])
+    o.up("feat/x")
+    assert BACK_WARNING not in dep_logs
+    o.configure("feat/x", ["front"])
+    assert dep_logs.count(BACK_WARNING) == 1
+
+
+def test_ignored_remote_is_warned_once_when_configure_starts_nothing(
+    dep_stack, dep_logs: list[str]
+) -> None:
+    o = dep_stack(["front", "back"])
+    o.add("feat/x")  # stopped, and the stack will not change: configure does not call `up`
+    assert not dep_logs.count(BACK_WARNING)
+    o.configure("feat/x", ["front"])  # back is now only required, so its remote is ignored
+    assert dep_logs.count(BACK_WARNING) == 1
+
+
+def test_configure_adding_the_consumer_starts_the_dependency_first(
+    dep_stack, docker: FakeDocker, start_events: list[str]
+) -> None:
+    o = dep_stack(["lone"])
+    o.up("feat/x")
+    lone = _process(o, "feat/x", "lone")
+    start_events.clear()
+    o.configure("feat/x", ["front"])
+    bs = o.store.load().branches["feat/x"]
+    assert bs.uses == ["front"]
+    assert [e.split(":")[0] for e in start_events] == ["process ui", f"compose {FRONT_PROJECT}"]
+    assert set(bs.processes) == {"back"}
+    assert host.alive(bs.processes["back"]) and not host.alive(lone)
+    assert bs.status == "up"
+
+
+def test_configure_removing_the_consumer_tears_down_the_implicit_dependency(
+    dep_stack, docker: FakeDocker
+) -> None:
+    o = dep_stack(["front"])
+    o.up("feat/x")
+    back = _process(o, "feat/x", "back")
+    o.configure("feat/x", ["lone"])
+    bs = o.store.load().branches["feat/x"]
+    assert not host.alive(back)
+    assert set(bs.processes) == {"lone"} and "back" not in bs.ports
+    assert docker.kept_downs == [FRONT_PROJECT] and "api" not in bs.compose_projects
+    assert bs.uses == ["lone"]
+
+
+def test_configure_removing_the_consumer_keeps_an_explicit_dependency(
+    dep_stack, docker: FakeDocker
+) -> None:
+    o = dep_stack(["front", "back"])
+    o.up("feat/x")
+    back = _process(o, "feat/x", "back")
+    o.configure("feat/x", ["back"])
+    bs = o.store.load().branches["feat/x"]
+    assert host.alive(back) and bs.processes["back"].pid == back.pid
+    assert docker.kept_downs == [FRONT_PROJECT]
+    assert bs.uses == ["back"]
+
+
+def test_unchecking_a_dependency_that_is_still_needed_changes_nothing_running(
+    dep_stack, docker: FakeDocker
+) -> None:
+    o = dep_stack(["front", "back"])
+    o.up("feat/x")
+    back = _process(o, "feat/x", "back")
+    docker.ups.clear()
+    o.configure("feat/x", ["front"])
+    bs = o.store.load().branches["feat/x"]
+    assert bs.uses == ["front"]
+    assert bs.processes["back"].pid == back.pid and host.alive(back)
+    assert docker.ups == [] and docker.kept_downs == []
+
+
+@pytest.mark.parametrize("status", ["failed", "degraded", "creating"])
+def test_configure_with_an_unchanged_stack_retries_a_branch_that_is_not_up(
+    dep_stack, docker: FakeDocker, status: str
+) -> None:
+    o = dep_stack(["front", "back"])
+    o.up("feat/x")
+    o._record("feat/x", lambda b: setattr(b, "status", status))
+    docker.ups.clear()
+    o.configure("feat/x", ["front", "back"])
+    assert o.store.load().branches["feat/x"].status == "up"
+    assert docker.ups
+
+
+def test_configure_with_an_unchanged_stack_leaves_a_stopped_branch_stopped(
+    dep_stack, docker: FakeDocker
+) -> None:
+    o = dep_stack(["front", "back"])
+    o.up("feat/x")
+    o.stop("feat/x")
+    docker.ups.clear()
+    o.configure("feat/x", ["front", "back"])
+    assert o.store.load().branches["feat/x"].status == "stopped"
+    assert docker.ups == []
+
+
+def test_configure_failure_leaves_a_branch_that_down_cleans(dep_stack, docker: FakeDocker) -> None:
+    o = dep_stack(["lone"])
+    o.up("feat/x")
+    docker.fail_up = True
+    with pytest.raises(WtError):
+        o.configure("feat/x", ["front"])
+    assert o.store.load().branches["feat/x"].status == "failed"
+    back = _process(o, "feat/x", "back")
+    assert o.down("feat/x") is True
+    assert not host.alive(back)
+    assert o.store.load().branches == {}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (
+            ["front"],
+            [
+                ("back", True, ("front",)),
+                ("front", True, ()),
+                ("admin", False, ()),
+                ("lone", False, ()),
+            ],
+        ),
+        (
+            ["front", "back"],
+            [
+                ("back", True, ()),
+                ("front", True, ()),
+                ("admin", False, ()),
+                ("lone", False, ()),
+            ],
+        ),
+        (
+            ["front", "admin"],
+            [
+                ("back", True, ("front", "admin")),
+                ("front", True, ()),
+                ("admin", True, ()),
+                ("lone", False, ()),
+            ],
+        ),
+        (
+            ["lone"],
+            [
+                ("back", False, ()),
+                ("front", False, ()),
+                ("admin", False, ()),
+                ("lone", True, ()),
+            ],
+        ),
+    ],
+)
+def test_catalog_choices_say_who_requires_a_service(
+    dep_stack, stored: list[str], expected: list[tuple[str, bool, tuple[str, ...]]]
+) -> None:
+    o = dep_stack(["lone"])
+    o.add("feat/x")
+    _set_uses(o, "feat/x", stored)
+    got = o.catalog_choices("feat/x")
+    assert got is not None
+    assert [(c.service, c.selected, c.required_by) for c in got] == expected
+
+
+def test_two_branches_with_different_selections_stay_independent(
+    dep_stack, docker: FakeDocker
+) -> None:
+    o = dep_stack(["front"])
+    o.up("feat/x")
+    o.up("feat/y")
+    back_x = _process(o, "feat/x", "back")
+    back_y = _process(o, "feat/y", "back")
+    o.configure("feat/y", ["lone"])
+    state_ = o.store.load().branches
+    assert not host.alive(back_y) and set(state_["feat/y"].processes) == {"lone"}
+    assert host.alive(back_x) and set(state_["feat/x"].processes) == {"back"}
+    assert docker.kept_downs == ["wt-shop-feat-y-api"]
+    assert [r.service for r in o.ls(probe=False)[0].services] == ["front", "back"]
+    assert state_["feat/x"].uses is None and state_["feat/y"].uses == ["lone"]

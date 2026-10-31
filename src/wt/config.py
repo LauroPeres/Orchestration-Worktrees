@@ -165,8 +165,9 @@ class LoadedConfig:
     path: Path
     catalog: Path | None = None
     remotes: dict[str, str] = field(default_factory=dict)
-    uses: tuple[str, ...] | None = None  # the selection; None for a `services:` project
+    uses: tuple[str, ...] | None = None  # the explicit selection; None for a `services:` project
     service_order: tuple[str, ...] = ()  # catalog order (or `services:` order): the port index
+    warnings: tuple[str, ...] = ()  # non-fatal notes from loading, for the caller to show
 
     @property
     def root(self) -> Path:
@@ -221,6 +222,7 @@ def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:  # n
         raise WtError(f"{path} must contain a YAML mapping")
     catalog: Path | None = None
     remotes: dict[str, str] = {}
+    warnings: tuple[str, ...] = ()
     selection: tuple[str, ...] | None = None
     order: tuple[str, ...] = ()
     if ("services" in raw) == ("uses" in raw):
@@ -234,7 +236,13 @@ def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:  # n
             raw = {**raw, "uses": uses}
         catalog = catalog_path(raw.get("catalog"), path.parent)
         selected = raw["uses"]
-        raw, remotes, order = resolve(raw, path)
+        resolved = resolve(raw, path)
+        raw, remotes, order, warnings = (
+            resolved.raw,
+            resolved.remotes,
+            resolved.order,
+            resolved.warnings,
+        )
         selection = tuple(dict.fromkeys(selected))
     try:
         config = Config.model_validate(raw)
@@ -251,6 +259,7 @@ def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:  # n
         remotes=remotes,
         uses=selection,
         service_order=order,
+        warnings=warnings,
     )
 
 
