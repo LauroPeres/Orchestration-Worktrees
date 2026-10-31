@@ -854,6 +854,9 @@ a staging URL. This replaces §17 Contract 1 (exact `uses`), Contract 2 (`remote
   that enter are started, dependencies first. Unchecking a service that a selected service still
   consumes changes the stored selection but not the running stack.
 - **TUI.** A choice with `required_by` is shown checked and labelled `(required by front)`, cannot be
-  toggled, and is left out of the list sent on confirm (explicit = checked minus locked).
+  toggled while one of its consumers is still checked, and is left out of the list sent on confirm
+  (explicit = checked minus locked). Unchecking the consumer lifts the lock at once: the dependency
+  stays checked and now counts as an explicit selection, so `back` alone can be configured. The
+  confirmation of `remove` wraps over as many lines as the box needs (it is never cut at one line).
 - **`examples/notes`.** `uses: [front]` brings `back` in; the fictional staging URL is removed from
   its catalog.
