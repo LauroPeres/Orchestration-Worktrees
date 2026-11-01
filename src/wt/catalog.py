@@ -1,5 +1,6 @@
 """The user catalog: reusable repos and services that a worktree.yaml picks with `uses:`."""
 
+import copy
 import os
 import re
 from dataclasses import dataclass
@@ -9,7 +10,20 @@ from typing import Any, Self
 import yaml
 from pydantic import Field, ValidationError, model_validator
 
-from wt.config import MAX_SERVICES, NAME, Service, Shared, Strict, _format_errors, find_cycle
+from wt.config import (
+    CONFIG_NAME,
+    DOMAIN,
+    MAX_SERVICES,
+    NAME,
+    PROJECT,
+    Config,
+    LoadedConfig,
+    Service,
+    Shared,
+    Strict,
+    _format_errors,
+    find_cycle,
+)
 from wt.errors import WtError
 from wt.naming import service_ref
 from wt.paths import wt_home
@@ -41,6 +55,12 @@ class CatalogService(Service):
 
 
 class Catalog(Strict):
+    project: str | None = Field(
+        default=None, pattern=PROJECT, description="project name; required by load_project"
+    )
+    domain: str | None = Field(
+        default=None, pattern=DOMAIN, description="base domain; required by load_project"
+    )
     repos: dict[str, str] = Field(default_factory=dict)
     services: dict[str, CatalogService] = Field(min_length=1)
 
@@ -108,16 +128,22 @@ def rows(cat: Catalog) -> list[Row]:
     ]
 
 
-def load_catalog(path: Path) -> LoadedCatalog:
-    path = path.resolve()
+def _read_mapping(path: Path, missing: str) -> dict[str, Any]:
+    """The YAML mapping in `path`; `missing` is the message when the file does not exist."""
     try:
         raw = yaml.safe_load(path.read_text())
     except FileNotFoundError as exc:
-        raise WtError(f"catalog not found: {path}") from exc
+        raise WtError(missing) from exc
     except yaml.YAMLError as exc:
         raise WtError(f"{path} is not valid YAML:\n{exc}") from exc
     if not isinstance(raw, dict):
         raise WtError(f"{path} must contain a YAML mapping")
+    return raw
+
+
+def load_catalog(path: Path) -> LoadedCatalog:
+    path = path.resolve()
+    raw = _read_mapping(path, f"catalog not found: {path}")
     try:
         catalog = Catalog.model_validate(raw)
     except ValidationError as exc:
@@ -161,7 +187,8 @@ def expand_uses(catalog: Catalog, uses: list[str]) -> list[str]:
     """
     for name in uses:
         if name not in catalog.services:
-            raise WtError(f"uses: unknown service {name!r} (not in the catalog)")
+            known = ", ".join(catalog.services)
+            raise WtError(f"uses: unknown service {name!r} (not in the catalog). Known: {known}")
     stack = list(dict.fromkeys(uses))
     for name in stack:  # grows while it is walked: breadth-first through the dependencies
         stack += [dep for dep in catalog.services[name].consumes if dep not in stack]
@@ -209,31 +236,26 @@ def _service_data(
     return data
 
 
-def resolve(raw: dict[str, Any], config_path: Path) -> Resolved:
-    """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
-
-    The stack is the closure of `uses` through `consumes` (SPEC section 20).
-    """
-    if "services" in raw:
-        raise WtError("set exactly one of 'services' or 'uses', not both")
+def _uses_list(raw: dict[str, Any]) -> list[str]:
     uses = raw.get("uses")
     if not isinstance(uses, list) or not uses or not all(isinstance(u, str) for u in uses):
         raise WtError("'uses' must be a non-empty list of service names")
-    if "shared" in raw:
-        raise WtError("'shared' cannot be set with 'uses'; infra comes from the catalog services")
-    if "repos" in raw:
-        raise WtError("'repos' cannot be set with 'uses'; repos come from the catalog")
-    loaded = load_catalog(catalog_path(raw.get("catalog"), config_path.parent))
+    return uses
+
+
+def _select(loaded: LoadedCatalog, uses: list[str]) -> Resolved:
+    """The `repos`, `services` and `shared` of a normal Config for a selection of the catalog."""
     catalog = loaded.catalog
     if len(catalog.services) > MAX_SERVICES:
         raise WtError(f"the catalog has {len(catalog.services)} services; at most 100 services")
     chosen = {name: catalog.services[name] for name in expand_uses(catalog, uses)}
     services = {name: _service_data(name, svc, chosen) for name, svc in chosen.items()}
-    out = {k: v for k, v in raw.items() if k not in ("uses", "catalog")}
-    out["repos"] = {
-        r: str(loaded.repos[r]) for r in dict.fromkeys(s["repo"] for s in services.values())
+    out: dict[str, Any] = {
+        "repos": {
+            r: str(loaded.repos[r]) for r in dict.fromkeys(s["repo"] for s in services.values())
+        },
+        "services": services,
     }
-    out["services"] = services
     shared = _merge_infra(chosen)
     if shared:
         out["shared"] = shared
@@ -243,4 +265,243 @@ def resolve(raw: dict[str, Any], config_path: Path) -> Resolved:
         remotes=remotes,
         order=tuple(catalog.services),
         warnings=_ignored_remotes(chosen, uses),
+    )
+
+
+def resolve(raw: dict[str, Any], config_path: Path) -> Resolved:
+    """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
+
+    The stack is the closure of `uses` through `consumes` (SPEC section 20).
+    """
+    if "services" in raw:
+        raise WtError("set exactly one of 'services' or 'uses', not both")
+    uses = _uses_list(raw)
+    if "shared" in raw:
+        raise WtError("'shared' cannot be set with 'uses'; infra comes from the catalog services")
+    if "repos" in raw:
+        raise WtError("'repos' cannot be set with 'uses'; repos come from the catalog")
+    loaded = load_catalog(catalog_path(raw.get("catalog"), config_path.parent))
+    selected = _select(loaded, uses)
+    out = {k: v for k, v in raw.items() if k not in ("uses", "catalog")}
+    return Resolved(
+        raw={**out, **selected.raw},
+        remotes=selected.remotes,
+        order=selected.order,
+        warnings=selected.warnings,
+    )
+
+
+def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
+    """Load the project catalog (SPEC section 21) for a selection of its services.
+
+    `uses=None` is the anchor: the first service in catalog order, plus its closure.
+    """
+    path = path.resolve()
+    if not path.is_file():
+        raise WtError(f"no catalog at {path}. Run wt init, or wt migrate <worktree.yaml>")
+    loaded = load_catalog(path)
+    catalog = loaded.catalog
+    absent = [key for key in ("project", "domain") if getattr(catalog, key) is None]
+    if absent:
+        raise WtError(f"{path} is missing required key(s): {', '.join(absent)}")
+    if uses is None:
+        uses = [next(iter(catalog.services))]
+    elif not uses:
+        raise WtError("choose at least one service (wt add <b> --uses a,b)")
+    selected = _select(loaded, uses)
+    try:
+        config = Config.model_validate(
+            {"project": catalog.project, "domain": catalog.domain, **selected.raw}
+        )
+    except ValidationError as exc:
+        raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
+    return LoadedConfig(
+        config=config,
+        path=path,
+        catalog=path,
+        remotes=selected.remotes,
+        uses=tuple(dict.fromkeys(uses)),
+        service_order=selected.order,
+        warnings=selected.warnings,
+        from_catalog=True,
+    )
+
+
+# --- wt migrate: fold a v0.5.x worktree.yaml into the catalog (pure: the caller writes it) ---
+@dataclass(frozen=True)
+class MergeResult:
+    catalog: dict[str, Any]  # raw catalog, ready to dump: project, domain, repos, services
+    added: tuple[str, ...]  # services the legacy file brought
+    skipped: tuple[str, ...]  # services already in the catalog, identical
+    uses: tuple[str, ...]  # the stack to record for the project's branches that have none
+
+
+@dataclass(frozen=True)
+class _Incoming:
+    repos: dict[str, str]  # absolute paths
+    services: dict[str, dict[str, Any]]
+    uses: tuple[str, ...]
+
+
+def read_legacy(path: Path) -> dict[str, Any]:
+    """The raw mapping of a worktree.yaml."""
+    return _read_mapping(path, f"{path} not found")
+
+
+def _mapping(value: object, what: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise WtError(f"{what} must be a mapping")
+    return value
+
+
+def _absolute(value: object, base: Path, repo: str) -> str:
+    if not isinstance(value, str):
+        raise WtError(f"repo {repo!r} must be a path")
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else (base / path).resolve())
+
+
+def _mentions(service: dict[str, Any], provider: str) -> bool:
+    """Does the service text use `{{ <provider>.`, i.e. does it need that shared server?"""
+    env = _mapping(service.get("env", {}), "env")
+    texts = [*env.values(), service.get("run"), service.get("health")]
+    call = re.compile(r"\{\{\s*" + re.escape(provider) + r"\.")
+    return any(call.search(text) for text in texts if isinstance(text, str))
+
+
+def _with_infra(
+    services: dict[str, dict[str, Any]], shared: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    """Turn the project-level `shared` into per-service `infra`.
+
+    A section nobody mentions goes to the first service so the server is still provisioned.
+    """
+    infra: dict[str, dict[str, Any]] = {name: {} for name in services}
+    for provider, section in shared.items():
+        if section is None:  # `redis:` with no value: not configured
+            continue
+        owners = [n for n, svc in services.items() if _mentions(svc, provider)]
+        for owner in owners or list(services)[:1]:
+            infra[owner][provider] = section
+    return {n: {**svc, "infra": infra[n]} if infra[n] else svc for n, svc in services.items()}
+
+
+def _incoming_services(legacy: dict[str, Any], legacy_dir: Path) -> _Incoming:
+    repos = _mapping(legacy.get("repos", {}), "repos")
+    services = {  # a copy: the result must not alias the caller's dict
+        name: copy.deepcopy(_mapping(svc, f"service {name!r}"))
+        for name, svc in _mapping(legacy["services"], "services").items()
+    }
+    shared = _mapping(legacy.get("shared", {}), "shared")
+    return _Incoming(
+        repos={name: _absolute(value, legacy_dir, name) for name, value in repos.items()},
+        services=_with_infra(services, shared),
+        uses=tuple(services),
+    )
+
+
+def _incoming_uses(legacy: dict[str, Any], legacy_dir: Path) -> _Incoming:
+    loaded = load_catalog(catalog_path(legacy.get("catalog"), legacy_dir))
+    stack = expand_uses(loaded.catalog, _uses_list(legacy))
+    services = {  # catalog order: the position is the service index
+        name: svc.model_dump(exclude_unset=True)
+        for name, svc in loaded.catalog.services.items()
+        if name in stack
+    }
+    used_repos = dict.fromkeys(svc["repo"] for svc in services.values())
+    return _Incoming(
+        repos={repo: str(loaded.repos[repo]) for repo in used_repos},
+        services=services,
+        uses=tuple(stack),
+    )
+
+
+def _incoming(legacy: dict[str, Any], legacy_dir: Path, legacy_name: str) -> _Incoming:
+    if ("services" in legacy) == ("uses" in legacy):
+        raise WtError(f"{legacy_name}: set exactly one of 'services' or 'uses'")
+    if "services" in legacy:
+        return _incoming_services(legacy, legacy_dir)
+    return _incoming_uses(legacy, legacy_dir)
+
+
+def _identity(current: dict[str, Any], legacy: dict[str, Any], legacy_name: str) -> dict[str, str]:
+    """`project` and `domain` of the merged catalog: the legacy file's, which must agree."""
+    identity = {}
+    for key in ("project", "domain"):
+        theirs = legacy.get(key)
+        if not isinstance(theirs, str):
+            raise WtError(f"{legacy_name} has no {key!r} (text)")
+        ours = current.get(key)
+        if ours is not None and ours != theirs:
+            raise WtError(f"catalog is {key} {ours}, {legacy_name} is {key} {theirs}")
+        identity[key] = theirs
+    return identity
+
+
+def _repo_path(value: object, catalog_dir: Path | None) -> Path:
+    """A repo path of the catalog as wt reads it: `~` expanded, relative to the catalog folder."""
+    path = Path(str(value)).expanduser()
+    if path.is_absolute() or catalog_dir is None:
+        return path
+    return (catalog_dir / path).resolve()
+
+
+def _conflicts(
+    repos: dict[str, Any],
+    services: dict[str, Any],
+    incoming: _Incoming,
+    legacy_name: str,
+    catalog_dir: Path | None,
+) -> list[str]:
+    differing = [
+        f"service {name!r} differs from the catalog's"
+        for name, svc in incoming.services.items()
+        if name in services and services[name] != svc
+    ]
+    for name, path in incoming.repos.items():
+        if name in repos and _repo_path(repos[name], catalog_dir) != Path(path):
+            differing.append(
+                f"repo {name!r} is {repos[name]} in the catalog, {path} in {legacy_name}"
+            )
+    return differing
+
+
+def merge_legacy(
+    existing: dict[str, Any] | None,
+    legacy: dict[str, Any],
+    legacy_dir: Path,
+    legacy_name: str = CONFIG_NAME,
+    catalog_dir: Path | None = None,
+) -> MergeResult:
+    """Fold a v0.5.x worktree.yaml (`legacy`, read from `legacy_dir`) into the raw catalog.
+
+    `catalog_dir` is the folder of the existing catalog file: its relative repo paths are read
+    against it, so the same repo written differently is not a clash. Entries already in the
+    catalog are kept exactly as written.
+
+    Merging a file into its own result changes nothing, so `wt migrate` is safe to repeat.
+    """
+    current = existing or {}
+    identity = _identity(current, legacy, legacy_name)
+    incoming = _incoming(legacy, legacy_dir, legacy_name)
+    repos = _mapping(current.get("repos") or {}, "repos")
+    services = _mapping(current.get("services") or {}, "services")
+    conflicts = _conflicts(repos, services, incoming, legacy_name, catalog_dir)
+    if conflicts:
+        raise WtError(f"{legacy_name} does not fit the catalog: " + "; ".join(conflicts))
+    added = tuple(name for name in incoming.services if name not in services)
+    merged = {
+        **identity,
+        "repos": {**repos, **{n: p for n, p in incoming.repos.items() if n not in repos}},
+        "services": {**services, **{name: incoming.services[name] for name in added}},
+    }
+    try:
+        Catalog.model_validate(merged)
+    except ValidationError as exc:
+        raise WtError(f"the merged catalog is invalid:\n{_format_errors(exc)}") from exc
+    return MergeResult(
+        catalog=merged,
+        added=added,
+        skipped=tuple(name for name in incoming.services if name in services),
+        uses=incoming.uses,
     )
