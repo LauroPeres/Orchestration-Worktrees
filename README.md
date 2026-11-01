@@ -14,7 +14,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 `https://api.main.shop.localhost` keeps serving `main`.
 
 wt ships no services of its own: you describe your stack (any repos, any languages) in
-`worktree.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
+one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
 > **Status: v0.5.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
@@ -50,17 +50,19 @@ same once when the route file it just wrote is not visible to Traefik.
 
 ## Quick start
 
-In your repo:
+From any folder (wt reads `~/.wt/catalog.yaml`, never the current folder):
 
 ```bash
-wt init            # writes a starter worktree.yaml
-$EDITOR worktree.yaml
+wt init            # writes a starter ~/.wt/catalog.yaml
+$EDITOR ~/.wt/catalog.yaml
+wt add my-branch --uses api,web   # the branch and the catalog services it runs
 wt up my-branch    # prints a SERVICE / URL / CHECK table
 wt ls              # branches, URLs, health, databases
                    # (--no-probe skips HTTP checks, --paths shows folders)
 wt logs my-branch api   # follows one service's logs, compose or run: (--no-follow, --tail N)
 wt tui                  # terminal UI: worktrees, services view, up/stop/add/remove
 wt add my-branch        # worktrees + reserved ports only, status "stopped"; nothing is started
+                        # (without --uses it asks which services; `wt tui` `a` asks the name too)
 wt stop my-branch       # stops containers and processes; worktrees, volumes, databases, ports stay
 wt down my-branch       # --force also removes worktrees with uncommitted changes
 wt remove my-branch     # down + deletes the git branch in every repo of the project where it exists
@@ -81,14 +83,25 @@ service is running and passes its health check, and `degraded` otherwise. With `
 the `UP` count decides. Piped or redirected output is never wrapped or cut; only a terminal gets
 the fixed-width layout.
 
-## `worktree.yaml`
+## The catalog (`catalog.yaml`)
+
+One file describes the project: its repos and every service a branch can run. wt finds it from
+`--catalog PATH` (`-c`), then `WT_CATALOG`, then `$WT_HOME/catalog.yaml` (`~/.wt/catalog.yaml`),
+never from the current folder, so `wt add`, `wt up` and `wt tui` work from anywhere. One catalog is
+one project; another project uses another file through `WT_CATALOG`. Each branch picks its
+services with `wt add <branch> --uses a,b` (stored per branch); `wt up` on a branch without
+services fails with `branch <b> has no services yet; run wt add <b> --uses a,b`.
+
+Coming from 0.5.x? `wt migrate path/to/worktree.yaml` imports the old file into the catalog
+(idempotent; it reports every conflict by name and records the stack for branches you already
+have). A `worktree.yaml` is not read by anything else any more.
 
 ```yaml
 project: shop
 domain: shop.localhost          # *.localhost resolves to 127.0.0.1 in browsers
 
 repos:                          # each repo gets a git worktree per branch
-  api: ../shop-api
+  api: ../shop-api              # relative paths are relative to this file
   web: ../shop-web
 
 services:
@@ -141,7 +154,7 @@ branch's worktree:
 - `port: auto` gets the port from the formula in [Ports](#ports). An explicit number is used as
   is, and `up` fails if something else holds it.
 - Running `wt up` again keeps a live process as is. If its rendered command, port or `env`
-  changed in `worktree.yaml`, `up` stops it and starts the new one.
+  changed in the catalog, `up` stops it and starts the new one.
 - Output goes to `~/.wt/<project>/branches/<slug>/logs/<service>.log`; read it with
   `wt logs <branch> <service>`.
 - Traefik reaches the process through `host.docker.internal`. **Bind to `0.0.0.0`** (not only
@@ -150,10 +163,10 @@ branch's worktree:
   `127.0.0.1`, but `0.0.0.0` is the portable choice.
 - `down` stops the whole process group (SIGTERM, then SIGKILL after 10 s).
 
-## Postgres per branch (`shared.postgres`)
+## Postgres per branch (`infra.postgres`)
 
 ```yaml
-shared:
+infra:                      # on a catalog service; the stack's sections are merged
   postgres:
     databases: [shop]       # each one is cloned per branch
     strategy: template      # template | dump-restore
@@ -192,10 +205,10 @@ gets the database `shop__feat_cart`.
 - A branch whose database names equal the base branch's (for example `Main` with the base
   `main`) is refused by `up` before anything is created. Rename the branch.
 
-## Redis per branch (`shared.redis`)
+## Redis per branch (`infra.redis`)
 
 ```yaml
-shared:
+infra:                      # on a catalog service; the stack's sections are merged
   redis:
     prefix: true            # default; false shares every key between branches
 ```
@@ -216,10 +229,10 @@ published on `127.0.0.1:56379`). Branch `feat/cart` of project `shop` gets the k
 - Overrides: `WT_REDIS_PORT` (host port, default `56379`) and `WT_REDIS_IMAGE` (default
   `redis:7-alpine`).
 
-## Kafka per branch (`shared.kafka`)
+## Kafka per branch (`infra.kafka`)
 
 ```yaml
-shared:
+infra:                      # on a catalog service; the stack's sections are merged
   kafka:
     groups: [worker]        # consumer groups; each one is named per branch
     topic_prefix: true      # default false; prefixes topics with the branch slug
@@ -244,10 +257,10 @@ group `worker-shop.feat-cart` (project `shop`) and, with `topic_prefix: true`, t
 - Overrides: `WT_KAFKA_PORT` (host port, default `59092`) and `WT_KAFKA_IMAGE` (default
   `apache/kafka:3.9.1`).
 
-## Keycloak per branch (`shared.keycloak`)
+## Keycloak per branch (`infra.keycloak`)
 
 ```yaml
-shared:
+infra:                      # on a catalog service; the stack's sections are merged
   keycloak:
     realm: shop             # one realm shared by every branch
     client: web             # each branch gets its own client: web-<project>.<slug>
@@ -289,43 +302,38 @@ keeps its old names recorded and `wt down` still removes them, so the simplest u
 them). Running `up` on such a branch after the upgrade creates the new names and keeps the old ones
 recorded until `down`. The Keycloak realm is never deleted, not even after the last branch is down.
 
-## User catalog (`uses:`)
+## Choosing services and dependencies
 
-If the same services serve several projects, describe them once in a catalog. By default it is
-`~/.wt/catalog.yaml`; a `catalog:` key in `worktree.yaml` or `WT_CATALOG` points elsewhere.
-Each service lists its `infra` (what it needs, merged into `shared`) and its `consumes` (other
-services whose URL it reads).
+Each catalog service lists its `infra` (what it needs from the shared servers) and its `consumes`
+(other services whose URL it reads). A branch runs the services you pick:
 
-```yaml
-# worktree.yaml
-project: notes
-domain: notes.localhost
-catalog: ./catalog.yaml
-uses: [front]                  # back comes in because front consumes it
+```bash
+wt add feat/x --uses front       # back comes in because front consumes it
 ```
 
-- A worktree.yaml has either `services:` (as above) or `uses:`, not both.
-- A selected service brings the services it consumes, transitively: `uses: [front]` runs `front`
-  and `back`, `back` first. `down` and `stop` handle both. Repos come from the catalog.
+- A selected service brings the services it consumes, transitively: `--uses front` runs `front`
+  and `back`, `back` first. `down` and `stop` handle both.
 - `consumes: {back: API_URL}` sets `API_URL` to the back's own URL in that branch.
 - `remote:` (an `http://` or `https://` URL) is optional. A service that has to run locally ignores
   it (wt warns once); it only gives the URL of a service nobody selected and nobody consumes.
   There is no staging fallback: a dependency always runs next to its consumer.
 - In `configure` (`c` in the services view), a dependency that a selected service needs is shown
   checked and locked (`required by front`).
-- A worktree can change its selection with `configure`. The selection is stored per branch and
-  starts from `uses:`.
+- A worktree can change its selection with `configure`. The selection is stored per branch.
 - `wt catalog` prints the catalog: service, repo, kind, infra, consumes and consumed by.
   `wt catalog --check` validates it, including each service resolved on its own.
 
 The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-implementation-notes)
-and [§17](docs/SPEC.md#17-v03-services-view-per-worktree-selection-deterministic-ports).
+[§17](docs/SPEC.md#17-v03-services-view-per-worktree-selection-deterministic-ports)
+and [§21](docs/SPEC.md#21-v060-one-global-catalog-wt-from-anywhere-json-output).
 A working example is in [examples/notes](examples/notes/README.md).
 
 ## Terminal UI (`wt tui`)
 
-`wt tui` shows one compact table with one row per worktree of the current project. Columns:
-`NAME` and `STATUS`. Below the table is the action line and a message line.
+`wt tui` shows one compact table with one row per worktree of the catalog's project
+(`wt tui --all` lists every project wt knows). `a` asks "Enter name", then which catalog services
+that worktree runs. Columns: `NAME` and `STATUS`. Below the table is the action line and a message
+line.
 
 ```
 NAME          STATUS
@@ -458,7 +466,7 @@ flowchart TB
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WT_CONFIG` | nearest `worktree.yaml` | config path (same as `--config`) |
+| `WT_CATALOG` | `$WT_HOME/catalog.yaml` | the catalog (same as `--catalog`) |
 | `WT_HOME` | `~/.wt` | where wt keeps state, worktrees and Traefik files |
 | `WT_HTTP_PORT` / `WT_HTTPS_PORT` | `80` / `443` | host ports for Traefik |
 | `WT_TRAEFIK_IMAGE` | `traefik:v3.5` | Traefik image |
