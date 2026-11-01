@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Usage: bootstrap.sh <dir>
 # Creates <dir>/notes-back and <dir>/notes-front as git repos on main (one commit each), a
-# feat/tags branch in notes-back with a visible change, <dir>/catalog.yaml and
-# <dir>/worktree.yaml. Never touches ~/.wt/catalog.yaml.
+# feat/tags branch in notes-back with a visible change and <dir>/catalog.yaml (use it with
+# WT_CATALOG=<dir>/catalog.yaml). Never touches ~/.wt/catalog.yaml.
 set -eu
 
 if [ $# -ne 1 ]; then
@@ -42,5 +42,5 @@ git_in "$dir/notes-back" add -A
 git_in "$dir/notes-back" commit -q -m "Add tags to notes"
 git_in "$dir/notes-back" checkout -q main
 
-cp "$here/catalog.yaml" "$here/worktree.yaml" "$dir/"
+cp "$here/catalog.yaml" "$dir/"
 echo "created $dir (notes-back on main and feat/tags, notes-front on main)"

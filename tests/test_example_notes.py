@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from wt.config import load_config
+from wt.catalog import load_project
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "notes"
 
@@ -12,7 +12,7 @@ def git(repo: Path, *args: str) -> str:
     ).stdout
 
 
-def test_bootstrap_and_load_config(tmp_path: Path) -> None:
+def test_bootstrap_and_load_catalog(tmp_path: Path) -> None:
     target = tmp_path / "notes"
     subprocess.run([str(EXAMPLE / "bootstrap.sh"), str(target)], check=True, capture_output=True)
 
@@ -22,7 +22,9 @@ def test_bootstrap_and_load_config(tmp_path: Path) -> None:
     assert git(front, "branch", "--show-current").strip() == "main"
     assert not (tmp_path / "wt-home" / "catalog.yaml").exists()
 
-    loaded = load_config(target / "worktree.yaml")
+    assert not (target / "worktree.yaml").exists()
+
+    loaded = load_project(target / "catalog.yaml", uses=["front"])
     cfg = loaded.config
     assert cfg.project == "notes"
     assert cfg.domain == "notes.localhost"

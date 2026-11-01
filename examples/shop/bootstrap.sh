@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Usage: bootstrap.sh <dir>
 # Creates <dir>/shop-api and <dir>/shop-web as git repos on main (one commit each), a
-# feat/cart branch in shop-api with a visible change, and <dir>/worktree.yaml.
+# feat/cart branch in shop-api with a visible change, <dir>/catalog.yaml (use it with
+# WT_CATALOG=<dir>/catalog.yaml) and <dir>/legacy/worktree.yaml (a v0.5 file for `wt migrate`).
 set -eu
 
 if [ $# -ne 1 ]; then
@@ -41,5 +42,7 @@ git_in "$dir/shop-api" add -A
 git_in "$dir/shop-api" commit -q -m "Add item quantity"
 git_in "$dir/shop-api" checkout -q main
 
-cp "$here/worktree.yaml" "$dir/worktree.yaml"
+cp "$here/catalog.yaml" "$dir/catalog.yaml"
+mkdir -p "$dir/legacy"
+cp "$here/legacy/worktree.yaml" "$dir/legacy/worktree.yaml"
 echo "created $dir (shop-api on main and feat/cart, shop-web on main)"

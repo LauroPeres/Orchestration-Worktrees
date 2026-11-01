@@ -1,6 +1,6 @@
 project: shop
 domain: shop.localhost
-repos: { api: ./shop-api, web: ./shop-web }
+repos: { api: ../shop-api, web: ../shop-web }
 services:
   api:
     repo: api

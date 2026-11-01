@@ -13,13 +13,14 @@ from typing import Any
 import pytest
 
 from wt import compose, health, router
-from wt.config import load_config
+from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers import postgres
 
 pytestmark = pytest.mark.docker
 
+USES = ["front"]  # the front consumes the back, so the back comes in too
 BOOTSTRAP = Path(__file__).parents[2] / "examples" / "notes" / "bootstrap.sh"
 
 
@@ -74,11 +75,11 @@ def notes(
 
     stack = tmp_path / "stack"
     subprocess.run([str(BOOTSTRAP), str(stack)], check=True, capture_output=True)
-    config = stack / "worktree.yaml"
+    config = stack / "catalog.yaml"
     # A unique project name keeps compose projects and images away from any real `notes` stack.
     config.write_text(config.read_text().replace("project: notes\n", f"project: {instance}\n"))
     logs: list[str] = []
-    orch = Orchestrator(load_config(config), log=logs.append)
+    orch = Orchestrator(load_project(config), log=logs.append)
     try:
         yield orch, logs
     finally:
@@ -97,7 +98,7 @@ def notes(
 
 def up(orch: Orchestrator, branch: str, monkeypatch: pytest.MonkeyPatch) -> None:
     try:
-        reports = orch.up(branch, timeout=180)
+        reports = orch.up(branch, uses=USES, timeout=180)
     except WtError as exc:
         if "not available" not in str(exc) and "already allocated" not in str(exc):
             raise
@@ -105,7 +106,7 @@ def up(orch: Orchestrator, branch: str, monkeypatch: pytest.MonkeyPatch) -> None
         monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
         monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
         docker("rm", "-f", "-v", postgres.container())
-        reports = orch.up(branch, timeout=180)
+        reports = orch.up(branch, uses=USES, timeout=180)
     assert {r.service: r.outcome for r in reports} == {"back": "ok", "front": "ok"}, reports
 
 

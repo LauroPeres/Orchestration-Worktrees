@@ -23,16 +23,32 @@ examples/shop/bootstrap.sh /tmp/shop
 ```
 
 This creates `/tmp/shop/shop-api` (branches `main` and `feat/cart`), `/tmp/shop/shop-web` (branch
-`main`) and `/tmp/shop/worktree.yaml`. The script refuses to use a non-empty directory.
+`main`), the catalog `/tmp/shop/catalog.yaml` and `/tmp/shop/legacy/worktree.yaml` (the old
+v0.5 format, used in step 8). The script refuses to use a non-empty directory.
+
+Point wt at the catalog (it never looks in the current folder, so you can run it from anywhere):
+
+```bash
+export WT_CATALOG=/tmp/shop/catalog.yaml   # or pass --catalog /tmp/shop/catalog.yaml
+wt catalog --check
+```
+
+The catalog lists three services. Each says what it needs in `infra` (the `api` Postgres and Kafka,
+the `worker` Kafka and Redis, the `web` Keycloak), and `web` consumes `api`, so selecting `web`
+brings `api` along.
 
 ## 2. Start the stack
 
 ```bash
-cd /tmp/shop
 wt doctor --fix   # checks Docker, git, ports and certificates; creates the network and starts Traefik
-wt up main
-wt up feat/cart
+wt up main --uses web,worker
+wt up feat/cart --uses web,worker
 ```
+
+`--uses` picks the catalog services of a branch (its dependencies come along). `api` and `worker`
+share one compose file, so select both: an unselected `worker` would still start with the `api`,
+without its Kafka and Redis variables. `wt add feat/cart --uses web,worker` prepares the worktrees
+and ports without starting anything; `wt up feat/cart` then starts it.
 
 Each `wt up` starts the API and the worker in Docker, the Postgres database cloned from the template,
 and the web page as a host process. The shared Kafka and Redis containers (`wt-kafka`, `wt-redis`)
@@ -109,3 +125,15 @@ The web page shows a "Sign in" link to the shared Keycloak. It uses the branch's
 Keycloak login form only because `wt up` registered that redirect URI for that branch. Nothing is
 enforced: the page keeps no session and handles no token. Add users in the Keycloak console (see
 [Keycloak per branch](../../README.md#keycloak-per-branch-sharedkeycloak)).
+
+## 8. Migrate an old worktree.yaml
+
+`legacy/worktree.yaml` is the same stack in the v0.5 format (`shared:` at the top level). Import it
+into an empty wt home to see `wt migrate`:
+
+```bash
+export WT_HOME=/tmp/shop-home     # a throwaway home, so your own catalog is untouched
+unset WT_CATALOG
+wt migrate /tmp/shop/legacy/worktree.yaml   # one line per service; creates $WT_HOME/catalog.yaml
+wt migrate /tmp/shop/legacy/worktree.yaml   # second run: every service skipped, nothing changes
+```

@@ -14,11 +14,14 @@ import pytest
 import yaml
 
 from wt import health, naming, router
-from wt.config import load_config
+from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
 
 pytestmark = pytest.mark.docker
+
+# What `wt add --uses` would pick for each fixture's orchestrator, by project name.
+SELECTION: dict[str, list[str]] = {}
 
 SERVE = Path(__file__).parent.parent / "serve.py"
 IMAGE = "traefik/whoami:v1.10"
@@ -63,9 +66,10 @@ def make_stack(
         "repos": {"api": "./api"},
         "services": services,
     }
-    path = tmp_path / "worktree.yaml"
+    path = tmp_path / "catalog.yaml"
     path.write_text(yaml.safe_dump(config))
-    orch = Orchestrator(load_config(path), log=lambda m: None)
+    SELECTION[instance] = list(services)
+    orch = Orchestrator(load_project(path), log=lambda m: None)
     yield orch
     for branch in list(orch.store.load().branches):
         orch.down(branch, force=True)
@@ -137,6 +141,8 @@ def catalog_orchestrator(
     make_repo("side")
     run = f"{sys.executable} {SERVE} {{{{ port }}}}"
     catalog = {
+        "project": instance,
+        "domain": f"{instance}.localhost",
         "repos": {"api": "./api", "web": "./web", "side": "./side"},
         "services": {
             "api": {
@@ -155,16 +161,10 @@ def catalog_orchestrator(
             "side": {"repo": "side", "run": run, "port": "auto", "subdomain": "side"},
         },
     }
-    (tmp_path / "catalog.yaml").write_text(yaml.safe_dump(catalog))
-    config = {
-        "project": instance,
-        "domain": f"{instance}.localhost",
-        "catalog": "./catalog.yaml",
-        "uses": uses,
-    }
-    path = tmp_path / "worktree.yaml"
-    path.write_text(yaml.safe_dump(config))
-    orch = Orchestrator(load_config(path), log=lambda m: None)
+    path = tmp_path / "catalog.yaml"
+    path.write_text(yaml.safe_dump(catalog))
+    SELECTION[instance] = uses
+    orch = Orchestrator(load_project(path), log=lambda m: None)
     yield orch
     for branch in list(orch.store.load().branches):
         orch.down(branch, force=True)
@@ -191,13 +191,13 @@ def up_retrying(
 ) -> list[ServiceReport]:
     """Another test run may grab a port between free_port() and compose up: retry once."""
     try:
-        return orch.up(branch, timeout=90)
+        return orch.up(branch, uses=SELECTION[orch.cfg.project], timeout=90)
     except WtError as exc:
         if "not available" not in str(exc) and "already allocated" not in str(exc):
             raise
         monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
         monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
-        return orch.up(branch, timeout=90)
+        return orch.up(branch, uses=SELECTION[orch.cfg.project], timeout=90)
 
 
 def env_of(container: str) -> list[str]:
