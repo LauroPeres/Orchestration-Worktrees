@@ -166,7 +166,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
 | v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
 | v0.7.1 | Keycloak dev users (`infra.keycloak.users`) |
-| v0.8.0 (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
+| v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 | v0.9 | native Windows (spike first) |
 
 ## 11. Clean-room rules

@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.7.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.8.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -198,6 +198,14 @@ wt cache ls              # install entries (key, preset, size, last used) and th
 wt cache prune           # drops entries not used for 30 days (--older-than DAYS)
 wt cache prune --all     # everything, including the uv and npm caches (asks first; --yes)
 ```
+
+Measured with `examples/bench-cache/bench.sh <npm-project>` (node v26.12.1, npm 12.2.1, a Vite + React
+project with 74 packages, network available, one run): the first `up` took 24.6 s with `setup_cache: npm`
+(cold `npm ci`, then stored) against 18.6 s without it; the second branch took 3.3 s restored against 3.0 s
+for a second plain `npm ci` with npm's own cache already warm. So on a small project the restore costs about
+the same as a warm npm cache; what it adds is an install that does not need the network and a lock-keyed
+copy you can inspect and prune. Larger projects or a cold npm cache are where it should pay off; that was not
+measured.
 
 Pruning never breaks a worktree: they hold copies. `wt doctor` shows the cache size and warns
 when the disk holding `~/.wt` has less than 2 GiB free.
@@ -633,7 +641,8 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.6.0 ✔ | One global `catalog.yaml`, `wt add/up --uses` from any folder, `wt migrate`, `--json` |
 | v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from tests |
 | v0.7.0 ✔ | Provider plugins, `wt init --with`, TUI log pane, catalog edit commands |
-| later | install caches (v0.8), Keycloak dev users (v0.7.1), Windows CI job (v0.9) |
+| v0.8.0 ✔ | Install caches for npm and uv, `wt cache ls/prune`, doctor cache check |
+| later | Keycloak dev users (v0.7.1), Windows CI job (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
 
