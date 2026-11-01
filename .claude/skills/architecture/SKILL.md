@@ -48,8 +48,7 @@ tests `tests/test_<module>.py` go with their module; e2e owns `tests/integration
   fixtures from `tests/conftest.py`, `tests/test_naming.py` (pure).
 
 ## Known exceptions (migrate gradually, never add more)
-1. `templating → providers` (`ignore_imports`): the "provider arrives in vX" hint reads the registry.
-   Target: the core passes the hint in, or drop it (it no longer fires) — needs a `spec-decision`.
+1. (Removed in v0.6.1: the templating → providers hint was dropped.)
 2. Functions over the limits, marked `# noqa: <code>` on the `def` line:
    `compose.up`, `config.Config._check`,
    `orchestrator.Orchestrator._start_steps`, `._up_run_service`, `._up_compose_group`, `._down_locked`,

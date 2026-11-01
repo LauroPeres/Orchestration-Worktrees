@@ -23,6 +23,9 @@ KEYCLOAK_NAME = r"^[A-Za-z0-9_][A-Za-z0-9._-]*$"
 # (`unknown_error`); 64 is far below that and plenty for a name.
 MAX_KEYCLOAK_NAME = 64
 
+DEFAULT_SETUP_TIMEOUT = 600  # seconds
+MAX_SETUP_TIMEOUT = 3600
+
 
 class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -33,6 +36,15 @@ class Service(Strict):
     compose: str | None = Field(None, description="compose file, relative to the repo root")
     compose_service: str | None = Field(None, description="name in the compose file, if different")
     run: str | None = Field(None, description="host process command (v0.2)")
+    setup: str | None = Field(
+        None, description="shell command run before the process starts, once per change (run only)"
+    )
+    setup_timeout: int = Field(
+        DEFAULT_SETUP_TIMEOUT,
+        ge=1,
+        le=MAX_SETUP_TIMEOUT,
+        description="seconds `setup` may take (run only)",
+    )
     port: int | Literal["auto"] | None = None
     subdomain: str | None = Field(
         None, pattern=LABEL, description='"" = branch root; unset = no route'
@@ -42,6 +54,15 @@ class Service(Strict):
     needs: list[str] = Field(
         default_factory=list, description="services that must be healthy before this one starts"
     )
+
+    @model_validator(mode="after")
+    def _check_setup(self) -> Self:
+        if self.run is None:
+            if self.setup is not None:
+                raise ValueError("setup: needs run:")
+            if "setup_timeout" in self.model_fields_set:
+                raise ValueError("setup_timeout: needs run:")
+        return self
 
     @model_validator(mode="after")
     def _check(self) -> Self:

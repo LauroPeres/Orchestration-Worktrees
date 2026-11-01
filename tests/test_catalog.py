@@ -13,6 +13,7 @@ from wt.catalog import (
     load_project,
     merge_legacy,
     read_legacy,
+    render_check,
 )
 from wt.errors import WtError
 from wt.templating import render
@@ -1084,3 +1085,90 @@ def test_merge_keeps_the_worktrees_key_when_it_adds_services(tmp_path: Path) -> 
 
 def test_merge_never_adds_a_worktrees_key(tmp_path: Path) -> None:
     assert "worktrees" not in merge_legacy(None, legacy_dict(), tmp_path).catalog
+
+
+# --- render_check (SPEC section 22) ---
+CHECK = """\
+repos:
+  r: ./r
+services:
+  music-back:
+    repo: r
+    run: serve --port {{ port }}
+    port: auto
+    subdomain: api
+    setup: make deps {{ slug }}
+    env:
+      DB: "{{ postgres.url }}"
+      DB2: "{{ postgres.database('main') }}"
+      TOPIC: "{{ kafka.topic('x') }} {{ redis.prefix }} {{ keycloak.realm }}"
+      SELF: "{{ url }} {{ host }} {{ branch }} {{ ident }} {{ project }} {{ domain }}"
+      DOM: "{{ branch_domain }}"
+    health: /ready
+  front:
+    repo: r
+    run: serve {{ services['music-back'].url }} {{ services['music-back'].host }}
+    port: auto
+    subdomain: ""
+"""
+
+
+def check(tmp_path: Path, text: str) -> dict[str, str]:
+    return render_check(load_catalog(write(tmp_path, text)))
+
+
+def test_render_check_passes_a_good_catalog(tmp_path: Path) -> None:
+    assert check(tmp_path, CHECK) == {}
+
+
+def test_render_check_passes_the_good_catalog_fixture(tmp_path: Path) -> None:
+    assert check(tmp_path, GOOD) == {}
+
+
+@pytest.mark.parametrize(
+    ("replace", "fragment"),
+    [
+        ("run: serve --port {{ port }}", "run: serve {{ nope }}"),
+        ("run: serve --port {{ port }}", "run: serve {{ port "),
+        ("setup: make deps {{ slug }}", "setup: make {{ nope }}"),
+        ('DOM: "{{ branch_domain }}"', 'DOM: "{{ mongo.url }}"'),
+        ('DOM: "{{ branch_domain }}"', 'DOM: "{{ services.nope.url }}"'),
+        ("health: /ready", 'health: "/{{ nope }}"'),
+    ],
+)
+def test_render_check_reports_the_failing_service(
+    tmp_path: Path, replace: str, fragment: str
+) -> None:
+    result = check(tmp_path, CHECK.replace(replace, fragment))
+    assert list(result) == ["music-back"]
+    assert "music-back" in result["music-back"]
+
+
+def test_render_check_names_the_field_and_keeps_the_template_error(tmp_path: Path) -> None:
+    result = check(tmp_path, CHECK.replace("{{ slug }}", "{{ nope }}"))
+    assert result["music-back"].startswith("services.music-back.setup: ")
+    assert "'nope' is undefined" in result["music-back"]
+
+
+def test_render_check_reports_a_syntax_error(tmp_path: Path) -> None:
+    result = check(tmp_path, CHECK.replace("{{ port }}", "{{ port "))
+    assert "bad template" in result["music-back"]
+
+
+def test_render_check_gives_the_hyphen_hint(tmp_path: Path) -> None:
+    text = CHECK.replace("services['music-back'].url", "services.music-back.url")
+    result = check(tmp_path, text)
+    assert list(result) == ["front"]
+    assert "services['music-back'].url" in result["front"]
+
+
+def test_render_check_reports_only_failing_services(tmp_path: Path) -> None:
+    text = CHECK.replace("{{ services['music-back'].url }}", "{{ nope }}")
+    assert list(check(tmp_path, text)) == ["front"]
+
+
+def test_render_check_covers_the_env_of_compose_services(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "    subdomain: api\n", "    subdomain: api\n    env: {X: '{{ nope }}'}\n", 1
+    )
+    assert list(check(tmp_path, text)) == ["back"]

@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from wt.errors import WtError
+from wt.paths import instance
 
 MAX_SLUG = 40  # leaves room for prefixes in DNS labels (63) and Postgres identifiers (63)
 MAX_LABEL = 63
@@ -78,10 +79,10 @@ class Names:
         return f"{subdomain}.{self.branch_domain}" if subdomain else self.branch_domain
 
     def compose_project(self, repo: str) -> str:
-        return fit(f"wt-{self.project}-{self.slug}-{repo}")
+        return fit(f"{instance()}-{self.project}-{self.slug}-{repo}")
 
     def network_alias(self, service: str) -> str:
-        return fit(f"wt-{self.project}-{self.slug}-{service}")
+        return fit(f"{instance()}-{self.project}-{self.slug}-{service}")
 
     @property
     def key(self) -> str:

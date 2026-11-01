@@ -20,27 +20,9 @@ def test_unknown_name_is_an_error() -> None:
         render("{{ nope }}", {"url": ""}, "env.A")
 
 
-def test_upcoming_provider_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    from wt import providers
-
-    monkeypatch.delitem(providers.REGISTRY, "postgres")
-    with pytest.raises(WtError, match=r"postgres provider arrives in v0\.2"):
-        render("{{ postgres.url('shop') }}", {}, "env.A")
-
-
 def test_sandbox_blocks_internals() -> None:
     with pytest.raises(WtError):
         render("{{ ''.__class__.__mro__ }}", {}, "env.A")
-
-
-def test_registered_provider_loses_the_upcoming_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.conftest import FakeProvider
-    from wt import providers
-
-    monkeypatch.setitem(providers.REGISTRY, "postgres", lambda cfg, log: FakeProvider([]))
-    with pytest.raises(WtError) as exc:
-        render("{{ postgres.url('shop') }}", {}, "env.A")
-    assert "arrives in" not in str(exc.value)
 
 
 HOSTILE = ["x;touch {marker}", "$(touch {marker})", "`touch {marker}`", "a&touch {marker}", "it's"]

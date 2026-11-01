@@ -8,10 +8,6 @@ from jinja2 import StrictUndefined, TemplateError, UndefinedError
 from jinja2.sandbox import SandboxedEnvironment
 
 from wt.errors import WtError
-from wt.providers import REGISTRY
-
-# Names reserved for providers that later versions add (docs/SPEC.md §10).
-UPCOMING = {"postgres": "v0.2"}
 
 _env = SandboxedEnvironment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True)
 # `run:` commands go through `sh -c`: every rendered value is shell-quoted (D15).
@@ -41,11 +37,7 @@ def render(value: str, context: dict[str, Any], where: str, quote: bool = False)
     try:
         return env.from_string(value).render(context)
     except UndefinedError as exc:
-        hint = ""
-        for name, version in UPCOMING.items():
-            if name not in REGISTRY and f"'{name}'" in str(exc):
-                hint = f" (the {name} provider arrives in {version})"
-        hint += _hyphen_hint(value, context)
+        hint = _hyphen_hint(value, context)
         known = ", ".join(sorted(context))
         raise WtError(f"{where}: {exc}{hint}. Available: {known}") from exc
     except TemplateError as exc:

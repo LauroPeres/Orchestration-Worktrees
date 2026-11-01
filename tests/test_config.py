@@ -45,6 +45,12 @@ def with_service(**changes: Any) -> dict[str, Any]:
     return data
 
 
+def with_run_service(**changes: Any) -> dict[str, Any]:
+    data = with_service()
+    data["services"]["web"].update(changes)
+    return data
+
+
 def with_infra(infra: dict[str, Any]) -> dict[str, Any]:
     """BASE with `infra` as the shared servers `api` needs."""
     return with_service(infra=infra)
@@ -71,6 +77,10 @@ def test_loads_spec_example(tmp_path: Path) -> None:
         (with_service(subdomain="Bad_Label"), "subdomain"),
         (with_service(health="healthz"), "starting with '/'"),
         (with_service(typo=1), "typo"),
+        (with_service(setup="make deps"), "setup: needs run:"),
+        (with_service(setup_timeout=30), "setup_timeout: needs run:"),
+        (with_run_service(setup_timeout=0), "setup_timeout"),
+        (with_run_service(setup_timeout=3601), "setup_timeout"),
         ({**BASE, "project": "Shop"}, "project"),
         ({**BASE, "domain": "localhost"}, "domain"),
         (with_infra({"keycloak": {"realm": "a/b", "client": "web"}}), "realm"),
@@ -198,3 +208,23 @@ def test_with_uses_on_a_project_catalog_errors(tmp_path: Path) -> None:
         loaded.with_uses([])
     with pytest.raises(WtError, match="unknown service 'nope'"):
         loaded.with_uses(["nope"])
+
+
+def test_setup_defaults_keep_old_files_valid(tmp_path: Path) -> None:
+    web = load(tmp_path, BASE).config.services["web"]
+    assert web.setup is None
+    assert web.setup_timeout == 600
+
+
+def test_setup_flows_into_the_resolved_service(tmp_path: Path) -> None:
+    data = with_run_service(setup="npm ci", setup_timeout=3600)
+    loaded = load(tmp_path, data)
+    web = loaded.config.services["web"]
+    assert (web.setup, web.setup_timeout) == ("npm ci", 3600)
+    api = loaded.config.services["api"]
+    assert (api.setup, api.setup_timeout) == (None, 600)
+
+
+def test_setup_timeout_lower_bound(tmp_path: Path) -> None:
+    web = load(tmp_path, with_run_service(setup="x", setup_timeout=1)).config.services["web"]
+    assert web.setup_timeout == 1

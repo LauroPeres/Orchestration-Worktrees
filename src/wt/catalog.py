@@ -26,6 +26,7 @@ from wt.config import (
 from wt.errors import WtError
 from wt.naming import service_ref
 from wt.paths import wt_home
+from wt.templating import render
 
 CATALOG_NAME = "catalog.yaml"
 LEGACY_NAME = "worktree.yaml"  # the v0.5.x file `wt migrate` reads
@@ -164,6 +165,70 @@ def load_catalog(path: Path) -> LoadedCatalog:
         repo = Path(value).expanduser()
         repos[name] = repo if repo.is_absolute() else (path.parent / repo).resolve()
     return LoadedCatalog(catalog=catalog, path=path, repos=repos)
+
+
+class _Anything(str):
+    """Stands in for a provider in `render_check`: every attribute and every call is 'x'.
+
+    The real providers live in a higher layer, so the model only checks that a template parses
+    and that the plain names it reads exist.
+    """
+
+    def __new__(cls) -> Self:
+        return super().__new__(cls, "x")
+
+    def __getattr__(self, name: str) -> "_Anything":
+        if name.startswith("_") or name in {"unsafe_callable", "alters_data"}:
+            raise AttributeError(name)  # the sandbox probes these: answer "not flagged"
+        return _Anything()
+
+    def __call__(self, *args: object, **kwargs: object) -> "_Anything":
+        return _Anything()
+
+
+def _dummy_context(catalog: Catalog) -> dict[str, Any]:
+    reference = {"url": "https://x.feat-x.example.localhost", "host": "x.feat-x.example.localhost"}
+    context: dict[str, Any] = {
+        "project": "demo",
+        "branch": "feat/x",
+        "slug": "feat-x",
+        "ident": "feat_x",
+        "domain": "example.localhost",
+        "branch_domain": "feat-x.example.localhost",
+        "port": 10000,
+        **reference,
+        "services": {name: {**reference, "port": 10000} for name in catalog.services},
+    }
+    context.update({provider: _Anything() for provider in Shared.model_fields})
+    return context
+
+
+def _render_service(svc: CatalogService, name: str, context: dict[str, Any]) -> None:
+    """Render everything the orchestrator renders for the service; raise `WtError` on the first."""
+    where = f"services.{name}"
+    if svc.run is not None:
+        render(svc.run, context, f"{where}.run", quote=True)
+    if svc.setup is not None:
+        render(svc.setup, context, f"{where}.setup", quote=True)
+    for key, value in svc.env.items():
+        render(value, context, f"{where}.env.{key}")
+    render(svc.health, context, f"{where}.health")
+
+
+def render_check(loaded: LoadedCatalog) -> dict[str, str]:
+    """Render every service's `run`, `setup`, `env` and `health` against dummy values.
+
+    Returns service name -> the first template error; empty when all of them render.
+    """
+    catalog = loaded.catalog
+    context = _dummy_context(catalog)
+    problems = {}
+    for name, svc in catalog.services.items():
+        try:
+            _render_service(svc, name, context)
+        except WtError as exc:
+            problems[name] = str(exc)
+    return problems
 
 
 def worktrees_folder(catalog: Catalog, catalog_file: Path) -> Path | None:
