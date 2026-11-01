@@ -15,7 +15,7 @@ from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
-from wt import __version__, catalog_edit, doctor
+from wt import __version__, cache, catalog_edit, doctor
 from wt.catalog import (
     LEGACY_NAME,
     Catalog,
@@ -1079,6 +1079,128 @@ def migrate(
         _write_validated(target, result)
     adopted = Orchestrator(load_project(target), log=_log).adopt_branches(list(result.uses))
     _report_migration(result, adopted, target, rewrote=rewrite and existing is not None)
+
+
+# ---- wt cache ls | prune (SPEC section 24) ----------------------------------------------------
+
+cache_app = typer.Typer(
+    help="Show or prune the install caches (restored node_modules, uv and npm downloads).",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(cache_app, name="cache")
+
+SIZE_UNITS = ("B", "KiB", "MiB", "GiB")
+BYTES_PER_UNIT = 1024
+KEY_SHOWN = 12  # leading characters of a sha256 key; enough to tell entries apart
+CONFIRM_PRUNE_ALL = "remove the whole install cache and the uv/npm caches?"  # typer adds ` [y/N]`
+
+
+def human_size(size: int) -> str:
+    """`1536` -> `1.5 KiB`: the largest binary unit that keeps the number below 1024."""
+    value = float(size)
+    unit = 0
+    while value >= BYTES_PER_UNIT and unit < len(SIZE_UNITS) - 1:
+        value /= BYTES_PER_UNIT
+        unit += 1
+    if unit == 0:
+        return f"{size} B"
+    return f"{value:.1f}".removesuffix(".0") + f" {SIZE_UNITS[unit]}"
+
+
+def _print_cache(entries: list[cache.Entry], tools: dict[str, int], total: int) -> None:
+    if not entries and not any(tools.values()):
+        console.print("the install cache is empty")
+        return
+    if entries:
+        table = Table()
+        for column in ("KEY", "PRESET", "SERVICE", "SIZE", "LAST USED"):
+            table.add_column(column, justify="right" if column == "SIZE" else "left")
+        for entry in entries:
+            table.add_row(
+                entry.key[:KEY_SHOWN],
+                entry.preset,
+                entry.service,
+                human_size(entry.bytes),
+                entry.last_used,
+            )
+        console.print(table)
+    for tool, size in tools.items():
+        console.print(f"{tool} cache: {human_size(size)}")
+    console.print(f"total: {human_size(total)}")
+
+
+@cache_app.command("ls")
+def cache_ls(json_output: JsonOption = False) -> None:
+    """List the cached installs and the uv/npm caches with their sizes."""
+    with _json_errors(json_output):
+        entries, tools, total = cache.entries(), cache.tool_sizes(), cache.total_bytes()
+        if json_output:
+            _emit(
+                {
+                    "schema": JSON_SCHEMA,
+                    "entries": [
+                        {
+                            "key": e.key,
+                            "preset": e.preset,
+                            "service": e.service,
+                            "bytes": e.bytes,
+                            "last_used": e.last_used,
+                        }
+                        for e in entries
+                    ],
+                    "tools": tools,
+                    "total_bytes": total,
+                }
+            )
+        else:
+            _print_cache(entries, tools, total)
+
+
+@cache_app.command("prune")
+def cache_prune(
+    older_than: Annotated[
+        int,
+        typer.Option(
+            "--older-than", min=0, help="Remove entries not used for more than this many days."
+        ),
+    ] = cache.DEFAULT_PRUNE_DAYS,
+    everything: Annotated[
+        bool,
+        typer.Option("--all", help="Remove every entry and the uv and npm caches (ignores DAYS)."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Remove install entries unused for DAYS days (default 30); with --all, the whole cache."""
+    with _json_errors(json_output):
+        if everything and not yes:
+            if json_output:
+                raise WtError("cache prune --all --json never asks for confirmation: pass --yes")
+            typer.confirm(CONFIRM_PRUNE_ALL, abort=True)
+        result = (
+            cache.prune(older_than_days=None, everything=True)
+            if everything
+            else cache.prune(older_than_days=older_than)
+        )
+        if json_output:
+            _emit(
+                {
+                    "schema": JSON_SCHEMA,
+                    "removed": result.removed,
+                    "bytes_freed": result.bytes_freed,
+                }
+            )
+        else:
+            installs = [name for name in result.removed if name not in cache.TOOLS]
+            noun = "entry" if len(installs) == 1 else "entries"
+            tools = [name for name in result.removed if name in cache.TOOLS]
+            extra = f" and the {' and '.join(tools)} cache" if tools else ""
+            console.print(
+                f"[green]removed {len(installs)} {noun}{extra}, "
+                f"freed {human_size(result.bytes_freed)}[/]"
+            )
 
 
 def main() -> None:

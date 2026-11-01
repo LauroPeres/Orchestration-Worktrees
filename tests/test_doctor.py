@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 import pytest
 
 from tests.conftest import SHOP_CATALOG, write_global_catalog
-from wt import compose, doctor, host, proc, router
+from wt import cache, compose, doctor, host, proc, router
 from wt.config import LoadedConfig, Shared
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
@@ -1004,3 +1004,51 @@ def test_stopped_postgres_keeps_the_not_running_warning(monkeypatch: pytest.Monk
     assert check.level == "warn"
     assert check.detail.endswith("not running")
     assert fake.ensured == []
+
+
+# ---- cache (SPEC section 24) -----------------------------------------------------------------
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+
+
+def _disk(monkeypatch: pytest.MonkeyPatch, *, total: int, free: int) -> None:
+    monkeypatch.setattr(cache, "total_bytes", lambda: total)
+    monkeypatch.setattr(cache, "free_bytes", lambda: free)
+
+
+def test_cache_check_reports_the_size_in_mib(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disk(monkeypatch, total=300 * MIB, free=50 * GIB)
+    assert doctor.check_cache() == doctor.Check(
+        "cache", "info", "300 MiB in the install and tool caches"
+    )
+
+
+def test_an_empty_cache_is_zero_mib(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disk(monkeypatch, total=0, free=50 * GIB)
+    assert doctor.check_cache().detail == "0 MiB in the install and tool caches"
+
+
+def test_cache_check_warns_below_two_gib_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disk(monkeypatch, total=300 * MIB, free=GIB)
+    assert doctor.check_cache() == doctor.Check(
+        "cache",
+        "warn",
+        "low disk space: 1024 MiB free; wt cache prune frees 300 MiB",
+        "wt cache prune --all",
+    )
+
+
+def test_exactly_two_gib_free_is_not_low(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disk(monkeypatch, total=MIB, free=2 * GIB)
+    assert doctor.check_cache().level == "info"
+
+
+def test_cache_check_runs_without_docker_and_without_a_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_run_checks_environment(monkeypatch)
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "fail", "no")])
+    _disk(monkeypatch, total=5 * MIB, free=50 * GIB)
+    checks = _by_name(doctor.run_checks(None, None, fix=False))
+    assert checks["cache"].detail == "5 MiB in the install and tool caches"

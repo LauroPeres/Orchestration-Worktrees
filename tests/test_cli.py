@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from tests.conftest import COMPOSE, SHARED, SHOP_CATALOG, FakeDocker
 from tests.test_catalog_edit import EDIT_CATALOG
-from wt import __version__, catalog_edit, cli, compose, doctor, host, proc
+from wt import __version__, cache, catalog_edit, cli, compose, doctor, host, proc
 from wt.catalog import load_project
 from wt.cli import app
 from wt.errors import WtError
@@ -1887,3 +1887,216 @@ def test_catalog_check_rejects_an_unknown_infra_key_but_the_table_stays_lenient(
     assert check.exit_code == 1, check.output
     assert "unknown infra 'nope'" in check.output
     assert runner.invoke(app, ["catalog"]).exit_code == 0
+
+
+# --- wt cache ls | prune (SPEC §24) ------------------------------------------------------------
+# What is cached and what a prune removes is tested in test_cache.py: here only the options, the
+# printed text and the JSON documents, with the cache functions faked.
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+ENTRY_KEY = "0123456789abcdef" * 4
+
+
+def _entry(key: str = ENTRY_KEY, size: int = 40 * MIB) -> cache.Entry:
+    return cache.Entry(
+        key=key, preset="npm", service="front", bytes=size, last_used="2026-10-30T09:00:00+00:00"
+    )
+
+
+@pytest.fixture
+def fake_cache(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Fake wt.cache; the dict holds what it was called with and what it returns."""
+    calls: dict[str, Any] = {"entries": [_entry()], "tools": {"uv": 12 * MIB, "npm": 0}}
+
+    def prune(*, older_than_days: int | None = 30, everything: bool = False) -> cache.PruneResult:
+        calls["prune"] = {"older_than_days": older_than_days, "everything": everything}
+        return cache.PruneResult(removed=["aa11", "bb22"], bytes_freed=52 * MIB)
+
+    monkeypatch.setattr(cache, "entries", lambda: calls["entries"])
+    monkeypatch.setattr(cache, "tool_sizes", lambda: calls["tools"])
+    monkeypatch.setattr(
+        cache,
+        "total_bytes",
+        lambda: sum(e.bytes for e in calls["entries"]) + sum(calls["tools"].values()),
+    )
+    monkeypatch.setattr(cache, "prune", prune)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("size", "text"),
+    [
+        (0, "0 B"),
+        (1023, "1023 B"),
+        (1024, "1 KiB"),
+        (1536, "1.5 KiB"),
+        (12 * MIB, "12 MiB"),
+        (12 * MIB + MIB // 2, "12.5 MiB"),
+        (GIB, "1 GiB"),
+        (3 * GIB + GIB // 4, "3.2 GiB"),
+        (2048 * GIB, "2048 GiB"),
+    ],
+)
+def test_human_size(size: int, text: str) -> None:
+    assert cli.human_size(size) == text
+
+
+def test_cache_ls_prints_a_table_the_tool_caches_and_the_total(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "ls"])
+    assert result.exit_code == 0, result.output
+    for column in ("KEY", "PRESET", "SERVICE", "SIZE", "LAST USED"):
+        assert column in result.output
+    assert ENTRY_KEY[:12] in result.output
+    assert ENTRY_KEY[:13] not in result.output
+    assert "npm" in result.output and "front" in result.output
+    assert "40 MiB" in result.output
+    assert "2026-10-30T09:00:00+00:00" in result.output
+    assert "uv cache: 12 MiB" in result.output
+    assert "npm cache: 0 B" in result.output
+    assert "total: 52 MiB" in result.output
+
+
+def test_cache_ls_says_when_nothing_is_cached(fake_cache: dict[str, Any]) -> None:
+    fake_cache["entries"] = []
+    fake_cache["tools"] = {"uv": 0, "npm": 0}
+    result = runner.invoke(app, ["cache", "ls"])
+    assert result.exit_code == 0, result.output
+    assert "the install cache is empty" in result.output
+    assert "total:" not in result.output
+
+
+def test_cache_ls_lists_tool_caches_even_without_entries(fake_cache: dict[str, Any]) -> None:
+    fake_cache["entries"] = []
+    result = runner.invoke(app, ["cache", "ls"])
+    assert result.exit_code == 0, result.output
+    assert "uv cache: 12 MiB" in result.output
+    assert "empty" not in result.output
+
+
+def test_cache_ls_json(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "ls", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "schema": 1,
+        "entries": [
+            {
+                "key": ENTRY_KEY,
+                "preset": "npm",
+                "service": "front",
+                "bytes": 40 * MIB,
+                "last_used": "2026-10-30T09:00:00+00:00",
+            }
+        ],
+        "tools": {"uv": 12 * MIB, "npm": 0},
+        "total_bytes": 52 * MIB,
+    }
+
+
+def test_cache_ls_json_when_empty_is_still_a_document(fake_cache: dict[str, Any]) -> None:
+    fake_cache["entries"] = []
+    fake_cache["tools"] = {"uv": 0, "npm": 0}
+    document = json.loads(runner.invoke(app, ["cache", "ls", "--json"]).stdout)
+    assert document == {
+        "schema": 1,
+        "entries": [],
+        "tools": {"uv": 0, "npm": 0},
+        "total_bytes": 0,
+    }
+
+
+def test_cache_prune_defaults_to_thirty_days(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune"])
+    assert result.exit_code == 0, result.output
+    assert fake_cache["prune"] == {"older_than_days": 30, "everything": False}
+    assert "removed 2 entries, freed 52 MiB" in result.output
+
+
+def test_cache_prune_older_than(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--older-than", "7"])
+    assert result.exit_code == 0, result.output
+    assert fake_cache["prune"] == {"older_than_days": 7, "everything": False}
+
+
+def test_cache_prune_older_than_zero_is_allowed_and_negative_is_not(
+    fake_cache: dict[str, Any],
+) -> None:
+    assert runner.invoke(app, ["cache", "prune", "--older-than", "0"]).exit_code == 0
+    assert fake_cache["prune"]["older_than_days"] == 0
+    fake_cache.pop("prune")
+    assert runner.invoke(app, ["cache", "prune", "--older-than", "-1"]).exit_code == 2
+    assert "prune" not in fake_cache
+
+
+def test_cache_prune_says_entry_for_one(
+    fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        cache, "prune", lambda **_: cache.PruneResult(removed=["aa11"], bytes_freed=MIB)
+    )
+    result = runner.invoke(app, ["cache", "prune"])
+    assert "removed 1 entry, freed 1 MiB" in result.output
+
+
+def test_cache_prune_all_asks_first_and_no_aborts(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--all"], input="n\n")
+    assert result.exit_code == 1, result.output
+    assert "remove the whole install cache and the uv/npm caches? [y/N]" in result.output
+    assert "prune" not in fake_cache
+
+
+def test_cache_prune_all_runs_after_yes_answer(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--all"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert fake_cache["prune"] == {"older_than_days": None, "everything": True}
+    assert "removed 2 entries, freed 52 MiB" in result.output
+
+
+def test_cache_prune_all_yes_does_not_ask(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--all", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "[y/N]" not in result.output
+    assert fake_cache["prune"]["everything"] is True
+
+
+def test_cache_prune_json(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "schema": 1,
+        "removed": ["aa11", "bb22"],
+        "bytes_freed": 52 * MIB,
+    }
+
+
+def test_cache_prune_all_json_never_asks_for_confirmation(fake_cache: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["cache", "prune", "--all", "--json"])
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {
+        "schema": 1,
+        "error": "cache prune --all --json never asks for confirmation: pass --yes",
+    }
+    assert "prune" not in fake_cache
+    done = runner.invoke(app, ["cache", "prune", "--all", "--json", "--yes"])
+    assert done.exit_code == 0, done.output
+    assert json.loads(done.stdout)["removed"] == ["aa11", "bb22"]
+
+
+@pytest.mark.parametrize("args", [["ls"], ["prune"]])
+def test_cache_errors_are_one_liners_and_json_documents(
+    fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    def boom(**_: object) -> Any:
+        raise WtError("cannot read the cache at /x: denied")
+
+    for name in ("entries", "tool_sizes", "prune"):
+        monkeypatch.setattr(cache, name, boom)
+    plain = runner.invoke(app, ["cache", *args])
+    assert plain.exit_code == 1, plain.output
+    assert str(plain.exception) == "cannot read the cache at /x: denied"
+    as_json = runner.invoke(app, ["cache", *args, "--json"])
+    assert as_json.exit_code == 1
+    assert json.loads(as_json.stdout) == {
+        "schema": 1,
+        "error": "cannot read the cache at /x: denied",
+    }
