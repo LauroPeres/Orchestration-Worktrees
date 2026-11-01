@@ -437,7 +437,7 @@ def test_create_matches_client_id_exactly_not_by_prefix(fake: FakeProc) -> None:
 
 
 def test_create_without_keycloak_section_fails() -> None:
-    with pytest.raises(WtError, match=r"shared\.keycloak"):
+    with pytest.raises(WtError, match=r"infra\.keycloak"):
         provider(with_keycloak=False).create(ctx())
 
 

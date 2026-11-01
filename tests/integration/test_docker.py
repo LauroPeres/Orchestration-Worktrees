@@ -1,6 +1,7 @@
 """End to end against a real Docker daemon: `pytest -m docker`."""
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -14,11 +15,16 @@ import pytest
 import yaml
 
 from wt import health, naming, router
-from wt.config import load_config
+from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
 
+from .isolation import reserve_free_indexes
+
 pytestmark = pytest.mark.docker
+
+# What `wt add --uses` would pick for each fixture's orchestrator, by project name.
+SELECTION: dict[str, list[str]] = {}
 
 SERVE = Path(__file__).parent.parent / "serve.py"
 IMAGE = "traefik/whoami:v1.10"
@@ -53,6 +59,7 @@ def make_stack(
         pytest.skip("docker is not available")
     instance = f"wtit{free_port()}"
     monkeypatch.setenv("WT_INSTANCE", instance)
+    reserve_free_indexes(Path(os.environ["WT_HOME"]))
     monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
     monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/local/bin")  # no mkcert: self-signed path
@@ -63,9 +70,10 @@ def make_stack(
         "repos": {"api": "./api"},
         "services": services,
     }
-    path = tmp_path / "worktree.yaml"
+    path = tmp_path / "catalog.yaml"
     path.write_text(yaml.safe_dump(config))
-    orch = Orchestrator(load_config(path), log=lambda m: None)
+    SELECTION[instance] = list(services)
+    orch = Orchestrator(load_project(path), log=lambda m: None)
     yield orch
     for branch in list(orch.store.load().branches):
         orch.down(branch, force=True)
@@ -137,6 +145,8 @@ def catalog_orchestrator(
     make_repo("side")
     run = f"{sys.executable} {SERVE} {{{{ port }}}}"
     catalog = {
+        "project": instance,
+        "domain": f"{instance}.localhost",
         "repos": {"api": "./api", "web": "./web", "side": "./side"},
         "services": {
             "api": {
@@ -155,16 +165,10 @@ def catalog_orchestrator(
             "side": {"repo": "side", "run": run, "port": "auto", "subdomain": "side"},
         },
     }
-    (tmp_path / "catalog.yaml").write_text(yaml.safe_dump(catalog))
-    config = {
-        "project": instance,
-        "domain": f"{instance}.localhost",
-        "catalog": "./catalog.yaml",
-        "uses": uses,
-    }
-    path = tmp_path / "worktree.yaml"
-    path.write_text(yaml.safe_dump(config))
-    orch = Orchestrator(load_config(path), log=lambda m: None)
+    path = tmp_path / "catalog.yaml"
+    path.write_text(yaml.safe_dump(catalog))
+    SELECTION[instance] = uses
+    orch = Orchestrator(load_project(path), log=lambda m: None)
     yield orch
     for branch in list(orch.store.load().branches):
         orch.down(branch, force=True)
@@ -191,13 +195,13 @@ def up_retrying(
 ) -> list[ServiceReport]:
     """Another test run may grab a port between free_port() and compose up: retry once."""
     try:
-        return orch.up(branch, timeout=90)
+        return orch.up(branch, uses=SELECTION[orch.cfg.project], timeout=90)
     except WtError as exc:
         if "not available" not in str(exc) and "already allocated" not in str(exc):
             raise
         monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
         monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
-        return orch.up(branch, timeout=90)
+        return orch.up(branch, uses=SELECTION[orch.cfg.project], timeout=90)
 
 
 def env_of(container: str) -> list[str]:
@@ -263,10 +267,15 @@ def test_worktrees_get_formula_ports_and_publish_on_loopback(
         up_retrying(stack, branch, monkeypatch)
 
     branches = stack.store.load().branches
-    assert [branches[b].index for b in ("main", "feat/cart")] == [0, 1]
+    first = branches["main"].index
+    assert first is not None
+    assert [branches[b].index for b in ("main", "feat/cart")] == [first, first + 1]
     main_port = branches["main"].ports["api"]
     cart_port = branches["feat/cart"].ports["api"]
-    assert (main_port, cart_port) == (naming.PORT_BASE, naming.PORT_BASE + 100)
+    assert (main_port, cart_port) == (
+        naming.host_port(first, 0),
+        naming.host_port(first + 1, 0),
+    )
 
     for port in (main_port, cart_port):
         status, body = get(f"http://127.0.0.1:{port}/")

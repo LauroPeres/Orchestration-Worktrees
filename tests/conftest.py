@@ -2,16 +2,17 @@ import os
 import random
 import socket
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
 from wt import compose, health, host, naming, providers, router, tls
 from wt.catalog import load_project
-from wt.config import LoadedConfig, load_config
+from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import BranchContext, Check, Resources
@@ -196,38 +197,49 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
     return fake
 
 
+def selection(o: Orchestrator) -> list[str]:
+    """The selection `o` was loaded with: the `--uses` that creates a branch with its services."""
+    return list(o.loaded.uses)
+
+
 @pytest.fixture
 def orch(make_repo, tmp_path: Path):
+    """Builds an orchestrator over a catalog with `api` and `db` (plus `extra_services`).
+
+    It is loaded with every service selected; create a branch with `uses=selection(o)`.
+    `shared` is the infra of `api`, so every branch gets those shared servers.
+    """
+
     def build(
         env: dict[str, str] | None = None,
         shared: dict[str, object] | None = None,
         extra_services: dict[str, object] | None = None,
         extra_needs: dict[str, list[str]] | None = None,
     ) -> Orchestrator:
-        if not (tmp_path / "shop-api").exists():  # a test may build a second config
+        if not (tmp_path / "shop-api").exists():  # a test may build a second catalog
             make_repo("shop-api", {"docker-compose.yml": COMPOSE})
-        config = {
+        services: dict[str, Any] = {
+            "api": {
+                "repo": "api",
+                "compose": "docker-compose.yml",
+                "port": 8000,
+                "subdomain": "api",
+                "env": env or {"URL": "{{ url }}"},
+                **({"infra": shared} if shared else {}),
+            },
+            "db": {"repo": "api", "compose": "docker-compose.yml"},
+            **(extra_services or {}),
+        }
+        for name, needs in (extra_needs or {}).items():
+            services[name]["needs"] = needs
+        catalog = {
             "project": "shop",
             "domain": "shop.localhost",
             "repos": {"api": "./shop-api"},
-            "services": {
-                "api": {
-                    "repo": "api",
-                    "compose": "docker-compose.yml",
-                    "port": 8000,
-                    "subdomain": "api",
-                    "env": env or {"URL": "{{ url }}"},
-                },
-                "db": {"repo": "api", "compose": "docker-compose.yml"},
-                **(extra_services or {}),
-            },
-            **({"shared": shared} if shared else {}),
+            "services": services,
         }
-        for name, needs in (extra_needs or {}).items():
-            config["services"][name]["needs"] = needs  # type: ignore[index]
-        path = tmp_path / "worktree.yaml"
-        path.write_text(yaml.safe_dump(config))
-        return Orchestrator(load_config(path), log=lambda m: None)
+        loaded = write_global_catalog(tmp_path, catalog, uses=list(services))
+        return Orchestrator(loaded, log=lambda m: None)
 
     return build
 
@@ -256,11 +268,16 @@ SHOP_CATALOG: dict[str, object] = {
 }
 
 
-def write_global_catalog(folder: Path, catalog: dict[str, object]) -> LoadedConfig:
-    """Write `catalog` as the global catalog file in `folder` and load it as the anchor."""
+def write_global_catalog(
+    folder: Path, catalog: Mapping[str, object], uses: list[str] | None = None
+) -> LoadedConfig:
+    """Write `catalog` as the global catalog file in `folder` and load it for `uses`.
+
+    `uses=None` loads the anchor (the first service and its closure).
+    """
     path = folder / "catalog.yaml"
     path.write_text(yaml.safe_dump(catalog))
-    return load_project(path)
+    return load_project(path, uses=uses)
 
 
 @pytest.fixture

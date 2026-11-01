@@ -1,10 +1,12 @@
-"""Terminal UI: one table, one row per worktree, a few green/purple accents (SPEC §16)."""
+"""Terminal UI: a bordered table of worktrees and one page per action (SPEC §16, §21)."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Protocol, Self, cast
+from typing import ClassVar, Protocol, Self, TypeVar, cast
 
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -12,7 +14,8 @@ from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.css.query import NoMatches
 from textual.message import Message
-from textual.screen import ModalScreen, Screen
+from textual.screen import Screen
+from textual.strip import Strip
 from textual.widgets import DataTable, Input, Label, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
@@ -21,6 +24,22 @@ from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 
 REFRESH_SECONDS = 2.0
+GREEN = Style(color="green")  # keys, column names, healthy statuses
+YELLOW = Style(color="yellow")
+RED = Style(color="red")
+# A status shows in color; any other value (`stopped`, `starting`, `-`) keeps the terminal's own.
+STATUS_STYLES: dict[str, Style] = {
+    "up": GREEN,
+    "healthy": GREEN,
+    "ok": GREEN,
+    "degraded": YELLOW,
+    "creating": YELLOW,
+    "removing": YELLOW,
+    "failed": RED,
+    "fail": RED,
+    "unhealthy": RED,
+}
+KEY_GAP = "  "  # separates the `key: words` items of a hint line
 ACTIONS = "enter: services  u: up  d: down  a: add  r: remove  q: quit"
 CONFIRM_REMOVE = (
     "remove {branch}: removes what wt created for it (containers, volumes, databases, "
@@ -46,7 +65,7 @@ class OrchestratorLike(Protocol):
 
     def services(self, branch: str) -> list[RepoRow]: ...
 
-    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None: ...
+    def catalog_choices(self, branch: str | None = None) -> list[Choice]: ...
 
     def configure(self, branch: str, uses: list[str]) -> None: ...
 
@@ -74,15 +93,43 @@ class Row:
         return f"{self.project}\0{self.status.branch if self.status else ''}"
 
 
-GREEN = "green"
-GREEN_STATES = {"up", "healthy"}
-PURPLE = "purple"
 SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
 CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
-NEEDS_CATALOG = "configure needs a catalog project (uses: in worktree.yaml)"
 NOTHING_CHECKED = "check at least one service"
 NO_CATALOG = "no catalog at {path}. Run wt init or wt migrate"
 ENTER_NAME = "Enter name"
+ADD_TITLE = "Add a worktree"
+REMOVE_TITLE = "Remove a worktree"
+INPUT_HINTS = "enter: confirm  esc: cancel"
+CONFIRM_HINTS = "y: yes  n: no  esc: cancel"
+# The table's keys; on a page that asks something they would stack another page on top.
+TABLE_ACTIONS = frozenset({"up_selected", "down_selected", "add_new", "remove_selected"})
+MARKER_CHECKED = "[x] "
+MARKER_UNCHECKED = "[ ] "
+# Textual draws a checkbox as 4 segments (left, inner, right, space) before the option text.
+BUTTON_SEGMENTS = 4
+
+
+def status_style(value: str) -> Style | None:
+    """The color of a status value, or None to leave it in the terminal's own."""
+    return STATUS_STYLES.get(value)
+
+
+def status_cell(value: str) -> Text:
+    """A table cell with the status as written, in the color of its value."""
+    return Text(value, style=status_style(value) or "")
+
+
+def keys_text(line: str) -> Text:
+    """A hint line (`key: words  key: words`) with the keys in green and the words plain."""
+    text = Text()
+    for index, item in enumerate(line.split(KEY_GAP)):
+        key, colon, words = item.partition(":")
+        if index:
+            text.append(KEY_GAP)
+        text.append(key, GREEN)
+        text.append(colon + words)
+    return text
 
 
 def choice_label(choice: Choice, holders: tuple[str, ...] = ()) -> Text:
@@ -102,32 +149,9 @@ def required_note(service: str, holders: tuple[str, ...]) -> str:
     return f"{service} is required by {', '.join(holders)}"
 
 
-def actions_text(actions: str = ACTIONS) -> Text:
-    """The action line with each key (the part before the colon) in green."""
-    text = Text()
-    for i, item in enumerate(actions.split("  ")):
-        key, _, label = item.partition(":")
-        text.append("  " if i else "")
-        text.append(key, style=GREEN)
-        text.append(":" + label)
-    return text
-
-
-def state_text(state: str) -> Text:
-    return Text(state, style=GREEN if state in GREEN_STATES else "")
-
-
 class ServicesScreen(Screen[None]):
     """Repos of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
 
-    CSS = """
-    ServicesScreen { background: $background; }  /* opaque: hide the main table's actions */
-    #services { height: auto; max-height: 1fr; border: solid $foreground; background: transparent; }
-    #services:focus { border: solid $foreground; background-tint: transparent; }
-    DataTable > .datatable--header { text-style: bold; background: transparent; }
-    DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
-    #actions, #message { height: 1; background: transparent; }
-    """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
@@ -143,7 +167,7 @@ class ServicesScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="services", cursor_type="row")
-        yield Static(actions_text(SERVICES_ACTIONS), id="actions")
+        yield Static(keys_text(SERVICES_ACTIONS), id="actions")
         yield Static("", id="message")
 
     def on_mount(self) -> None:
@@ -164,9 +188,6 @@ class ServicesScreen(Screen[None]):
             choices = self._orch().catalog_choices(self.branch)
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.say(error_text(exc))
-            return
-        if choices is None:
-            self.say(NEEDS_CATALOG)
             return
         branch = self.branch
 
@@ -204,8 +225,8 @@ class ServicesScreen(Screen[None]):
             cursor = table.cursor_row
             table.clear()
             for r in rows:
-                port = Text(str(r.port), style=PURPLE) if r.port is not None else Text("-")
-                table.add_row(Text(r.name), state_text(r.status), port, Text(r.url or "-"))
+                port = Text(str(r.port) if r.port is not None else "-")
+                table.add_row(Text(r.name), status_cell(r.status), port, Text(r.url or "-"))
             if rows:
                 table.move_cursor(row=min(cursor, len(rows) - 1))
             if self._failed_shown:
@@ -217,12 +238,29 @@ class ServicesScreen(Screen[None]):
             self._loading = False
 
 
-class ConfirmScreen(ModalScreen[bool]):
+PageResult = TypeVar("PageResult")
+
+
+class PageScreen(Screen[PageResult]):
+    """A full-screen step of an action: a title, the step and its hints; nothing else is shown."""
+
+    def __init__(self, heading: str) -> None:
+        super().__init__()
+        self.heading = heading
+
+    def compose(self) -> ComposeResult:
+        yield Label(Text(self.heading), id="title")
+        yield from self.compose_page()
+
+    def compose_page(self) -> ComposeResult:
+        raise NotImplementedError
+
+
+class ConfirmScreen(PageScreen[bool]):
     """Yes/no question; dismisses with True on `y`, False on `n`/`Enter`/`Escape`."""
 
     CSS = """
-    ConfirmScreen { align: center bottom; background: transparent; }
-    #dialog { width: 100%; height: auto; border: solid; padding: 0 1; }
+    #dialog { width: 100%; height: auto; }
     #dialog Label { width: 100%; }  /* a Label is as wide as its text by default: wrap instead */
     """
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -230,35 +268,36 @@ class ConfirmScreen(ModalScreen[bool]):
         Binding("n,enter,escape", "answer(False)", "No"),
     ]
 
-    def __init__(self, question: str) -> None:
-        super().__init__()
+    def __init__(self, heading: str, question: str) -> None:
+        super().__init__(heading)
         self.question = question
 
-    def compose(self) -> ComposeResult:
+    def compose_page(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text(self.question))
+        yield Static(keys_text(CONFIRM_HINTS), id="hints")
 
     def action_answer(self, value: bool) -> None:
         self.dismiss(value)
 
 
-class InputScreen(ModalScreen[str | None]):
+class InputScreen(PageScreen[str | None]):
     """Single-line prompt; dismisses with the text, or None on Escape."""
 
     CSS = """
-    InputScreen { align: center bottom; background: transparent; }
-    #dialog { width: 100%; height: auto; border: solid; padding: 0 1; }
+    #dialog { width: 100%; height: auto; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, prompt: str) -> None:
-        super().__init__()
+    def __init__(self, heading: str, prompt: str) -> None:
+        super().__init__(heading)
         self.prompt = prompt
 
-    def compose(self) -> ComposeResult:
+    def compose_page(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Label(Text(self.prompt))
-            yield Input(id="answer")
+            yield Input(id="answer", compact=True)
+        yield Static(keys_text(INPUT_HINTS), id="hints")
 
     @on(Input.Submitted)
     def _submitted(self, event: Input.Submitted) -> None:
@@ -284,7 +323,9 @@ class ChoiceList(SelectionList[str]):
 
     def __init__(self, choices: list[Choice]) -> None:
         super().__init__(
-            *[Selection(choice_label(c), c.service, c.selected) for c in choices], id="choices"
+            *[Selection(choice_label(c), c.service, c.selected) for c in choices],
+            id="choices",
+            compact=True,
         )
         self._choices = choices
 
@@ -317,6 +358,19 @@ class ChoiceList(SelectionList[str]):
         for index, choice in enumerate(self._choices):
             self.replace_option_prompt_at_index(index, choice_label(choice, self.holders(choice)))
 
+    def render_line(self, y: int) -> Strip:
+        """Draw `[x]`/`[ ]` in place of Textual's colored checkbox: the state shows as text."""
+        strip = super().render_line(y)
+        index = self.scroll_offset.y + y
+        segments = list(strip)
+        if index >= self.option_count or len(segments) < BUTTON_SEGMENTS:
+            return strip
+        checked = self.get_option_at_index(index).value in self.selected
+        marker = MARKER_CHECKED if checked else MARKER_UNCHECKED
+        # Keep the option meta so a click on the marker still toggles the line.
+        style = (segments[BUTTON_SEGMENTS - 1].style or Style()) + Style(meta={"option": index})
+        return Strip([Segment(marker, style), *segments[BUTTON_SEGMENTS:]])
+
     def toggle(self, selection: Selection[str] | str) -> Self:
         value = selection.value if isinstance(selection, Selection) else selection
         for choice in self._choices:
@@ -326,42 +380,26 @@ class ChoiceList(SelectionList[str]):
         return super().toggle(selection)
 
 
-class ConfigureScreen(ModalScreen[list[str] | None]):
+class ConfigureScreen(PageScreen[list[str] | None]):
     """Check-box list of the catalog services; dismisses with the checked names, None on Escape."""
 
     CSS = """
-    ConfigureScreen { align: center middle; background: transparent; }
-    #dialog { width: auto; min-width: 40; max-width: 100%; height: auto; max-height: 100%;
-              border: solid $foreground; padding: 0 1; background: $surface; }
-    #choices { height: auto; max-height: 20; border: none; padding: 0; background: transparent; }
-    #choices > .selection-list--button { color: $panel; background: $panel; }
-    #choices > .selection-list--button-highlighted { color: $panel; background: $panel; }
-    #choices > .selection-list--button-selected {
-        color: green; background: $panel; text-style: bold;
-    }
-    #choices > .selection-list--button-selected-highlighted {
-        color: green; background: $panel; text-style: bold;
-    }
-    #choices:focus { border: none; background-tint: transparent; }
-    #hints, #error { height: 1; }
-    #error { color: $error; }
+    #choices { height: auto; max-height: 20; }
+    #error { height: 1; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("enter", "confirm", "Confirm", show=False, priority=True),
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, choices: list[Choice], title: str = "Services") -> None:
-        super().__init__()
+    def __init__(self, choices: list[Choice], heading: str = "Services") -> None:
+        super().__init__(heading)
         self.choices = choices
-        self.title_text = title
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Label(Text(self.title_text))
-            yield ChoiceList(self.choices)
-            yield Static(actions_text(CONFIGURE_HINTS), id="hints")
-            yield Static("", id="error")
+    def compose_page(self) -> ComposeResult:
+        yield ChoiceList(self.choices)
+        yield Static(keys_text(CONFIGURE_HINTS), id="hints")
+        yield Static("", id="error")
 
     def on_mount(self) -> None:
         options = self._options
@@ -400,14 +438,31 @@ class WtApp(App[None]):
     """Table of worktrees with up/down/add/remove actions (SPEC §16)."""
 
     TITLE = "wt"
+    # The terminal's own colors, plus green for the column names and keys; the selected row or
+    # option is a green bar (black text). The text input cursor stays reverse video.
     CSS = """
-    Screen { background: transparent; }
-    #table { height: auto; max-height: 1fr; border: solid $foreground; background: transparent; }
-    #table:focus { border: solid $foreground; background-tint: transparent; }
-    DataTable > .datatable--header { text-style: bold; background: transparent; }
-    DataTable > .datatable--cursor { text-style: reverse; background: transparent; }
-    #actions { height: auto; background: transparent; }  /* wraps on a narrow terminal */
-    #message { height: 1; background: transparent; }
+    DataTable { height: auto; max-height: 1fr; border: solid ansi_default; }
+    #actions { height: auto; }  /* wraps on a narrow terminal */
+    #message, #hints { height: 1; }
+    #title { height: 1; margin-bottom: 1; text-style: bold; }
+    DataTable > .datatable--header {
+        text-style: none; background: ansi_default; color: ansi_green;
+    }
+    DataTable > .datatable--hover {
+        text-style: none; background: ansi_default; color: ansi_default;
+    }
+    DataTable > .datatable--cursor,
+    DataTable:focus > .datatable--cursor,
+    OptionList > .option-list--option-highlighted,
+    OptionList:focus > .option-list--option-highlighted,
+    SelectionList > .option-list--option-highlighted,
+    SelectionList:focus > .option-list--option-highlighted {
+        text-style: none; background: ansi_green; color: ansi_black;
+    }
+    Input > .input--cursor, Input > .input--selection {
+        text-style: reverse; background: ansi_default; color: ansi_default;
+    }
+    OptionList > .option-list--option-hover { background: ansi_default; }
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("u", "up_selected", "Up", show=False),
@@ -428,7 +483,8 @@ class WtApp(App[None]):
 
         `missing_catalog` is the catalog file that was looked for and is not there.
         """
-        super().__init__()
+        super().__init__(ansi_color=True)
+        self.set_reactive(App.theme, "ansi-dark")  # background and text are the terminal's own
         if (orch is None) == (projects is None):
             raise ValueError("pass either orch or projects")
         self.orch = orch
@@ -442,7 +498,7 @@ class WtApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="table", cursor_type="row")
-        yield Static(actions_text(), id="actions")
+        yield Static(keys_text(ACTIONS), id="actions")
         yield Static("", id="message")
 
     def on_mount(self) -> None:
@@ -453,9 +509,13 @@ class WtApp(App[None]):
 
     # -- helpers --------------------------------------------------------------------
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """The table's keys do nothing on a page that asks something (they would stack pages)."""
+        return not (action in TABLE_ACTIONS and isinstance(self.screen, PageScreen))
+
     @property
     def _main(self) -> Screen[object]:
-        """The main screen, also while the services screen or a modal is on top."""
+        """The main screen, also while the services screen or a page is on top."""
         return self.screen_stack[0]
 
     @property
@@ -563,7 +623,7 @@ class WtApp(App[None]):
             if name:
                 self._choose_services(project, name)
 
-        self.push_screen(InputScreen(ENTER_NAME), got)
+        self.push_screen(InputScreen(ADD_TITLE, ENTER_NAME), got)
 
     def _choose_services(self, project: str, name: str) -> None:
         """Second step of `a`: pick the catalog services of the new worktree, then add it."""
@@ -595,7 +655,8 @@ class WtApp(App[None]):
                     lambda: self._orch_for(row.project).remove(branch, force=True),
                 )
 
-        self.push_screen(ConfirmScreen(CONFIRM_REMOVE.format(branch=branch)), confirmed)
+        question = CONFIRM_REMOVE.format(branch=branch)
+        self.push_screen(ConfirmScreen(REMOVE_TITLE, question), confirmed)
 
     def start(self, label: str, call: Callable[[], object]) -> None:
         self._busy = True
@@ -671,7 +732,7 @@ class WtApp(App[None]):
             table.clear()
             for r in rows:
                 if r.status is not None:
-                    cells = (Text(r.status.branch), state_text(r.status.status))
+                    cells = (Text(r.status.branch), status_cell(r.status.status))
                 else:
                     cells = (Text(r.project), Text(r.note))
                 table.add_row(*cells, key=r.key)

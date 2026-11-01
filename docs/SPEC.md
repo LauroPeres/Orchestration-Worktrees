@@ -162,7 +162,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
-| v0.6.0 (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
+| v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
 | v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |
@@ -525,10 +525,10 @@ final verify step. A cycle across steps (e.g. through groups) is a WtError befor
   (no pytest-asyncio, no Docker).
 
 **`worktree` command (opens the TUI from any folder).** A second console script, `worktree`
-(`wt.cli:worktree_main`, same `--config`/`WT_CONFIG` option), shares its entry with `wt tui`.
-- Inside a project (a `worktree.yaml` found from the cwd, or `--config`): the TUI of that project,
+(`wt.cli:worktree_main`, same `--catalog`/`WT_CATALOG` option, changed by §21), shares its entry with `wt tui`.
+- With a catalog (§21: `--catalog`, `WT_CATALOG` or `$WT_HOME/catalog.yaml`): the TUI of that project,
   as above.
-- Outside a project: the left pane is a tree, project header then its branches. Projects come from
+- Without one, or with `--all`: the left pane is a tree, project header then its branches. Projects come from
   `$WT_HOME/<project>/state.json` (`src/wt/projects.py`), sorted by name, re-read on every refresh.
   A project with no branches, or whose state file is unreadable, is skipped. Its `config_path`
   gives its config; each project gets its own `Orchestrator`, built lazily on first use.
@@ -694,7 +694,7 @@ port rules of §13 (compose isolation) and §14 (ports).
    action line `c: configure  esc: back  q: quit`, plus a message line. `c` opens a modal with a
    checkbox list (`<service> (<repo>)`): space toggles, enter confirms, esc cancels. Confirm runs
    `configure` as the one running action. For a `services:` project the message is
-   `configure needs a catalog project (uses: in worktree.yaml)`. Colors: the initials of the action
+   `configure needs a catalog project (uses: in worktree.yaml)`. Colors (removed by §21 'TUI look'): the initials of the action
    line are green, PORT values are purple, STATUS `healthy` and `up` are green, everything else is
    plain. This replaces "no colors" in §16.
 9. **`examples/notes`.** `uses: [front, back]`. `back` gets `remote: https://api.staging.notes.example`.
@@ -1005,3 +1005,28 @@ error:   {"schema":1,"error":"<the text the CLI prints>"}      (stdout, exit cod
 
 **Examples.** `examples/shop/bootstrap.sh` and `examples/notes` produce a `catalog.yaml` (the walkthroughs
 use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for `wt migrate` demos.
+
+**Amendments before the release (2026-11-01, from the first hands-on test).**
+- **Worktree location.** The catalog gains an optional key `worktrees` (a folder; `~` expanded, relative
+  = relative to the catalog file). A worktree named `feat-x` (its slug) is created at
+  `<worktrees>/<slug>/<repo>` for every repo of its services, so the worktree folder groups its repos
+  (`~/Projects/Code/wt/test1/music-front`, `.../test1/music-back`, `.../test1/my-discord`). Without the
+  key the folder stays `$WT_HOME/<project>/worktrees/<slug>/<repo>`.
+- **Existing branches keep their place.** The path recorded in the state (`RepoState.path`) wins over
+  the computed one for `up`, `down`, `stop` and `remove`; changing `worktrees` never moves a branch.
+- **Not our folder.** Before creating `<worktrees>/<slug>/<repo>`, if the folder exists, is not empty and is not a git
+  worktree of that repo, `up`/`add` fail before anything else is created:
+  `<path> already exists and was not created by wt; move it, or choose another name or worktrees folder`.
+  (The `<worktrees>/<slug>` folder may exist and be empty or hold only wt worktrees of other repos.)
+  `down`/`remove` delete only the worktree folders wt recorded, and the `<slug>` folder only when empty.
+- **TUI look (replaces the first wording).** A little color, a real table, one screen per action.
+  - Main screen: a bordered table (one row per worktree, columns `NAME` and `STATUS`) whose column
+    names are green, the action line (`enter: services  u: up  d: down  a: add  r: remove  q: quit`) with the key
+    letters in green, and the message line. The selected row (main table, services table, services
+    checklist) is a green bar (black text on green). The STATUS and HEALTH cells are colored by value:
+    `up`, `healthy`, `ok` green; `degraded`, `creating`, `removing` yellow; `failed`, `fail`, `unhealthy`
+    red; `stopped` and the rest plain. Everything else uses the terminal's own colors.
+  - Every action that needs input (full-screen pages, not overlays) clears the page and shows only that step, then returns to the
+    table: `a` shows the "Enter name" input, then the services checklist (own page each); `r` shows
+    the confirmation alone. `u` and `d` act on the selected row and report on the message line.
+  - The services checklist keeps `[x]` markers and `(required by …)` labels as text.

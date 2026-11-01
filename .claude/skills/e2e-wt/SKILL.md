@@ -13,7 +13,7 @@ the real `~/.wt` or the user's projects.
 - `uv run pytest -m docker` — all integration tests (`tests/integration/`, slow).
 - One stack: `uv run pytest -m docker tests/integration/test_example_shop.py`.
 - Stacks: `examples/shop/` (api + worker + web, Postgres, Kafka, Redis, Keycloak) and `examples/notes/`;
-  each has a `bootstrap.sh` that builds its repos, and a `worktree.yaml`.
+  each has a `bootstrap.sh` that builds its repos, and a `catalog.yaml` (shop also keeps `legacy/worktree.yaml` for `wt migrate`).
 
 ## Adversarial cases (always try the ones the change touches)
 - Branch names: `feat/Cart_v2`, very long names, names that slug to the same value, only symbols.

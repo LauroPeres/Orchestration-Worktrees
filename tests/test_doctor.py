@@ -1,10 +1,12 @@
+import copy
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import pytest
 
+from tests.conftest import SHOP_CATALOG, write_global_catalog
 from wt import compose, doctor, host, proc, router
-from wt.config import STARTER, LoadedConfig, load_config
+from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
@@ -438,17 +440,24 @@ def test_keycloak_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> No
     assert check.detail == "compose failed"
 
 
-def _loaded(make_repo, with_postgres: bool) -> LoadedConfig:
-    shared = "shared:\n  postgres:\n    databases: [shop]\n" if with_postgres else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    return load_config(repo / "worktree.yaml")
+def _loaded(make_repo, infra: Mapping[str, object] | None) -> LoadedConfig:
+    """A one-service catalog (repo `app`) whose service needs `infra`."""
+    repo = make_repo("app", {"docker-compose.yml": "services: {app: {image: x}}\n"})
+    service = {"repo": "app", "compose": "docker-compose.yml", "port": 8000, "subdomain": ""}
+    catalog = {
+        "project": "app",
+        "domain": "app.localhost",
+        "repos": {"app": "./app"},
+        "services": {"app": {**service, **({"infra": infra} if infra else {})}},
+    }
+    return write_global_catalog(repo.parent, catalog)
 
 
 @pytest.mark.parametrize("with_postgres", [False, True])
 def test_run_checks_only_checks_postgres_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_postgres: bool
 ) -> None:
-    loaded = _loaded(make_repo, with_postgres)
+    loaded = _loaded(make_repo, {"postgres": {"databases": ["shop"]}} if with_postgres else None)
     calls: list[list[str]] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -470,9 +479,7 @@ def test_run_checks_only_checks_postgres_when_configured(
 def test_run_checks_only_checks_redis_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_redis: bool
 ) -> None:
-    shared = "shared:\n  redis:\n    prefix: true\n" if with_redis else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    loaded = _loaded(make_repo, {"redis": {"prefix": True}} if with_redis else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -494,9 +501,7 @@ def test_run_checks_only_checks_redis_when_configured(
 def test_run_checks_only_checks_kafka_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_kafka: bool
 ) -> None:
-    shared = "shared:\n  kafka:\n    groups: [worker]\n" if with_kafka else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    loaded = _loaded(make_repo, {"kafka": {"groups": ["worker"]}} if with_kafka else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -518,9 +523,8 @@ def test_run_checks_only_checks_kafka_when_configured(
 def test_run_checks_only_checks_keycloak_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_keycloak: bool
 ) -> None:
-    shared = "shared:\n  keycloak:\n    realm: shop\n    client: web\n" if with_keycloak else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    keycloak = {"keycloak": {"realm": "shop", "client": "web"}}
+    loaded = _loaded(make_repo, keycloak if with_keycloak else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -536,6 +540,83 @@ def test_run_checks_only_checks_keycloak_when_configured(
     names = [c.name for c in doctor.run_checks(loaded, None, fix=True)]
     assert ("keycloak" in names) is with_keycloak
     assert calls == ([True] if with_keycloak else [])
+
+
+def _stub_run_checks_environment(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub everything but the shared-provider checks; return the names they get called by."""
+    called: list[str] = []
+    monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
+    monkeypatch.setattr(doctor, "check_tls", lambda fix: doctor.Check("mkcert", "ok", ""))
+    monkeypatch.setattr(doctor, "check_routing", lambda fix: [])
+    monkeypatch.setattr(doctor, "check_resolution", lambda d: doctor.Check("resolver", "ok", ""))
+
+    def fake_postgres(dbs: list[str], fix: bool) -> list[doctor.Check]:
+        called.append("postgres:" + ",".join(dbs))
+        return [doctor.Check("postgres", "ok", "")]
+
+    def fake_server(name: str) -> Callable[..., doctor.Check]:
+        def check(*, fix: bool) -> doctor.Check:
+            called.append(name)
+            return doctor.Check(name, "ok", "")
+
+        return check
+
+    monkeypatch.setattr(doctor, "check_postgres", fake_postgres)
+    for name in ("redis", "kafka", "keycloak"):
+        monkeypatch.setattr(doctor, f"check_{name}", fake_server(name))
+    return called
+
+
+def _infra_catalog(infra: dict[str, dict[str, object]]) -> dict[str, object]:
+    """SHOP_CATALOG with `infra` per service name (back is the anchor: first in catalog order)."""
+    services = copy.deepcopy(SHOP_CATALOG["services"])
+    assert isinstance(services, dict)
+    for name, value in infra.items():
+        services[name]["infra"] = value
+    return {**SHOP_CATALOG, "services": services}
+
+
+def test_catalog_run_checks_covers_the_infra_of_every_service(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    catalog = _infra_catalog(
+        {"back": {"postgres": {"databases": ["shop"]}}, "front": {"redis": {}}}
+    )
+    loaded = write_global_catalog(tmp_path, catalog)
+    assert loaded.config.shared.redis is None  # the anchor (back) alone would miss redis
+    doctor.run_checks(loaded, None, fix=False)
+    assert sorted(called) == ["postgres:shop", "redis"]
+
+
+def test_catalog_run_checks_merges_postgres_databases(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    catalog = _infra_catalog(
+        {
+            "back": {"postgres": {"databases": ["shop"]}},
+            "front": {"postgres": {"databases": ["shop", "web"]}},
+        }
+    )
+    doctor.run_checks(write_global_catalog(tmp_path, catalog), None, fix=False)
+    assert called == ["postgres:shop,web"]
+
+
+def test_catalog_run_checks_reports_an_unreadable_catalog(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    loaded = write_global_catalog(tmp_path, _infra_catalog({"back": {"redis": {}}}))
+    loaded.path.write_text("services: [")
+    checks = doctor.run_checks(loaded, None, fix=False)
+    assert called == []
+    failed = [c for c in checks if c.name == "catalog"]
+    assert [c.level for c in failed] == ["fail"]
 
 
 def _record_process(port: int | None) -> None:

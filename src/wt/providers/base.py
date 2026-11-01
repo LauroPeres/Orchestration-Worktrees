@@ -79,4 +79,4 @@ class Provider(Protocol):
         """Remove the slice. Safe on a half-created or missing one."""
 
     def template_vars(self, ctx: BranchContext, kind: Kind) -> dict[str, Any]:
-        """Names for {{ }} in worktree.yaml; `kind` is the service kind that renders them."""
+        """Names for {{ }} in the catalog; `kind` is the service kind that renders them."""

@@ -1,6 +1,6 @@
 ---
 name: config-and-naming
-description: How wt's pure model is written — the worktree.yaml pydantic schema (Strict models, validators, error formatting), the catalog (uses:), deterministic names and ports, sandboxed Jinja templating with shell quoting, and paths. Use when changing src/wt/{config,catalog,naming,templating,paths,errors}.py.
+description: How wt's pure model is written — the catalog.yaml pydantic schema (Strict models, validators, error formatting), `load_project` and `merge_legacy`, deterministic names and ports, sandboxed Jinja templating with shell quoting, and paths. Use when changing src/wt/{config,catalog,naming,templating,paths,errors}.py.
 ---
 
 # Config and naming — wt model

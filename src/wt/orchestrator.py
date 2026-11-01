@@ -103,7 +103,7 @@ def _kind(svc: Service) -> Literal["compose", "run"]:
 class ComposeGroup:
     repo: str
     file: str  # compose file, relative to the repo root
-    services: list[str]  # worktree.yaml service names in this group
+    services: list[str]  # catalog service names in this group
 
 
 @dataclass(frozen=True)
@@ -149,18 +149,18 @@ class Orchestrator:
         """This orchestrator, or one built on the branch's selection (§17 D-a, §21).
 
         The stored selection always wins. `uses` (an explicit choice when creating) only counts
-        for a catalog project whose branch has none yet; worktree.yaml projects ignore it.
+        for a branch that has none yet.
         """
         bs = self.store.load().branches.get(branch)
         stored = None if bs is None else bs.uses
         if stored is not None:
-            if uses is not None and self.loaded.from_catalog:
+            if uses is not None:
                 self.log(
                     f"branch {branch} already has services {','.join(stored)}; "
                     "keeping them (use configure to change)"
                 )
             return self._with_selection(stored)
-        if uses is not None and self.loaded.from_catalog:
+        if uses is not None:
             return self._with_selection(uses)
         return self
 
@@ -170,16 +170,15 @@ class Orchestrator:
         return Orchestrator(self.loaded.with_uses(uses), self.log, self.out)
 
     def _for_creating(self, branch: str, uses: list[str] | None) -> "Orchestrator":
-        """`_for` for `up` and `add`: a catalog branch must come with a selection (§21)."""
-        if self.loaded.from_catalog:
-            bs = self.store.load().branches.get(branch)
-            if bs is None or bs.uses is None:
-                if uses is None:
-                    raise WtError(
-                        f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
-                    )
-                if not uses:
-                    raise WtError("choose at least one service (wt add <b> --uses a,b)")
+        """`_for` for `up` and `add`: a branch must come with a selection (§21)."""
+        bs = self.store.load().branches.get(branch)
+        if bs is None or bs.uses is None:
+            if uses is None:
+                raise WtError(
+                    f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
+                )
+            if not uses:
+                raise WtError("choose at least one service (wt add <b> --uses a,b)")
         return self._for(branch, uses)
 
     # ---- naming helpers -------------------------------------------------------------------
@@ -188,7 +187,16 @@ class Orchestrator:
         return Names(self.cfg.project, branch, self.cfg.domain)
 
     def worktree_target(self, names: Names, repo: str) -> Path:
-        return project_dir(self.cfg.project) / "worktrees" / names.slug / repo
+        """Where the worktree of `repo` lives: the recorded path wins, so a branch never moves."""
+        bs = self.store.load().branches.get(names.branch)
+        if bs is not None and repo in bs.repos:
+            return Path(bs.repos[repo].path)
+        return self._slug_dir(names) / repo
+
+    def _slug_dir(self, names: Names) -> Path:
+        """The folder that groups the worktrees of one branch (§21 "Worktree location")."""
+        root = self.loaded.worktrees_dir or project_dir(self.cfg.project) / "worktrees"
+        return root / names.slug
 
     def branch_dir(self, names: Names) -> Path:
         return project_dir(self.cfg.project) / "branches" / names.slug
@@ -296,7 +304,7 @@ class Orchestrator:
             bs.updated_at = now()
 
     def _log_warnings(self) -> None:
-        """The notes `load_config` produced, e.g. a `remote:` the stack makes irrelevant."""
+        """The notes `load_project` produced, e.g. a `remote:` the stack makes irrelevant."""
         for warning in self.loaded.warnings:
             self.log(f"warning: {warning}")
 
@@ -319,6 +327,7 @@ class Orchestrator:
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         self._log_warnings()
         with self._branch_lock(names):
+            self._check_worktree_targets(names)
             self._check_hosts_free(names)
             envs, commands, ports = self._reserve(branch, names)
 
@@ -385,6 +394,25 @@ class Orchestrator:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
 
+    def _check_worktree_targets(self, names: Names) -> None:
+        """Fail `up` and `add` before anything is created when a target folder is not ours.
+
+        A folder that already holds something other than a worktree of the repo (a file, or a
+        non-empty folder) is never touched. A branch that has its worktree recorded is exempt.
+        """
+        recorded = self.store.load().branches.get(names.branch)
+        for repo in self.cfg.repos:
+            if recorded is not None and repo in recorded.repos:
+                continue
+            target = self.worktree_target(names, repo)
+            if _holds_foreign_content(target) and not _is_worktree_of(
+                self.loaded.repo_path(repo), target
+            ):
+                raise WtError(
+                    f"{target} already exists and was not created by wt; move it, or choose "
+                    "another name or worktrees folder"
+                )
+
     def _check_hosts_free(self, names: Names) -> None:
         """Fail `up` before anything is created when another route file already routes a host.
 
@@ -430,10 +458,10 @@ class Orchestrator:
                     current = state.branches.setdefault(
                         branch, BranchState(branch=branch, slug=names.slug)
                     )
-                    if self.loaded.from_catalog and current.uses is None:
+                    if current.uses is None:
                         # The explicit choice, not the closure: later operations rebuild the
                         # same stack from it through `_for` (like `configure`).
-                        current.uses = list(self.loaded.uses or ())
+                        current.uses = list(self.loaded.uses)
                     current.status = "creating"
                     current.index = index
                     current.ports = dict(ports)
@@ -457,6 +485,7 @@ class Orchestrator:
             if branch in self.store.load().branches:
                 self.log(f"branch {branch} is already known; nothing to add")
                 return False
+            self._check_worktree_targets(names)
             self._reserve(branch, names)
             try:
                 self._up_worktrees(branch, names)
@@ -703,7 +732,9 @@ class Orchestrator:
                 bs.repos[repo] = RepoState(
                     source=str(source),
                     path=str(res.path),
-                    created=res.created,
+                    # wt never claims a checkout it did not create: git reports the recorded
+                    # path (the repo's own folder) as "ours" because it is the target
+                    created=res.created and (before is None or before.created),
                     branch_created=res.branch_created or bool(before and before.branch_created),
                 )
 
@@ -911,7 +942,7 @@ class Orchestrator:
         for repo in sorted(set(self.cfg.repos) | set(bs.repos if bs else [])):
             recorded = bs.repos.get(repo) if bs else None
             if recorded is not None:
-                if recorded.created:
+                if recorded.created and self._is_removable(recorded):
                     removals.append((Path(recorded.source), Path(recorded.path)))
             elif repo in self.cfg.repos and self.worktree_target(names, repo).exists():
                 source, target = self.loaded.repo_path(repo), self.worktree_target(names, repo)
@@ -953,9 +984,8 @@ class Orchestrator:
         for source, path in removals:
             self.log(f"removing worktree {path}")
             git.remove_worktree(source, path, force=force)
-        slug_dir = self.worktree_target(names, "x").parent
-        if slug_dir.is_dir() and not any(slug_dir.iterdir()):
-            slug_dir.rmdir()
+        for slug_dir in {self._slug_dir(names), *(path.parent for _, path in removals)}:
+            _remove_if_empty(slug_dir)
 
         with ports_lock():
             with self.store.edit() as state:
@@ -964,6 +994,16 @@ class Orchestrator:
         sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
         sources.update({r: Path(s.source) for r, s in (bs.repos if bs else {}).items()})
         return sources
+
+    def _is_removable(self, recorded: RepoState) -> bool:
+        """False when the record is the repo's own folder: git refuses it, so wt must not try."""
+        if Path(recorded.path).resolve() != Path(recorded.source).resolve():
+            return True
+        self.log(
+            f"[yellow]warning:[/] {recorded.path} is the repo's main checkout; "
+            "left in place, wt does not remove it"
+        )
+        return False
 
     def _down_processes(self, branch: str, bs: BranchState | None) -> None:
         for name, ps in (bs.processes if bs else {}).items():
@@ -1150,14 +1190,12 @@ class Orchestrator:
             return "unhealthy"
         return "healthy"
 
-    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
+    def catalog_choices(self, branch: str | None = None) -> list[Choice]:
         """Every catalog service with its repo and its place in the branch's stack (§20).
 
         Without a branch (one that is about to be created) nothing is selected and `required_by`
         lists each service's direct consumers in the whole catalog.
         """
-        if self.loaded.uses is None or self.loaded.catalog is None:
-            return None
         if branch is None:
             catalog = load_catalog(self.loaded.catalog).catalog
             return [
@@ -1169,7 +1207,7 @@ class Orchestrator:
         mine = self._for(branch).loaded
         catalog = load_catalog(self.loaded.catalog).catalog
         stack = list(mine.config.services)
-        explicit = set(mine.uses or ())
+        explicit = set(mine.uses)
 
         def required_by(name: str) -> tuple[str, ...]:
             if name in explicit or name not in stack:
@@ -1276,6 +1314,17 @@ def _is_worktree_of(repo: Path, path: Path) -> bool:
     except WtError:
         return False
     return any(tree.path.resolve() == path.resolve() for tree in trees)
+
+
+def _holds_foreign_content(path: Path) -> bool:
+    """True when `path` is a file or a folder with something in it (an empty folder is fine)."""
+    return path.exists() and (not path.is_dir() or any(path.iterdir()))
+
+
+def _remove_if_empty(folder: Path) -> None:
+    """Never `rmtree`: a folder that holds anything is somebody's and stays."""
+    if folder.is_dir() and not any(folder.iterdir()):
+        folder.rmdir()
 
 
 def _env_hash(env: dict[str, str]) -> str:

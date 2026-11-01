@@ -4,9 +4,12 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.conftest import write_global_catalog
 from wt.catalog import load_project
-from wt.config import STARTER, Config, find_config, load_config
+from wt.config import Config, LoadedConfig
 from wt.errors import WtError
+
+SHARED = {"postgres": {"databases": ["shop"]}, "kafka": {"groups": ["orders"]}}
 
 BASE: dict[str, Any] = {
     "project": "shop",
@@ -19,6 +22,7 @@ BASE: dict[str, Any] = {
             "port": 8000,
             "subdomain": "api",
             "env": {"X": "{{ url }}"},
+            "infra": SHARED,
         },
         "web": {
             "repo": "web",
@@ -27,14 +31,12 @@ BASE: dict[str, Any] = {
             "subdomain": "",
         },
     },
-    "shared": {"postgres": {"databases": ["shop"]}, "kafka": {"groups": ["orders"]}},
 }
 
 
-def write(tmp_path: Path, data: dict[str, Any]) -> Path:
-    path = tmp_path / "worktree.yaml"
-    path.write_text(yaml.safe_dump(data))
-    return path
+def load(tmp_path: Path, data: dict[str, Any]) -> LoadedConfig:
+    """Write `data` as the catalog and load it with every service selected."""
+    return write_global_catalog(tmp_path, data, uses=list(data["services"]))
 
 
 def with_service(**changes: Any) -> dict[str, Any]:
@@ -43,40 +45,18 @@ def with_service(**changes: Any) -> dict[str, Any]:
     return data
 
 
+def with_infra(infra: dict[str, Any]) -> dict[str, Any]:
+    """BASE with `infra` as the shared servers `api` needs."""
+    return with_service(infra=infra)
+
+
 def test_loads_spec_example(tmp_path: Path) -> None:
-    loaded = load_config(write(tmp_path, BASE))
+    loaded = load(tmp_path, BASE)
     cfg = loaded.config
     assert cfg.project == "shop"
     assert cfg.services["web"].port == "auto"
     assert cfg.shared.configured() == ["postgres", "kafka"]
     assert loaded.repo_path("api") == (tmp_path / "../shop-api").resolve()
-
-
-def test_starter_is_valid(tmp_path: Path) -> None:
-    path = tmp_path / "worktree.yaml"
-    path.write_text(STARTER.format(project="demo"))
-    assert load_config(path).config.services["app"].env["PUBLIC_URL"] == "{{ url }}"
-
-
-def test_starter_examples_validate_when_uncommented(tmp_path: Path) -> None:
-    text = STARTER.format(project="demo")
-    base, marker, rest = text.partition("# --- examples")
-    assert marker
-    examples = rest.splitlines()[1:]  # drop the rest of the marker line
-    assert all(line.startswith("# ") for line in examples)
-    assert "#   web:" in examples
-    assert "#   postgres:" in examples
-    uncommented = "\n".join(line.removeprefix("# ") for line in examples)
-    path = tmp_path / "worktree.yaml"
-    path.write_text(base + uncommented + "\n")
-    cfg = load_config(path).config
-    web = cfg.services["web"]
-    assert web.run == "npm run dev -- --host 0.0.0.0 --port {{ port }}"
-    assert web.port == "auto"
-    assert web.env["DATABASE_URL"] == "{{ postgres.url('app') }}"
-    assert cfg.shared.postgres is not None
-    assert cfg.shared.postgres.databases == ["app"]
-    assert cfg.shared.postgres.base_branch == "main"
 
 
 @pytest.mark.parametrize(
@@ -93,51 +73,42 @@ def test_starter_examples_validate_when_uncommented(tmp_path: Path) -> None:
         (with_service(typo=1), "typo"),
         ({**BASE, "project": "Shop"}, "project"),
         ({**BASE, "domain": "localhost"}, "domain"),
-        ({**BASE, "shared": {"keycloak": {"realm": "a/b", "client": "web"}}}, "realm"),
-        ({**BASE, "shared": {"keycloak": {"realm": "shop", "client": "we b"}}}, "client"),
-        ({**BASE, "shared": {"keycloak": {"realm": "", "client": "web"}}}, "realm"),
+        (with_infra({"keycloak": {"realm": "a/b", "client": "web"}}), "realm"),
+        (with_infra({"keycloak": {"realm": "shop", "client": "we b"}}), "client"),
+        (with_infra({"keycloak": {"realm": "", "client": "web"}}), "realm"),
     ],
 )
 def test_rejects_invalid(tmp_path: Path, data: dict[str, Any], message: str) -> None:
     with pytest.raises(WtError, match=message):
-        load_config(write(tmp_path, data))
+        load(tmp_path, data)
 
 
 def test_one_compose_file_per_repo(tmp_path: Path) -> None:
     data = yaml.safe_load(yaml.safe_dump(BASE))
     data["services"]["worker"] = {"repo": "api", "compose": "other.yml"}
     with pytest.raises(WtError, match="two compose files"):
-        load_config(write(tmp_path, data))
+        load(tmp_path, data)
 
 
 def test_bad_yaml(tmp_path: Path) -> None:
-    path = tmp_path / "worktree.yaml"
+    path = tmp_path / "catalog.yaml"
     path.write_text("project: [unclosed")
     with pytest.raises(WtError, match="not valid YAML"):
-        load_config(path)
-
-
-def test_find_config_walks_up(tmp_path: Path) -> None:
-    path = write(tmp_path, BASE)
-    deep = tmp_path / "a" / "b"
-    deep.mkdir(parents=True)
-    assert find_config(deep) == path
+        load_project(path)
 
 
 def test_postgres_base_branch_default_and_override(tmp_path: Path) -> None:
-    pg = load_config(write(tmp_path, BASE)).config.shared.postgres
+    pg = load(tmp_path, BASE).config.shared.postgres
     assert pg is not None and pg.base_branch == "main"
-    data = yaml.safe_load(yaml.safe_dump(BASE))
-    data["shared"]["postgres"]["base_branch"] = "develop"
-    pg = load_config(write(tmp_path, data)).config.shared.postgres
+    data = with_infra({"postgres": {"databases": ["shop"], "base_branch": "develop"}})
+    pg = load(tmp_path, data).config.shared.postgres
     assert pg is not None and pg.base_branch == "develop"
 
 
 def test_postgres_base_branch_must_be_a_string(tmp_path: Path) -> None:
-    data = yaml.safe_load(yaml.safe_dump(BASE))
-    data["shared"]["postgres"]["base_branch"] = ["main"]
+    data = with_infra({"postgres": {"databases": ["shop"], "base_branch": ["main"]}})
     with pytest.raises(WtError, match="base_branch"):
-        load_config(write(tmp_path, data))
+        load(tmp_path, data)
 
 
 def _needs(**needs: list[str]) -> dict:  # type: ignore[type-arg]
@@ -167,15 +138,15 @@ def test_needs_cycle_message() -> None:
 def test_keycloak_realm_and_client_reject_dash_or_dot_first(tmp_path: Path, bad: str) -> None:
     for key in ("realm", "client"):
         keycloak = {"realm": "shop", "client": "web", key: bad}
-        data = {**BASE, "shared": {"keycloak": keycloak}}
+        data = with_infra({"keycloak": keycloak})
         with pytest.raises(WtError, match=key):
-            load_config(write(tmp_path, data))
+            load(tmp_path, data)
 
 
 @pytest.mark.parametrize("key", ["realm", "client"])
 def test_keycloak_name_accepts_64_characters(tmp_path: Path, key: str) -> None:
     keycloak = {"realm": "shop", "client": "web", key: "a" * 64}
-    cfg = load_config(write(tmp_path, {**BASE, "shared": {"keycloak": keycloak}})).config
+    cfg = load(tmp_path, with_infra({"keycloak": keycloak})).config
     assert cfg.shared.keycloak is not None
     assert getattr(cfg.shared.keycloak, key) == "a" * 64
 
@@ -183,13 +154,13 @@ def test_keycloak_name_accepts_64_characters(tmp_path: Path, key: str) -> None:
 @pytest.mark.parametrize("key", ["realm", "client"])
 def test_keycloak_name_rejects_65_characters_naming_the_field(tmp_path: Path, key: str) -> None:
     keycloak = {"realm": "shop", "client": "web", key: "a" * 65}
-    with pytest.raises(WtError, match=rf"shared\.keycloak\.{key}: .*at most 64 characters"):
-        load_config(write(tmp_path, {**BASE, "shared": {"keycloak": keycloak}}))
+    with pytest.raises(WtError, match=rf"infra\.keycloak\.{key}: .*at most 64 characters"):
+        load(tmp_path, with_infra({"keycloak": keycloak}))
 
 
 def test_keycloak_realm_and_client_accept_dots_dashes_and_case(tmp_path: Path) -> None:
-    data = {**BASE, "shared": {"keycloak": {"realm": "Shop.v1_x-2", "client": "Web-App"}}}
-    cfg = load_config(write(tmp_path, data)).config
+    data = with_infra({"keycloak": {"realm": "Shop.v1_x-2", "client": "Web-App"}})
+    cfg = load(tmp_path, data).config
     assert cfg.shared.keycloak is not None
     assert cfg.shared.keycloak.realm == "Shop.v1_x-2"
 
@@ -210,9 +181,7 @@ def test_with_uses_on_a_project_catalog_re_resolves_it(tmp_path: Path) -> None:
     path = tmp_path / "catalog.yaml"
     path.write_text(CATALOG)
     loaded = load_project(path, ["front"])
-    assert loaded.from_catalog
     other = loaded.with_uses(["admin"])
-    assert other.from_catalog
     assert other.uses == ("admin",)
     assert list(other.config.services) == ["admin"]
     assert other.path == other.catalog == path
@@ -229,7 +198,3 @@ def test_with_uses_on_a_project_catalog_errors(tmp_path: Path) -> None:
         loaded.with_uses([])
     with pytest.raises(WtError, match="unknown service 'nope'"):
         loaded.with_uses(["nope"])
-
-
-def test_a_worktree_yaml_is_not_from_a_catalog(tmp_path: Path) -> None:
-    assert not load_config(write(tmp_path, BASE)).from_catalog

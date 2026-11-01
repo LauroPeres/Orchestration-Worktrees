@@ -1,3 +1,6 @@
+# The notes catalog. `wt add <branch> --uses front` brings the back along (front consumes it).
+project: notes
+domain: notes.localhost
 repos:
   notes-back: ./notes-back
   notes-front: ./notes-front

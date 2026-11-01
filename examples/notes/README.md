@@ -2,9 +2,9 @@
 
 A small notes app split in two repos: `notes-back` (an HTTP API in Docker with a Postgres
 database) and `notes-front` (a host process serving one page). The two are described in a
-catalog, and the worktree says `uses: [front]`: the front consumes the back, so selecting it
-brings the back along. Each branch gets its own front, back and database. `feat/tags` adds a `tags`
-column to the back. Everything here is fictional.
+catalog; the front consumes the back, so `wt add <branch> --uses front` brings the back
+along. Each branch gets its own front, back and database. `feat/tags` adds a `tags` column to
+the back. Everything here is fictional.
 
 ## Prerequisites
 
@@ -22,14 +22,17 @@ examples/notes/bootstrap.sh /tmp/notes
 ```
 
 This creates `/tmp/notes/notes-back` (branches `main` and `feat/tags`), `/tmp/notes/notes-front`
-(branch `main`), `/tmp/notes/catalog.yaml` and `/tmp/notes/worktree.yaml`. The worktree points
-at the local catalog (`catalog: ./catalog.yaml`), so your own `~/.wt/catalog.yaml` is never read
-or changed. The script refuses to use a non-empty directory.
+(branch `main`) and `/tmp/notes/catalog.yaml`. Select that catalog with `WT_CATALOG` (or
+`--catalog`), so your own `~/.wt/catalog.yaml` is never read or changed. The script refuses to use
+a non-empty directory.
+
+```bash
+export WT_CATALOG=/tmp/notes/catalog.yaml
+```
 
 ## 2. Look at the catalog
 
 ```bash
-cd /tmp/notes
 wt catalog           # services, repos, kind, infra, consumes, consumed by
 wt catalog --check   # validates it
 ```
@@ -38,8 +41,8 @@ wt catalog --check   # validates it
 
 ```bash
 wt doctor --fix
-wt up main
-wt up feat/tags
+wt up main --uses front
+wt up feat/tags --uses front
 ```
 
 Infrastructure (Traefik, Postgres) starts first, then the back, then the front, because the

@@ -1,4 +1,4 @@
-"""Resolve {{ }} values in worktree.yaml, per branch."""
+"""Resolve {{ }} values in the catalog, per branch."""
 
 import re
 import shlex
