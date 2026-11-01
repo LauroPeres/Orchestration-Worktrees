@@ -1191,11 +1191,18 @@ planned as v0.7.1; after v0.8.0 they ship as v0.8.1.
 
 **Keycloak dev users (v0.8.1).** `infra.keycloak.users: list[{username: str, password: str, email: str | None,
 roles: list[str]}] = []` (usernames unique, `[A-Za-z0-9._-]{1,64}`, non-empty password).
-- In the shared realm, on `create`: a missing user is created (`enabled`, `emailVerified`), its password is set
-  to the configured value on every `up` (idempotent), missing realm roles are created and assigned.
+- In the shared realm, on `create`: a missing user is created with `enabled=true`, `emailVerified=true` and the
+  profile Keycloak 26 requires before a login works: `firstName` = the username, `lastName` = `wt`, and `email`
+  as configured or `<username>@wt.invalid` (found with a real server: without them the login fails with
+  `Account is not fully set up`). Its password is set to the configured value on every `up` (idempotent),
+  missing realm roles are created and assigned.
 - Users are shared by all branches of the realm and are never deleted by `down` (like the realm itself, §19).
 - Passwords are development values: they never appear in logs, errors or `--json` output (an error names the
-  user, not the password); the kcadm calls pass the password through the process environment, not argv.
+  user, not the password), and in no process argument on the machine, host or container: wt json-encodes
+  `{"type":"password","value":…,"temporary":false}` on the host, hands it to the container in an environment
+  variable (`docker exec -e VAR`, no value in argv) and the in-container script feeds it to
+  `kcadm.sh create users/<id>/reset-password -f -` through a shell built-in pipe (`printf`), so no process ever
+  has the password in its arguments.
 - Errors keep the form `keycloak: <reason> (kcadm.sh <verb> <resource>)`.
 - `wt catalog --check` rejects duplicate usernames and an empty password.
 
