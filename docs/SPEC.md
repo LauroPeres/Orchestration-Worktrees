@@ -1005,3 +1005,21 @@ error:   {"schema":1,"error":"<the text the CLI prints>"}      (stdout, exit cod
 
 **Examples.** `examples/shop/bootstrap.sh` and `examples/notes` produce a `catalog.yaml` (the walkthroughs
 use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for `wt migrate` demos.
+
+**Amendments before the release (2026-11-01, from the first hands-on test).**
+- **Worktree location.** The catalog gains an optional key `worktrees` (a folder; `~` expanded, relative
+  = relative to the catalog file). A worktree named `feat-x` (its slug) is created at
+  `<worktrees>/<slug>/<repo>` for every repo of its services, so the worktree folder groups its repos
+  (`~/Projects/Code/wt/test1/music-front`, `.../test1/music-back`, `.../test1/my-discord`). Without the
+  key the folder stays `$WT_HOME/<project>/worktrees/<slug>/<repo>`.
+- **Existing branches keep their place.** The path recorded in the state (`RepoState.path`) wins over
+  the computed one for `up`, `down`, `stop` and `remove`; changing `worktrees` never moves a branch.
+- **Not our folder.** Before creating `<worktrees>/<slug>/<repo>`, if the folder exists and is not a git
+  worktree of that repo, `up`/`add` fail before anything else is created:
+  `<path> already exists and was not created by wt; move it, or choose another name or worktrees folder`.
+  (The `<worktrees>/<slug>` folder may exist and be empty or hold only wt worktrees of other repos.)
+  `down`/`remove` delete only the worktree folders wt recorded, and the `<slug>` folder only when empty.
+- **TUI look.** No colors, backgrounds or borders: every widget uses the terminal's own colors. The
+  screen is the table (one row per worktree), the action line and the message line, redrawn in place
+  (the table refreshes every 2 s and after each action). Input and confirm boxes are plain text boxes.
+  The services checklist keeps its `[x]` markers and `(required by …)` labels as text only.
