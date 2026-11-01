@@ -161,7 +161,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.3 ✔ | Bug fixes (stale Traefik mounts, live `ls` status), `wt tui`, user catalog (`uses:`), `examples/notes`, services view, selection, deterministic ports (§17) |
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
-| v0.5.1 (in progress, §20) | Stabilise (stale-port rule, destroy errors, one deadline) and dependencies run together |
+| v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
 | later | shared dependency caches, plugin entry points, native Windows |
 
 ## 11. Clean-room rules
