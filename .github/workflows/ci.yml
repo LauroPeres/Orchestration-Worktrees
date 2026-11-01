@@ -39,3 +39,16 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked
       - run: uv run pytest -m docker
+
+  # Not supported yet (docs/windows.md): this job only reports what fails on Windows, it never blocks.
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run pytest -q -m "not docker" -rfE --tb=line -p no:cacheprovider
+
