@@ -1877,3 +1877,13 @@ def test_the_edited_catalog_passes_catalog_check(edit_file: Path) -> None:
     assert _edit("remove-service", "worker").exit_code == 0
     check = runner.invoke(app, ["catalog", "--check"])
     assert check.exit_code == 0, check.output
+
+
+def test_catalog_check_rejects_an_unknown_infra_key_but_the_table_stays_lenient(
+    edit_file: Path,
+) -> None:
+    edit_file.write_text(EDIT_CATALOG.replace("      postgres:", "      nope: {}\n      postgres:"))
+    check = runner.invoke(app, ["catalog", "--check"])
+    assert check.exit_code == 1, check.output
+    assert "unknown infra 'nope'" in check.output
+    assert runner.invoke(app, ["catalog"]).exit_code == 0

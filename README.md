@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.6.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.7.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -610,6 +610,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.5.1 ✔ | Stabilise, dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ | One global `catalog.yaml`, `wt add/up --uses` from any folder, `wt migrate`, `--json` |
 | v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from tests |
+| v0.7.0 ✔ | Provider plugins, shared provider helpers, `wt init --with`, TUI log pane, catalog edit commands |
 | later | plugin entry points (v0.7), shared dependency caches (v0.8), native Windows (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

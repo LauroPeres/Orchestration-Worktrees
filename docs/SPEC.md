@@ -164,7 +164,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
 | v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
-| v0.7.0 (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
+| v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
 | v0.7.1 | Keycloak dev users (`infra.keycloak.users`) |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |

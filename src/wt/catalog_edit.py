@@ -18,7 +18,7 @@ from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from wt.catalog import load_catalog, load_project
 from wt.errors import WtError
-from wt.providers import provider_names
+from wt.providers import provider_names, validate_infra
 from wt.state import atomic_write
 
 INFRA_LISTS = {"postgres": "databases", "kafka": "groups"}  # providers whose section needs a list
@@ -116,11 +116,14 @@ def remove_repo(target: Path, name: str) -> EditResult:
 
 
 def service_failures(catalog_file: Path, names: list[str]) -> dict[str, str]:
-    """Why each service fails to resolve on its own (services that resolve are left out)."""
+    """Why each service fails to resolve on its own (services that resolve are left out).
+
+    A service also fails when its `infra` keys do not pass the check `up` runs (SPEC section 23).
+    """
     failures: dict[str, str] = {}
     for name in names:
         try:
-            load_project(catalog_file, uses=[name])
+            validate_infra(load_project(catalog_file, uses=[name]).config)
         except WtError as exc:
             failures[name] = str(exc)
     return failures

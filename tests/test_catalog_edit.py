@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import FakePluginFactory, FakeProvider, InstallPlugins
 from wt import catalog_edit
 from wt.catalog import load_catalog, load_project
 from wt.catalog_edit import ServiceSpec
@@ -290,6 +291,50 @@ def test_every_service_is_checked_on_its_own_before_writing(
     monkeypatch.setattr(catalog_edit, "load_project", spy)
     catalog_edit.add_repo(catalog_file, "docs", Path("/srv/docs"))
     assert asked == [None, ["back"], ["front"], ["worker"]]  # the anchor, then each one alone
+
+
+# --- infra keys are checked like `up` checks them -----------------------------------------
+
+
+def one_service_catalog(path: Path, infra: str) -> Path:
+    path.write_text(
+        "project: p\ndomain: p.localhost\nrepos:\n  r: /r\nservices:\n  s:\n    repo: r\n"
+        f"    run: x\n    infra:\n      {infra}\n"
+    )
+    return path
+
+
+def test_service_failures_reports_an_unknown_infra_key(tmp_path: Path) -> None:
+    path = one_service_catalog(tmp_path / "c.yaml", "nope: {}")
+    failures = catalog_edit.service_failures(path, ["s"])
+    assert failures == {
+        "s": "unknown infra 'nope' (installed providers: kafka, keycloak, postgres, redis)"
+    }
+
+
+def test_service_failures_accepts_an_installed_plugin_and_checks_its_settings(
+    tmp_path: Path, install_plugins: InstallPlugins
+) -> None:
+    install_plugins({"echo": FakePluginFactory(FakeProvider([], name="echo"))})
+    good = one_service_catalog(tmp_path / "good.yaml", "echo: {prefix: z}")
+    bad = one_service_catalog(tmp_path / "bad.yaml", "echo: {nope: 1}")
+    assert catalog_edit.service_failures(good, ["s"]) == {}
+    assert "infra echo:" in catalog_edit.service_failures(bad, ["s"])["s"]
+
+
+def test_add_service_with_an_unknown_infra_key_is_refused(catalog_file: Path) -> None:
+    spec = ServiceSpec("x", "notes-back", run="r", infra={"nope": []})
+    message = refused(catalog_file, lambda: catalog_edit.add_service(catalog_file, spec))
+    assert message.startswith("service 'x': unknown infra 'nope'")
+
+
+def test_add_service_with_an_installed_plugin_is_written(
+    catalog_file: Path, install_plugins: InstallPlugins
+) -> None:
+    install_plugins({"echo": FakePluginFactory(FakeProvider([], name="echo"))})
+    spec = ServiceSpec("x", "notes-back", run="r", infra=catalog_edit.parse_infra(["echo"]))
+    catalog_edit.add_service(catalog_file, spec)
+    assert "      echo: {}" in catalog_file.read_text()
 
 
 # --- option parsing ---------------------------------------------------------------------------
