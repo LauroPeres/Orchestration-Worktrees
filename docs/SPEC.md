@@ -1077,3 +1077,15 @@ one) and fill `urls` for `add`, `stop` and `up` from the branch's recorded route
   that fail, in addition to the checks of §15.
 - **Shared text.** The remove confirmation sentence lives once, in `wt.messages` (model layer), and is
   used by the CLI and the TUI.
+- **`remove` after `down` (bug from the real-repo run).** A branch that is no longer in state is looked up
+  in **every repo of the catalog**, not only in those of the anchor selection, with the same protections
+  as §16 (never a protected branch, never one checked out in a folder wt did not create). Before: the
+  branch survived in the repos that the anchor did not include (`wt remove` after `wt down` left it in
+  music-front and My-discord).
+- **Ctrl-C during `up`.** `up` catches `KeyboardInterrupt` after the branch exists in state, marks it
+  `failed`, prints `interrupted: wt up <branch> again, or wt down <branch>` and exits 130; processes it
+  started are left for `down` to stop (the state records them).
+- **`down` stop order.** Host processes and compose groups stop consumers first (reverse of the start
+  order), so a consumer never talks to a stopped dependency while shutting down.
+- **Hints name real services.** `branch <b> has no services yet; run wt add <b> --uses <service>[,<service>…]
+  (services: a, b, c)` lists the catalog's service names (at most 10, then `…`).
