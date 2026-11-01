@@ -39,6 +39,9 @@ class Service(Strict):
     setup: str | None = Field(
         None, description="shell command run before the process starts, once per change (run only)"
     )
+    setup_cache: Literal["uv", "npm"] | None = Field(
+        None, description="install cache preset for `setup` (needs setup)"
+    )
     setup_timeout: int = Field(
         DEFAULT_SETUP_TIMEOUT,
         ge=1,
@@ -62,6 +65,8 @@ class Service(Strict):
                 raise ValueError("setup: needs run:")
             if "setup_timeout" in self.model_fields_set:
                 raise ValueError("setup_timeout: needs run:")
+        if self.setup is None and self.setup_cache is not None:
+            raise ValueError("setup_cache: needs setup:")
         return self
 
     @model_validator(mode="after")

@@ -36,3 +36,17 @@ def project_dir(project: str) -> Path:
 
 def locks_dir() -> Path:
     return wt_home() / "locks"
+
+
+def cache_dir() -> Path:
+    return wt_home() / "cache"
+
+
+def installs_dir() -> Path:
+    """Restorable install entries (SPEC section 24), one folder per key."""
+    return cache_dir() / "installs"
+
+
+def tool_cache_dir(name: str) -> Path:
+    """The shared download cache of one tool: `uv` or `npm`."""
+    return cache_dir() / name

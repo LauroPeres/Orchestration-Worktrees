@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from wt import compose, git, health, host, naming, proc, router, tls
+from wt import cache, compose, git, health, host, naming, proc, router, tls
 from wt import providers as registry
 from wt.catalog import CatalogService, load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
@@ -129,6 +129,15 @@ class SetupJob:
     env: dict[str, str]
     log: Path
     timeout: int  # seconds
+    cache_preset: cache.Preset | None = None  # the service's `setup_cache`
+
+
+@dataclass(frozen=True)
+class InstallCache:
+    """The install-store entry a restorable `setup_cache` preset maps one setup to."""
+
+    preset: cache.Preset
+    key: str
 
 
 @dataclass(frozen=True)
@@ -364,6 +373,7 @@ class Orchestrator:
         with self._branch_lock(names):
             self._check_worktree_targets(names)
             self._check_hosts_free(names)
+            self._check_install_caches(names.branch)
             envs, commands, setups, ports = self._reserve(branch, names)
 
             try:
@@ -480,6 +490,19 @@ class Orchestrator:
                     f"host {route_host} is already routed by {router.route_file_owner(path)}; "
                     "give one of the projects another domain"
                 )
+
+    def _check_install_caches(self, branch: str) -> None:
+        """Fail `up` before anything is created when a `setup_cache` preset lacks its lock file.
+
+        A known branch is read in its own worktree; a new one has none yet, so its repo stands in.
+        """
+        recorded = self.store.load().branches.get(branch)
+        for svc in self.cfg.services.values():
+            if svc.setup_cache is None or not cache.restorable(svc.setup_cache):
+                continue
+            repo = recorded.repos.get(svc.repo) if recorded else None
+            folder = Path(repo.path) if repo else self.loaded.repo_path(svc.repo)
+            cache.read_lock_files(folder, svc.setup_cache)
 
     def _reserve(
         self, branch: str, names: Names
@@ -671,7 +694,11 @@ class Orchestrator:
         }
         envs = {
             name: {
-                k: render(v, contexts[name], f"services.{name}.env.{k}") for k, v in svc.env.items()
+                **(cache.tool_env(svc.setup_cache) if svc.setup_cache else {}),
+                **{
+                    k: render(v, contexts[name], f"services.{name}.env.{k}")
+                    for k, v in svc.env.items()
+                },
             }
             for name, svc in self.cfg.services.items()
         }
@@ -775,20 +802,38 @@ class Orchestrator:
     ) -> SetupJob:
         svc = self.cfg.services[name]
         log = self.setup_log_path(names, name)
-        return SetupJob(name, command, worktrees[svc.repo], envs[name], log, svc.setup_timeout)
+        return SetupJob(
+            name, command, worktrees[svc.repo], envs[name], log, svc.setup_timeout, svc.setup_cache
+        )
 
     def _run_setup(self, branch: str, job: SetupJob) -> None:
-        """Run a service's `setup:` unless this exact command already succeeded (SPEC §22)."""
+        """Run a service's `setup:` unless this exact command already succeeded (SPEC §22).
+
+        A restorable `setup_cache` first tries to copy a stored install in; a hit stands in for the
+        run (SPEC §24).
+        """
         digest = hashlib.sha256(job.command.encode()).hexdigest()
         if self.store.load().branches[branch].setup_done.get(job.service) == digest:
             return
-        self.log(f"setup [bold]{job.service}[/]")
-        _execute_setup(job)
+        install = _install_cache(job)
+        if install is not None and cache.restore(install.key, install.preset, job.cwd):
+            self.log("restored node_modules from the install cache")
+        else:
+            self.log(f"setup [bold]{job.service}[/]")
+            _execute_setup(job)
+            self._store_install(job, install)
 
         def done(bs: BranchState) -> None:
             bs.setup_done[job.service] = digest
 
         self._record(branch, done)
+
+    def _store_install(self, job: SetupJob, install: InstallCache | None) -> None:
+        """Keep the finished install for the next worktree; a failure is only a note."""
+        if install is None:
+            return
+        if not cache.store(install.key, install.preset, job.service, job.command, job.cwd):
+            self.log("[yellow]note:[/] could not store node_modules in the install cache")
 
     def _up_run_service(  # noqa: PLR0913
         self,
@@ -1527,6 +1572,25 @@ def _execute_setup(job: SetupJob) -> None:
         except proc.CommandError as exc:
             code = exc.result.returncode
             raise WtError(f"setup of {job.service} failed (exit {code}); see {job.log}") from exc
+
+
+def _node_version() -> str:
+    """`node --version`, stripped; empty when node is missing or fails (it then keys no version)."""
+    try:
+        result = proc.run(["node", "--version"], check=False)
+    except WtError:
+        return ""
+    return result.stdout.strip() if result.ok else ""
+
+
+def _install_cache(job: SetupJob) -> InstallCache | None:
+    """The store entry for a job whose preset keeps installs (uv shares only its tool cache)."""
+    preset = job.cache_preset
+    if preset is None or not cache.restorable(preset):
+        return None
+    lock_files = cache.read_lock_files(job.cwd, preset)
+    key = cache.install_key(preset, lock_files, job.command, _node_version())
+    return InstallCache(preset, key)
 
 
 def _env_hash(env: dict[str, str]) -> str:

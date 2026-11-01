@@ -1130,6 +1130,21 @@ def test_render_check_passes_the_good_catalog_fixture(tmp_path: Path) -> None:
     assert check(tmp_path, GOOD) == {}
 
 
+def test_setup_cache_passes_render_check_and_reaches_the_resolved_service(tmp_path: Path) -> None:
+    text = "project: shop\ndomain: shop.localhost\n" + CHECK.replace(
+        "    setup: make deps {{ slug }}\n", "    setup: npm ci\n    setup_cache: npm\n"
+    )
+    assert check(tmp_path, text) == {}
+    loaded = load_project(write(tmp_path, text), ["music-back"])
+    assert loaded.config.services["music-back"].setup_cache == "npm"
+
+
+def test_setup_cache_without_setup_is_rejected_in_a_catalog(tmp_path: Path) -> None:
+    text = CHECK.replace("    setup: make deps {{ slug }}\n", "    setup_cache: uv\n")
+    with pytest.raises(WtError, match=r"setup_cache: needs setup:"):
+        load_catalog(write(tmp_path, text))
+
+
 @pytest.mark.parametrize(
     ("replace", "fragment"),
     [

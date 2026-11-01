@@ -79,6 +79,10 @@ def test_loads_spec_example(tmp_path: Path) -> None:
         (with_service(typo=1), "typo"),
         (with_service(setup="make deps"), "setup: needs run:"),
         (with_service(setup_timeout=30), "setup_timeout: needs run:"),
+        (with_service(setup="make deps", setup_cache="uv"), "setup: needs run:"),
+        (with_service(setup_cache="uv"), "setup_cache: needs setup:"),
+        (with_run_service(setup_cache="uv"), "setup_cache: needs setup:"),
+        (with_run_service(setup="x", setup_cache="pip"), "setup_cache"),
         (with_run_service(setup_timeout=0), "setup_timeout"),
         (with_run_service(setup_timeout=3601), "setup_timeout"),
         ({**BASE, "project": "Shop"}, "project"),
@@ -287,3 +291,15 @@ def test_a_plugin_key_survives_load_project(tmp_path: Path) -> None:
 def test_a_non_mapping_plugin_key_is_a_load_error(tmp_path: Path) -> None:
     with pytest.raises(WtError, match=r"infra\.echo: must be a mapping"):
         load(tmp_path, with_infra({"echo": "yes"}))
+
+
+def test_setup_cache_defaults_to_none(tmp_path: Path) -> None:
+    assert load(tmp_path, BASE).config.services["web"].setup_cache is None
+
+
+@pytest.mark.parametrize("preset", ["uv", "npm"])
+def test_setup_cache_flows_into_the_resolved_service(tmp_path: Path, preset: str) -> None:
+    data = with_run_service(setup="make deps", setup_cache=preset)
+    services = load(tmp_path, data).config.services
+    assert services["web"].setup_cache == preset
+    assert services["api"].setup_cache is None

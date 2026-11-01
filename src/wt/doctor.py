@@ -7,7 +7,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from wt import compose, host, proc, router, tls
+from wt import cache, compose, host, proc, router, tls
 from wt.catalog import load_catalog
 from wt.config import BUILTIN_INFRA, LoadedConfig, Postgres, Shared
 from wt.errors import WtError
@@ -16,6 +16,8 @@ from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
 MIN_COMPOSE = (2, 24)  # `!reset` in override files
+BYTES_PER_MIB = 1024 * 1024
+LOW_DISK_BYTES = 2048 * BYTES_PER_MIB  # below this, a full install cache can fill the disk
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,21 @@ def check_tls(fix: bool) -> Check:
             f"{tls.caroot()}/rootCA.pem into Windows 'Trusted Root Certification Authorities'"
         )
     return Check("mkcert", "ok", f"CA at {tls.caroot()}", hint)
+
+
+def check_cache() -> Check:
+    """The caches grow on their own: say how big, and warn when the disk is low."""
+    used = cache.total_bytes()
+    free = cache.free_bytes()
+    if free < LOW_DISK_BYTES:
+        return Check(
+            "cache",
+            "warn",
+            f"low disk space: {free // BYTES_PER_MIB} MiB free; "
+            f"wt cache prune frees {used // BYTES_PER_MIB} MiB",
+            "wt cache prune --all",
+        )
+    return Check("cache", "info", f"{used // BYTES_PER_MIB} MiB in the install and tool caches")
 
 
 def check_routing(fix: bool) -> list[Check]:
@@ -450,6 +467,7 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
     checks += docker
     docker_ok = all(c.level == "ok" for c in docker)
     checks.append(check_tls(fix))
+    checks.append(check_cache())
     checks += check_plugins()
     if docker_ok:
         checks += check_routing(fix)

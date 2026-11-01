@@ -1,6 +1,6 @@
 [project]
 name = "orchestration-worktrees"
-version = "0.7.0"
+version = "0.8.0"
 description = "Run an isolated copy of your dev stack for every git branch, side by side."
 readme = "README.md"
 license = "MIT"
@@ -86,7 +86,7 @@ layers = [
     "wt.cli : wt.tui : wt.catalog_edit : wt.__main__",
     "wt.orchestrator : wt.doctor",
     "wt.providers",
-    "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects",
+    "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects : wt.cache",
     "wt.config : wt.catalog : wt.naming : wt.templating : wt.paths : wt.errors",
 ]
 

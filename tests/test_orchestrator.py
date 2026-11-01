@@ -4,8 +4,9 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ from tests.conftest import (
     write_global_catalog,
 )
 from tests.conftest import git as git_run
-from wt import compose, git, health, host, naming, orchestrator, proc, router, state, tls
+from wt import cache, compose, git, health, host, naming, orchestrator, proc, router, state, tls
 from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
@@ -4081,6 +4082,306 @@ def test_a_command_timeout_becomes_the_setup_timeout_message(
         o.up("feat/x", uses=selection(o))
     assert str(err.value) == f"setup of web timed out after 7s; see {log}"
     assert o.store.load().branches["feat/x"].status == "failed"
+
+
+# ---- setup_cache: (SPEC §24) ---------------------------------------------------------------
+
+RESTORED_LOG = "restored node_modules from the install cache"
+NODE_VERSION = "v20.11.1"
+
+
+@dataclass
+class FakeInstallCache:
+    """Stands in for `wt.cache`: records every call and answers with the configured outcome."""
+
+    hit: bool = False
+    store_ok: bool = True
+    lock_error: str | None = None
+    calls: list[tuple[Any, ...]] = field(default_factory=list)
+
+    def of(self, name: str) -> list[tuple[Any, ...]]:
+        return [call[1:] for call in self.calls if call[0] == name]
+
+    def read_lock_files(self, repo_dir: Path, preset: str) -> dict[str, bytes]:
+        self.calls.append(("read_lock_files", repo_dir, preset))
+        if self.lock_error is not None:
+            raise WtError(self.lock_error)
+        return {"package-lock.json": b"lock"}
+
+    def install_key(
+        self, preset: str, lock_files: Mapping[str, bytes], setup_text: str, tool_version: str
+    ) -> str:
+        self.calls.append(("install_key", preset, dict(lock_files), setup_text, tool_version))
+        return "key-1"
+
+    def restorable(self, preset: str) -> bool:
+        return preset == "npm"
+
+    def restore(self, key: str, preset: str, target_dir: Path) -> bool:
+        self.calls.append(("restore", key, preset, target_dir))
+        return self.hit
+
+    def store(self, key: str, preset: str, service: str, setup_text: str, source_dir: Path) -> bool:
+        self.calls.append(("store", key, preset, service, setup_text, source_dir))
+        return self.store_ok
+
+    def tool_env(self, preset: str) -> dict[str, str]:
+        var = "npm_config_cache" if preset == "npm" else "UV_CACHE_DIR"
+        return {var: f"/wt-cache/{preset}"}
+
+
+@pytest.fixture
+def install_cache(monkeypatch: pytest.MonkeyPatch) -> FakeInstallCache:
+    fake = FakeInstallCache()
+    for name in (
+        "read_lock_files",
+        "install_key",
+        "restorable",
+        "restore",
+        "store",
+        "tool_env",
+    ):
+        monkeypatch.setattr(cache, name, getattr(fake, name))
+    real_run = proc.run
+
+    def run(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args) == ["node", "--version"]:
+            return proc.Result(0, NODE_VERSION + "\n", "")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", run)
+    return fake
+
+
+def _cached_orch(run_orch, tmp_path: Path, preset: str = "npm", **extra: object) -> Orchestrator:
+    return _setup_orch(run_orch, tmp_path, "COUNT", setup_cache=preset, **extra)
+
+
+def test_a_cache_miss_runs_setup_and_stores_the_install(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, isolated_home: Path
+) -> None:
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    worktree = isolated_home / "shop" / "worktrees" / "feat-x" / "api"
+    rendered = f"echo x >> {tmp_path / 'setups.txt'}"
+    assert _setup_runs(tmp_path) == 1
+    assert install_cache.of("install_key") == [
+        ("npm", {"package-lock.json": b"lock"}, rendered, NODE_VERSION)
+    ]
+    assert install_cache.of("restore") == [("key-1", "npm", worktree)]
+    assert install_cache.of("store") == [("key-1", "npm", "web", rendered, worktree)]
+    assert o.store.load().branches["feat/x"].setup_done == {"web": _sha(rendered)}
+
+
+def test_a_cache_hit_skips_setup_and_records_it_as_done(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    install_cache.hit = True
+    o = _cached_orch(run_orch, tmp_path)
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/x", uses=selection(o))
+    bs = o.store.load().branches["feat/x"]
+    assert _setup_runs(tmp_path) == 0
+    assert bs.setup_done == {"web": _sha(f"echo x >> {tmp_path / 'setups.txt'}")}
+    assert bs.status == "up"
+    assert RESTORED_LOG in logs
+    assert install_cache.of("store") == []  # nothing new to keep
+
+
+def test_a_restored_install_is_not_restored_again_by_the_next_up(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    install_cache.hit = True
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    o.up("feat/x")
+    o.stop("feat/x")
+    o.up("feat/x")
+    assert len(install_cache.of("restore")) == 1
+
+
+def test_a_failing_setup_stores_nothing_and_is_not_remembered(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT; exit 4", setup_cache="npm")
+    with pytest.raises(WtError, match=r"setup of web failed \(exit 4\)"):
+        o.up("feat/x", uses=selection(o))
+    bs = o.store.load().branches["feat/x"]
+    assert install_cache.of("store") == []
+    assert bs.setup_done == {}
+    assert bs.status == "failed"
+
+
+def test_a_store_that_fails_is_a_note_and_up_still_succeeds(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    install_cache.store_ok = False
+    o = _cached_orch(run_orch, tmp_path)
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/x", uses=selection(o))
+    assert o.store.load().branches["feat/x"].status == "up"
+    assert o.store.load().branches["feat/x"].setup_done
+    assert any("could not store node_modules in the install cache" in line for line in logs)
+
+
+def test_a_second_branch_restores_the_install_instead_of_running_setup(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    install_cache.hit = True
+    o.up("feat/y", uses=selection(o))
+    assert _setup_runs(tmp_path) == 1  # the second branch restored instead of installing
+
+
+def test_a_missing_lock_file_fails_up_before_anything_is_created(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, isolated_home: Path
+) -> None:
+    install_cache.lock_error = "setup_cache: npm needs package-lock.json in /repo"
+    o = _cached_orch(run_orch, tmp_path)
+    with pytest.raises(WtError) as err:
+        o.up("feat/x", uses=selection(o))
+    assert str(err.value) == "setup_cache: npm needs package-lock.json in /repo"
+    assert o.store.load().branches == {}
+    assert not (isolated_home / "shop").exists()
+    assert _setup_runs(tmp_path) == 0
+
+
+def test_the_lock_file_preflight_reads_the_repo_before_the_worktree_exists(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    first, *_ = install_cache.of("read_lock_files")
+    assert first == (o.loaded.repo_path("api"), "npm")
+
+
+def test_the_preflight_of_a_known_branch_reads_its_own_worktree(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, isolated_home: Path
+) -> None:
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    install_cache.calls.clear()
+    o.up("feat/x")
+    worktree = isolated_home / "shop" / "worktrees" / "feat-x" / "api"
+    assert install_cache.of("read_lock_files") == [(worktree, "npm")]
+
+
+def test_add_does_not_need_the_lock_file(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    install_cache.lock_error = "setup_cache: npm needs package-lock.json in /repo"
+    o = _cached_orch(run_orch, tmp_path)
+    assert o.add("feat/x", uses=selection(o)) is True
+
+
+def test_without_node_the_tool_version_is_empty(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args) == ["node", "--version"]:
+            raise WtError("'node' was not found on PATH")
+        return real_run(args, **kwargs)
+
+    real_run = proc.run
+    monkeypatch.setattr(proc, "run", missing)
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    [(_, _, _, tool_version)] = install_cache.of("install_key")
+    assert tool_version == ""
+
+
+def test_a_node_that_fails_gives_an_empty_tool_version(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_run = proc.run
+
+    def broken(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args) == ["node", "--version"]:
+            return proc.Result(1, "garbage", "boom")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", broken)
+    o = _cached_orch(run_orch, tmp_path)
+    o.up("feat/x", uses=selection(o))
+    [(_, _, _, tool_version)] = install_cache.of("install_key")
+    assert tool_version == ""
+
+
+def test_uv_runs_setup_and_never_touches_the_install_store(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache
+) -> None:
+    o = _cached_orch(run_orch, tmp_path, preset="uv")
+    o.up("feat/x", uses=selection(o))
+    assert _setup_runs(tmp_path) == 1
+    assert [c[0] for c in install_cache.calls] == []
+    assert o.store.load().branches["feat/x"].setup_done
+
+
+def test_setup_and_run_get_the_tool_cache_variable(
+    run_orch,
+    tmp_path: Path,
+    install_cache: FakeInstallCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_envs: list[dict[str, str]] = []
+    setup_envs: list[dict[str, str]] = []
+    real_start, real_run = host.start, proc.run
+
+    def start(command: Any, cwd: Any, env: dict[str, str], *args: Any) -> ProcessState:
+        run_envs.append(env)
+        return real_start(command, cwd, env, *args)
+
+    def run(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args[:2]) == ["sh", "-c"]:
+            setup_envs.append(kwargs["env"])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(host, "start", start)
+    monkeypatch.setattr(proc, "run", run)
+    o = _cached_orch(run_orch, tmp_path, env={"OTHER": "1"})
+    o.up("feat/x", uses=selection(o))
+    assert setup_envs[0]["npm_config_cache"] == "/wt-cache/npm"
+    assert setup_envs[0]["OTHER"] == "1"
+    assert run_envs[0]["npm_config_cache"] == "/wt-cache/npm"
+
+
+def test_the_service_env_wins_over_the_tool_cache_variable(
+    run_orch,
+    tmp_path: Path,
+    install_cache: FakeInstallCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envs: list[dict[str, str]] = []
+    real_start = host.start
+
+    def start(command: Any, cwd: Any, env: dict[str, str], *args: Any) -> ProcessState:
+        envs.append(env)
+        return real_start(command, cwd, env, *args)
+
+    monkeypatch.setattr(host, "start", start)
+    o = _cached_orch(run_orch, tmp_path, preset="uv", env={"UV_CACHE_DIR": "/mine"})
+    o.up("feat/x", uses=selection(o))
+    assert envs[0]["UV_CACHE_DIR"] == "/mine"
+
+
+def test_a_service_without_setup_cache_gets_no_tool_variable(
+    run_orch, tmp_path: Path, install_cache: FakeInstallCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    envs: list[dict[str, str]] = []
+    real_start = host.start
+
+    def start(command: Any, cwd: Any, env: dict[str, str], *args: Any) -> ProcessState:
+        envs.append(env)
+        return real_start(command, cwd, env, *args)
+
+    monkeypatch.setattr(host, "start", start)
+    o = _setup_orch(run_orch, tmp_path, "COUNT")
+    o.up("feat/x", uses=selection(o))
+    assert "npm_config_cache" not in envs[0]
+    assert install_cache.calls == []
 
 
 @pytest.fixture
