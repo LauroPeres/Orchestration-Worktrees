@@ -25,6 +25,7 @@ INSTALL_TIMEOUT = 600
 TUI_TIMEOUT = 60
 BUILT_IN_PROVIDERS = "kafka, keycloak, postgres, redis"
 SAFE_PATH = "/usr/bin:/bin:/usr/local/bin"  # no mkcert: the self-signed path
+UV = shutil.which("uv") or "uv"  # resolved before PATH is trimmed: CI keeps uv outside SAFE_PATH
 
 # Four services in three repos, with comments, odd spacing and a trailing comment to preserve.
 CATALOG_TEXT = """\
@@ -119,10 +120,10 @@ def stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[VenvWt]:
     if shutil.which("docker") is None or docker("info").returncode != 0:
         pytest.skip("docker is not available")
     venv = tmp_path / "venv"
-    subprocess.run(["uv", "venv", "-q", str(venv)], check=True, timeout=CLI_TIMEOUT)
+    subprocess.run([UV, "venv", "-q", str(venv)], check=True, timeout=CLI_TIMEOUT)
     python = str(venv / "bin" / "python")
     subprocess.run(
-        ["uv", "pip", "install", "-q", "--python", python, str(REPO_ROOT), str(ECHO_PACKAGE)],
+        [UV, "pip", "install", "-q", "--python", python, str(REPO_ROOT), str(ECHO_PACKAGE)],
         check=True,
         timeout=INSTALL_TIMEOUT,
     )
@@ -157,7 +158,7 @@ def test_plugin_provider_lifecycle_and_missing_plugin(stack: VenvWt, make_repo) 
     assert echo_log.read_text().splitlines() == ["create feat-p", "destroy feat-p"]
 
     uninstall = subprocess.run(
-        ["uv", "pip", "uninstall", "--python", stack.python, "wt-provider-echo"],
+        [UV, "pip", "uninstall", "--python", stack.python, "wt-provider-echo"],
         capture_output=True,
         text=True,
         check=False,
@@ -279,6 +280,7 @@ def test_init_with_unknown_provider_writes_nothing(
     assert not list(tmp_path.glob("**/catalog.yaml"))
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="util-linux `script -c`; BSD script differs")
 def test_tui_services_view_log_page_round_trip(tmp_path: Path, make_repo) -> None:
     repo = make_repo("app")
     catalog = tmp_path / "catalog.yaml"
