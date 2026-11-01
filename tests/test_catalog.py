@@ -1,8 +1,19 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
-from wt.catalog import Catalog, catalog_path, expand_uses, load_catalog
+from wt.catalog import (
+    Catalog,
+    MergeResult,
+    catalog_path,
+    expand_uses,
+    load_catalog,
+    load_project,
+    merge_legacy,
+    read_legacy,
+)
 from wt.config import load_config
 from wt.errors import WtError
 from wt.templating import render
@@ -451,6 +462,11 @@ def test_expand_uses_unknown_name(tmp_path: Path) -> None:
         expand_uses(chain_catalog(tmp_path), ["a", "nope"])
 
 
+def test_expand_uses_unknown_name_lists_the_known_services(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match=r"Known: a, b, c, d"):
+        expand_uses(chain_catalog(tmp_path), ["nope"])
+
+
 def test_expand_uses_cycle(tmp_path: Path) -> None:
     text = CHAIN.replace("    subdomain: c\n", "    subdomain: c\n    consumes: {a: A_URL}\n")
     with pytest.raises(WtError, match="cycle through catalog consumes: a -> b -> c -> a"):
@@ -582,3 +598,481 @@ def test_services_project_with_hyphenated_names_renders_both_forms_of_access(
     assert render(cfg.services["music-front"].env["API"], context, "env.API") == (
         "https://api.music.localhost"
     )
+
+
+# --- the project catalog: project/domain in the catalog, load_project ---
+PROJECT_HEADER = "project: notes\ndomain: notes.localhost\n"
+
+
+def project_catalog(tmp_path: Path, text: str = GOOD, header: str = PROJECT_HEADER) -> Path:
+    return write(tmp_path, header + text)
+
+
+def test_catalog_project_and_domain_are_optional() -> None:
+    old = Catalog.model_validate(yaml.safe_load(GOOD))
+    assert old.project is None
+    assert old.domain is None
+    new = Catalog.model_validate({**yaml.safe_load(GOOD), "project": "notes", "domain": "n.dev"})
+    assert (new.project, new.domain) == ("notes", "n.dev")
+
+
+@pytest.mark.parametrize(
+    ("key", "value"), [("project", "Notes"), ("project", "1x"), ("domain", "nodot"), ("domain", "")]
+)
+def test_catalog_project_and_domain_are_validated_when_set(key: str, value: str) -> None:
+    with pytest.raises(ValueError, match=key):
+        Catalog.model_validate({**yaml.safe_load(GOOD), key: value})
+
+
+def test_old_catalog_without_project_still_loads_through_the_old_path(tmp_path: Path) -> None:
+    assert load_catalog(write(tmp_path, GOOD)).catalog.project is None
+    assert list(load_config(project(tmp_path, GOOD, "uses: [back]\n")).config.services) == ["back"]
+
+
+def test_load_project_matches_a_uses_project(tmp_path: Path) -> None:
+    path = project_catalog(tmp_path)
+    old = load_config(project(tmp_path, PROJECT_HEADER + GOOD, "uses: [front]\n"))
+    new = load_project(path, ["front"])
+    assert new.config == old.config
+    assert new.path == path == new.catalog
+    assert new.uses == ("front",)
+    assert new.service_order == ("back", "front")
+    assert new.remotes == old.remotes == {}
+    assert new.warnings == old.warnings == (IGNORED_BACK,)
+    assert new.config.repos["notes-back"] == str(tmp_path / "back")
+    assert new.config.project == "notes"
+    assert new.config.domain == "notes.localhost"
+
+
+def test_load_project_without_uses_is_the_anchor(tmp_path: Path) -> None:
+    anchor = load_project(project_catalog(tmp_path))
+    assert anchor.uses == ("back",)  # the first service in catalog order
+    assert list(anchor.config.services) == ["back"]
+    assert anchor.remotes == {"front": ""}
+
+
+def test_the_anchor_brings_its_closure(tmp_path: Path) -> None:
+    consumer_first = GOOD.replace(
+        "services:\n",
+        "services:\n  front0:\n    repo: notes-front\n"
+        "    run: y\n    port: 1\n    consumes:\n      back: B_URL\n",
+        1,
+    )
+    anchor = load_project(project_catalog(tmp_path, consumer_first))
+    assert anchor.uses == ("front0",)
+    assert list(anchor.config.services) == ["front0", "back"]
+
+
+def test_load_project_explicit_selection_keeps_its_order(tmp_path: Path) -> None:
+    loaded = load_project(project_catalog(tmp_path), ["front", "back"])
+    assert loaded.uses == ("front", "back")
+    assert list(loaded.config.services) == ["front", "back"]
+
+
+def test_load_project_empty_selection_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match=r"choose at least one service \(wt add <b> --uses a,b\)"):
+        load_project(project_catalog(tmp_path), [])
+
+
+def test_load_project_unknown_service_lists_the_catalog_names(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match=r"unknown service 'nope'.*Known: back, front"):
+        load_project(project_catalog(tmp_path), ["nope"])
+
+
+def test_load_project_missing_file(tmp_path: Path) -> None:
+    path = tmp_path / "nope.yaml"
+    expected = f"no catalog at {path}. Run wt init, or wt migrate <worktree.yaml>"
+    with pytest.raises(WtError) as info:
+        load_project(path)
+    assert str(info.value) == expected
+
+
+@pytest.mark.parametrize(
+    ("header", "missing"),
+    [("", "project, domain"), ("project: notes\n", "domain"), ("domain: n.dev\n", "project")],
+)
+def test_load_project_requires_project_and_domain(
+    tmp_path: Path, header: str, missing: str
+) -> None:
+    path = project_catalog(tmp_path, header=header)
+    with pytest.raises(WtError, match=rf"{path.name}.*missing.*{missing}"):
+        load_project(path)
+
+
+def test_load_project_reports_invalid_files(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match="not valid YAML"):
+        load_project(write(tmp_path, "a: [\n"))
+    bad = project_catalog(tmp_path, GOOD.replace("compose: docker-compose.yml", "port: 1"))
+    with pytest.raises(WtError, match=r"invalid catalog\.yaml"):
+        load_project(bad)
+
+
+def test_load_project_reports_infra_conflicts(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "    consumes:\n      back: API_URL\n",
+        "    consumes:\n      back: API_URL\n"
+        "    infra:\n      postgres: {databases: [other], base_branch: dev}\n",
+    ).replace("postgres: {databases: [notes]}", "postgres: {databases: [notes], base_branch: main}")
+    with pytest.raises(WtError, match="conflicts"):
+        load_project(project_catalog(tmp_path, text), ["front"])
+
+
+def test_load_project_rejects_more_than_100_services(tmp_path: Path) -> None:
+    services = "".join(f"  s{i}:\n    repo: r\n    run: x\n" for i in range(101))
+    path = project_catalog(tmp_path, f"repos: {{r: .}}\nservices:\n{services}")
+    with pytest.raises(WtError, match="at most 100 services"):
+        load_project(path)
+
+
+# --- wt migrate: read_legacy and merge_legacy (pure) ---
+SHOP = """\
+project: shop
+domain: shop.localhost
+repos: { api: ./shop-api, web: ./shop-web }
+services:
+  api:
+    repo: api
+    compose: docker-compose.yml
+    port: 8000
+    subdomain: api
+    health: /healthz
+    env:
+      DATABASE_URL: "{{ postgres.url('shop') }}"
+      WEB_ORIGIN: "{{ services.web.url }}"
+      KAFKA_BOOTSTRAP: "{{kafka.bootstrap}}"
+  worker:
+    repo: api
+    compose: docker-compose.yml
+    compose_service: worker
+    env:
+      KAFKA_GROUP: "{{ kafka.group('worker') }}"
+      REDIS_URL: "{{ redis.url }}"
+  web:
+    repo: web
+    run: python3 server.py --port {{ port }}
+    port: auto
+    subdomain: ""
+    env:
+      KEYCLOAK_URL: "{{ keycloak.url }}"
+shared:
+  postgres: {databases: [shop], strategy: template, verify: true}
+  kafka: {groups: [worker], topic_prefix: true}
+  redis: {}
+  keycloak: {realm: shop, client: web}
+"""
+
+
+def legacy_dict(text: str = SHOP) -> dict[str, Any]:
+    raw = yaml.safe_load(text)
+    assert isinstance(raw, dict)
+    return raw
+
+
+def test_read_legacy(tmp_path: Path) -> None:
+    path = tmp_path / "worktree.yaml"
+    path.write_text(SHOP)
+    assert read_legacy(path) == legacy_dict()
+    with pytest.raises(WtError, match="not found"):
+        read_legacy(tmp_path / "nope.yaml")
+    path.write_text("a: [\n")
+    with pytest.raises(WtError, match="not valid YAML"):
+        read_legacy(path)
+    path.write_text("- a\n")
+    with pytest.raises(WtError, match="must contain a YAML mapping"):
+        read_legacy(path)
+
+
+def test_merge_services_style_into_a_new_catalog(tmp_path: Path) -> None:
+    result = merge_legacy(None, legacy_dict(), tmp_path)
+    cat = result.catalog
+    assert list(cat) == ["project", "domain", "repos", "services"]
+    assert (cat["project"], cat["domain"]) == ("shop", "shop.localhost")
+    assert cat["repos"] == {"api": str(tmp_path / "shop-api"), "web": str(tmp_path / "shop-web")}
+    assert result.added == ("api", "worker", "web")
+    assert result.skipped == ()
+    assert result.uses == ("api", "worker", "web")
+    assert "shared" not in cat
+    Catalog.model_validate(cat)
+
+
+def test_merge_gives_each_service_the_shared_sections_it_mentions(tmp_path: Path) -> None:
+    services = merge_legacy(None, legacy_dict(), tmp_path).catalog["services"]
+    assert list(services["api"]["infra"]) == ["postgres", "kafka"]  # "{{kafka." without spaces too
+    assert list(services["worker"]["infra"]) == ["kafka", "redis"]
+    assert list(services["web"]["infra"]) == ["keycloak"]
+    assert services["api"]["infra"]["postgres"] == {
+        "databases": ["shop"],
+        "strategy": "template",
+        "verify": True,
+    }
+    assert services["worker"]["infra"]["redis"] == {}
+
+
+def test_merge_gives_an_unmentioned_shared_section_to_the_first_service(tmp_path: Path) -> None:
+    legacy = legacy_dict()
+    legacy["shared"]["redis"] = {"prefix": False}
+    legacy["services"]["worker"]["env"].pop("REDIS_URL")
+    services = merge_legacy(None, legacy, tmp_path).catalog["services"]
+    assert services["api"]["infra"]["redis"] == {"prefix": False}
+    assert "redis" not in services["worker"]["infra"]
+
+
+def test_merge_looks_in_run_and_health_text_too(tmp_path: Path) -> None:
+    legacy = {
+        "project": "p",
+        "domain": "p.dev",
+        "repos": {"r": "."},
+        "services": {
+            "one": {"repo": "r", "run": "x"},
+            "two": {"repo": "r", "run": "serve {{ redis.url }}"},
+            "three": {"repo": "r", "run": "y", "port": 1, "health": "/{{postgres.name}}"},
+        },
+        "shared": {"redis": {}, "postgres": {"databases": ["d"]}},
+    }
+    services = merge_legacy(None, legacy, tmp_path).catalog["services"]
+    assert "infra" not in services["one"]
+    assert list(services["two"]["infra"]) == ["redis"]
+    assert list(services["three"]["infra"]) == ["postgres"]
+
+
+def test_merge_does_not_change_its_inputs(tmp_path: Path) -> None:
+    legacy = legacy_dict()
+    existing = {"project": "shop", "domain": "shop.localhost", "repos": {}, "services": {}}
+    merge_legacy(existing, legacy, tmp_path)
+    assert legacy == legacy_dict()
+    assert existing["services"] == {}
+
+
+def test_merge_keeps_absolute_and_home_repos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", "/h")
+    legacy = legacy_dict()
+    legacy["repos"] = {"api": "/srv/api", "web": "~/web"}
+    assert merge_legacy(None, legacy, tmp_path).catalog["repos"] == {
+        "api": "/srv/api",
+        "web": "/h/web",
+    }
+
+
+def test_merge_is_idempotent(tmp_path: Path) -> None:
+    first = merge_legacy(None, legacy_dict(), tmp_path)
+    second = merge_legacy(first.catalog, legacy_dict(), tmp_path)
+    assert second.catalog == first.catalog
+    assert second.added == ()
+    assert second.skipped == ("api", "worker", "web")
+    assert second.uses == first.uses
+
+
+def test_merge_appends_new_services_and_keeps_the_existing_ones_first(tmp_path: Path) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    other = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"cron": "/srv/cron"},
+        "services": {"cron": {"repo": "cron", "run": "cron"}},
+    }
+    result = merge_legacy(existing, other, tmp_path)
+    assert result.added == ("cron",)
+    assert list(result.catalog["services"]) == ["api", "worker", "web", "cron"]
+    assert list(result.catalog["repos"]) == ["api", "web", "cron"]
+    assert result.uses == ("cron",)
+
+
+@pytest.mark.parametrize("key", ["project", "domain"])
+def test_merge_into_another_project_or_domain_is_an_error(tmp_path: Path, key: str) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    other = {**legacy_dict(), key: "other" if key == "project" else "other.dev"}
+    new = other[key]
+    with pytest.raises(WtError) as info:
+        merge_legacy(existing, other, tmp_path)
+    assert str(info.value) == f"catalog is {key} {existing[key]}, worktree.yaml is {key} {new}"
+
+
+def test_merge_into_a_catalog_without_project_sets_it(tmp_path: Path) -> None:
+    old = yaml.safe_load(GOOD)
+    old["repos"] = {"notes-back": str(tmp_path / "back"), "notes-front": "~/code/front"}
+    legacy = {
+        "project": "notes",
+        "domain": "notes.localhost",
+        "uses": ["back"],
+        "catalog": "c.yaml",
+    }
+    (tmp_path / "c.yaml").write_text(GOOD)
+    result = merge_legacy(old, legacy, tmp_path)
+    assert result.catalog["project"] == "notes"
+    assert result.added == ()
+    assert result.skipped == ("back",)
+
+
+@pytest.mark.parametrize("key", ["project", "domain"])
+def test_merge_requires_project_and_domain_in_the_legacy_file(tmp_path: Path, key: str) -> None:
+    legacy = legacy_dict()
+    del legacy[key]
+    with pytest.raises(WtError, match=f"worktree.yaml.*{key}"):
+        merge_legacy(None, legacy, tmp_path)
+
+
+def test_merge_conflict_lists_every_differing_service_in_one_error(tmp_path: Path) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    existing["services"]["api"]["port"] = 9000
+    existing["services"]["web"]["port"] = 9001
+    with pytest.raises(WtError) as info:
+        merge_legacy(existing, legacy_dict(), tmp_path)
+    message = str(info.value)
+    assert "service 'api' differs from the catalog's" in message
+    assert "service 'web' differs from the catalog's" in message
+    assert "worker" not in message
+
+
+def test_merge_repo_name_clash_with_another_path_is_an_error(tmp_path: Path) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    existing["repos"]["web"] = "/elsewhere/web"
+    with pytest.raises(WtError, match=r"repo 'web'.*/elsewhere/web.*shop-web"):
+        merge_legacy(existing, legacy_dict(), tmp_path)
+
+
+def test_merge_validates_the_result(tmp_path: Path) -> None:
+    legacy = legacy_dict()
+    legacy["services"]["api"]["repo"] = "ghost"
+    with pytest.raises(WtError, match="unknown repo 'ghost'"):
+        merge_legacy(None, legacy, tmp_path)
+    legacy = legacy_dict()
+    legacy["project"] = "Bad Name"
+    with pytest.raises(WtError, match="project"):
+        merge_legacy(None, legacy, tmp_path)
+
+
+def test_merge_needs_exactly_one_of_services_or_uses(tmp_path: Path) -> None:
+    legacy = legacy_dict()
+    legacy["uses"] = ["x"]
+    with pytest.raises(WtError, match="exactly one of 'services' or 'uses'"):
+        merge_legacy(None, legacy, tmp_path)
+    del legacy["services"], legacy["uses"]
+    with pytest.raises(WtError, match="exactly one of 'services' or 'uses'"):
+        merge_legacy(None, legacy, tmp_path)
+
+
+USES_LEGACY = {"project": "notes", "domain": "notes.localhost", "uses": ["front"]}
+
+
+def test_merge_uses_style_copies_the_closure_with_its_repos(tmp_path: Path) -> None:
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    legacy = {**USES_LEGACY, "catalog": "./catalog.yaml"}
+    result = merge_legacy(None, legacy, tmp_path)
+    assert result.added == ("back", "front")  # catalog order
+    assert result.uses == ("front", "back")  # the closure, selection first
+    cat = result.catalog
+    assert list(cat) == ["project", "domain", "repos", "services"]
+    assert cat["repos"]["notes-back"] == str(tmp_path / "back")
+    assert cat["services"]["front"]["consumes"] == {"back": "API_URL"}
+    assert cat["services"]["back"]["remote"] == "https://api.staging.example"
+    assert cat["services"]["back"]["infra"] == {"postgres": {"databases": ["notes"]}}
+    loaded = load_project(_dump(tmp_path, cat), ["front"])
+    assert set(loaded.config.services) == {"front", "back"}
+
+
+def _dump(tmp_path: Path, catalog: dict[str, Any]) -> Path:
+    path = tmp_path / "merged.yaml"
+    path.write_text(yaml.safe_dump(catalog, sort_keys=False))
+    return path
+
+
+def test_merge_uses_style_only_copies_what_the_stack_reaches(tmp_path: Path) -> None:
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    result = merge_legacy(
+        None, {**USES_LEGACY, "uses": ["back"], "catalog": "catalog.yaml"}, tmp_path
+    )
+    assert result.added == ("back",)
+    assert list(result.catalog["repos"]) == ["notes-back"]
+    assert result.uses == ("back",)
+
+
+def test_merge_uses_style_finds_the_catalog_through_wt_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "env.yaml").write_text(GOOD)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "env.yaml"))
+    assert merge_legacy(None, USES_LEGACY, tmp_path).added == ("back", "front")
+
+
+def test_merge_uses_style_finds_the_default_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WT_CATALOG", raising=False)
+    monkeypatch.setenv("WT_HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "catalog.yaml").write_text(GOOD)
+    assert merge_legacy(None, USES_LEGACY, tmp_path).added == ("back", "front")
+
+
+def test_merge_uses_style_is_idempotent_and_skips_identical_services(tmp_path: Path) -> None:
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    legacy = {**USES_LEGACY, "catalog": "catalog.yaml"}
+    first = merge_legacy(None, legacy, tmp_path)
+    second = merge_legacy(first.catalog, legacy, tmp_path)
+    assert second.catalog == first.catalog
+    assert (second.added, second.skipped) == ((), ("back", "front"))
+
+
+def test_merge_uses_style_conflict_names_the_service(tmp_path: Path) -> None:
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    legacy = {**USES_LEGACY, "catalog": "catalog.yaml"}
+    existing = merge_legacy(None, legacy, tmp_path).catalog
+    existing["services"]["back"]["port"] = 1234
+    with pytest.raises(WtError, match="service 'back' differs from the catalog's"):
+        merge_legacy(existing, legacy, tmp_path)
+
+
+def test_merge_uses_style_missing_catalog_and_unknown_service(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match="catalog not found"):
+        merge_legacy(None, {**USES_LEGACY, "catalog": "nope.yaml"}, tmp_path)
+    (tmp_path / "catalog.yaml").write_text(GOOD)
+    with pytest.raises(WtError, match="unknown service 'ghost'"):
+        merge_legacy(None, {**USES_LEGACY, "uses": ["ghost"], "catalog": "catalog.yaml"}, tmp_path)
+    with pytest.raises(WtError, match="non-empty list"):
+        merge_legacy(None, {**USES_LEGACY, "uses": [], "catalog": "catalog.yaml"}, tmp_path)
+
+
+def test_a_merged_catalog_loads_with_load_project(tmp_path: Path) -> None:
+    result = merge_legacy(None, legacy_dict(), tmp_path)
+    loaded = load_project(_dump(tmp_path, result.catalog), list(result.uses))
+    assert list(loaded.config.services) == ["api", "worker", "web"]
+    assert loaded.config.shared.kafka is not None
+    assert loaded.config.shared.kafka.groups == ["worker"]
+    assert isinstance(result, MergeResult)
+
+
+def test_merge_reads_relative_catalog_repos_against_catalog_dir(tmp_path: Path) -> None:
+    catalog_dir = tmp_path / "home"
+    legacy_dir = tmp_path / "proj"
+    existing = merge_legacy(None, legacy_dict(), legacy_dir).catalog
+    existing["repos"] = {"api": "../proj/shop-api", "web": "../proj/./shop-web"}
+    result = merge_legacy(existing, legacy_dict(), legacy_dir, catalog_dir=catalog_dir)
+    assert result.catalog["repos"] == existing["repos"]  # kept as written
+    assert result.added == ()
+
+
+def test_merge_without_catalog_dir_compares_relative_repos_as_given(tmp_path: Path) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    existing["repos"]["web"] = "./shop-web"
+    with pytest.raises(WtError, match=r"repo 'web' is \./shop-web in the catalog"):
+        merge_legacy(existing, legacy_dict(), tmp_path)
+
+
+def test_merge_relative_catalog_repo_pointing_elsewhere_is_still_a_clash(tmp_path: Path) -> None:
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    existing["repos"]["web"] = "./other"
+    with pytest.raises(WtError, match="repo 'web'"):
+        merge_legacy(existing, legacy_dict(), tmp_path, catalog_dir=tmp_path)
+
+
+def test_merge_home_relative_catalog_repo_with_the_same_path_is_no_clash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    existing = merge_legacy(None, legacy_dict(), tmp_path).catalog
+    existing["repos"]["api"] = "~/shop-api"
+    result = merge_legacy(existing, legacy_dict(), tmp_path)
+    assert result.catalog["repos"]["api"] == "~/shop-api"
+    assert result.added == ()

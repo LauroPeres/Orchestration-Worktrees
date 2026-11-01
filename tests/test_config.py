@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 import yaml
 
+from wt.catalog import load_project
 from wt.config import STARTER, Config, find_config, load_config
 from wt.errors import WtError
 
@@ -191,3 +192,44 @@ def test_keycloak_realm_and_client_accept_dots_dashes_and_case(tmp_path: Path) -
     cfg = load_config(write(tmp_path, data)).config
     assert cfg.shared.keycloak is not None
     assert cfg.shared.keycloak.realm == "Shop.v1_x-2"
+
+
+# --- LoadedConfig.with_uses for a project catalog ---
+CATALOG = """\
+project: notes
+domain: notes.localhost
+repos: {r: .}
+services:
+  back: {repo: r, run: x, port: auto, subdomain: api}
+  front: {repo: r, run: y, port: auto, subdomain: "", consumes: {back: API_URL}}
+  admin: {repo: r, run: z, port: auto, subdomain: admin}
+"""
+
+
+def test_with_uses_on_a_project_catalog_re_resolves_it(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.yaml"
+    path.write_text(CATALOG)
+    loaded = load_project(path, ["front"])
+    assert loaded.from_catalog
+    other = loaded.with_uses(["admin"])
+    assert other.from_catalog
+    assert other.uses == ("admin",)
+    assert list(other.config.services) == ["admin"]
+    assert other.path == other.catalog == path
+    assert other.service_order == ("back", "front", "admin")
+    assert loaded.uses == ("front",)  # the original is untouched
+    assert list(loaded.with_uses(["front"]).config.services) == ["front", "back"]
+
+
+def test_with_uses_on_a_project_catalog_errors(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.yaml"
+    path.write_text(CATALOG)
+    loaded = load_project(path)
+    with pytest.raises(WtError, match="select at least one service"):
+        loaded.with_uses([])
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        loaded.with_uses(["nope"])
+
+
+def test_a_worktree_yaml_is_not_from_a_catalog(tmp_path: Path) -> None:
+    assert not load_config(write(tmp_path, BASE)).from_catalog

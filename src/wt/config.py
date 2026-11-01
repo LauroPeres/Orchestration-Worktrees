@@ -171,6 +171,7 @@ class LoadedConfig:
     uses: tuple[str, ...] | None = None  # the explicit selection; None for a `services:` project
     service_order: tuple[str, ...] = ()  # catalog order (or `services:` order): the port index
     warnings: tuple[str, ...] = ()  # non-fatal notes from loading, for the caller to show
+    from_catalog: bool = False  # loaded by load_project: re-resolve with it, not load_config
 
     @property
     def root(self) -> Path:
@@ -187,11 +188,15 @@ class LoadedConfig:
             raise WtError(f"unknown service {name!r}") from None
 
     def with_uses(self, uses: list[str]) -> "LoadedConfig":
-        """The same worktree.yaml and catalog, resolved for another selection."""
+        """The same worktree.yaml or project catalog, resolved for another selection."""
         if self.uses is None:
             raise WtError("configure needs a catalog project (uses: in worktree.yaml)")
         if not uses:
             raise WtError("select at least one service")
+        if self.from_catalog:
+            from wt.catalog import load_project  # catalog imports this module
+
+            return load_project(self.path, uses=list(uses))
         return load_config(self.path, uses=list(uses))
 
 
