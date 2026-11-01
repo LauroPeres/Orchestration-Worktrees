@@ -686,24 +686,47 @@ def named(*names: str, key: str = "username") -> proc.Result:
     return proc.Result(0, json.dumps([{"id": f"id-{n}", key: n} for n in names]), "")
 
 
+def profiled(
+    username: str, first: str = "", last: str = "", email: str = "", user_id: str = "uid-1"
+) -> proc.Result:
+    """A `get users` answer; Keycloak omits the profile fields that are empty."""
+    row = {
+        "id": user_id,
+        "username": username,
+        "firstName": first,
+        "lastName": last,
+        "email": email,
+    }
+    return proc.Result(0, json.dumps([{k: v for k, v in row.items() if v}]), "")
+
+
 def user_calls(fake: FakeProc) -> list[list[str]]:
     """Every kcadm call after the client was created: what the users step did."""
     return fake.kc()[2:]
 
 
+def reset_calls(fake: FakeProc) -> list[int]:
+    return [i for i, c in enumerate(fake.calls) if any("/reset-password" in p for p in c)]
+
+
 def test_create_adds_a_new_user_sets_its_password_and_assigns_roles(fake: FakeProc) -> None:
     fake.on("get clients", clients())
     fake.on("get users", proc.Result(0, "[ ]", ""))
+    fake.on("create users -r", proc.Result(0, "uid-1\n", ""))
     fake.on("get roles", named("dev", "devops", key="name"))
     res = provider(users=[ALICE]).create(ctx())
     assert res.names == ["shop/web-shop.feat-cart"]
     assert user_calls(fake) == [
-        ["get", "users", "-r", "shop", "-q", "username=alice", "--fields", "id,username"],
         [
-            *("create", "users", "-r", "shop", "-s", "username=alice"),
-            *("-s", "enabled=true", "-s", "emailVerified=true", "-s", "email=alice@shop.localhost"),
+            *("get", "users", "-r", "shop", "-q", "username=alice"),
+            *("--fields", "id,username,firstName,lastName,email"),
         ],
-        ["set-password", "-r", "shop", "--username", "alice"],
+        [
+            *("create", "users", "-r", "shop", "-i", "-s", "username=alice"),
+            *("-s", "enabled=true", "-s", "emailVerified=true"),
+            *("-s", "firstName=alice", "-s", "lastName=wt", "-s", "email=alice@shop.localhost"),
+        ],
+        ["update", "users/uid-1/reset-password", "-r", "shop"],
         ["get", "roles", "-r", "shop", "-q", "search=admin", "--fields", "id,name"],
         ["create", "roles", "-r", "shop", "-s", "name=admin"],
         ["add-roles", "-r", "shop", "--uusername", "alice", "--rolename", "admin"],
@@ -712,35 +735,54 @@ def test_create_adds_a_new_user_sets_its_password_and_assigns_roles(fake: FakePr
     ]
 
 
-def test_a_user_without_email_or_roles_is_created_without_them(fake: FakeProc) -> None:
+def test_a_user_without_email_gets_a_placeholder_one(fake: FakeProc) -> None:
     fake.on("get clients", clients())
     fake.on("get users", proc.Result(0, "[ ]", ""))
-    bob = {"username": "bob", "password": "pw-bob"}
-    provider(users=[bob]).create(ctx())
+    fake.on("create users -r", proc.Result(0, "uid-2\n", ""))
+    provider(users=[{"username": "bob", "password": "pw-bob"}]).create(ctx())
     create = next(c for c in user_calls(fake) if c[:2] == ["create", "users"])
-    assert not any(part.startswith("email=") for part in create)
-    assert [c[0] for c in user_calls(fake)] == ["get", "create", "set-password"]
+    assert "email=bob@wt.invalid" in create and "firstName=bob" in create
+    assert [c[0] for c in user_calls(fake)] == ["get", "create", "update"]
+    assert user_calls(fake)[2][1] == "users/uid-2/reset-password"
 
 
 def test_an_existing_user_is_not_recreated_but_gets_its_password_again(fake: FakeProc) -> None:
     fake.on("get clients", clients())
-    fake.on("get users", named("alice"))
+    fake.on("get users", profiled("alice", "Alice", "A", "a@x.io", "uid-9"))
     provider(users=[{**ALICE, "roles": []}]).create(ctx())
-    verbs = [c[:2] for c in user_calls(fake)]
-    assert ["create", "users"] not in verbs
-    assert ["set-password", "-r"] in verbs
+    assert user_calls(fake)[1:] == [["update", "users/uid-9/reset-password", "-r", "shop"]]
+
+
+def test_an_existing_user_with_an_empty_profile_gets_only_the_empty_fields(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", profiled("alice", first="Alice", user_id="uid-9"))
+    provider(users=[{**ALICE, "roles": [], "email": None}]).create(ctx())
+    assert user_calls(fake)[1:] == [
+        [
+            "update",
+            "users/uid-9",
+            "-r",
+            "shop",
+            "-s",
+            "lastName=wt",
+            "-s",
+            "email=alice@wt.invalid",
+        ],
+        ["update", "users/uid-9/reset-password", "-r", "shop"],
+    ]
 
 
 def test_the_user_match_is_exact_and_ignores_case(fake: FakeProc) -> None:
     fake.on("get clients", clients())
     fake.on("get users", named("alice2", "malice"))
+    fake.on("create users -r", proc.Result(0, "uid-1\n", ""))
     provider(users=[{**ALICE, "roles": []}]).create(ctx())
-    assert ["create", "users"] in [c[:2] for c in user_calls(fake)]
+    assert next(c[:2] for c in user_calls(fake)[1:]) == ["create", "users"]
     # Keycloak stores usernames in lower case: "Alice" finds the stored "alice".
     fake.calls.clear()
     fake.rules.clear()
     fake.on("get clients", clients())
-    fake.on("get users", named("alice"))
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
     provider(users=[{**ALICE, "username": "Alice", "roles": []}]).create(ctx())
     assert ["create", "users"] not in [c[:2] for c in user_calls(fake)]
 
@@ -765,46 +807,58 @@ def test_a_role_created_by_a_concurrent_up_counts_as_done(fake: FakeProc) -> Non
 
 def test_the_password_travels_in_the_environment_never_in_argv(fake: FakeProc) -> None:
     fake.on("get clients", clients())
-    fake.on("get users", proc.Result(0, "[ ]", ""))
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
     fake.on("get roles", proc.Result(0, "[ ]", ""))
     provider(users=[ALICE]).create(ctx())
+    body = json.dumps({"type": "password", "value": PASSWORD, "temporary": False})
     assert all(PASSWORD not in part for call in fake.calls for part in call)
-    index = next(i for i, c in enumerate(fake.calls) if "set-password" in c)
+    (index,) = reset_calls(fake)
     call = fake.calls[index]
-    assert fake.envs[index] == {"WT_KC_PASSWORD": PASSWORD}
-    assert call[:5] == ["docker", "exec", "-e", "WT_KC_PASSWORD", keycloak.container()]
-    assert "--temporary" not in call
-    assert '--new-password "$WT_KC_PASSWORD"' in call[call.index("-c") + 1]
+    assert fake.envs[index] == {"WT_KC_BODY": body}
+    assert call[:5] == ["docker", "exec", "-e", "WT_KC_BODY", keycloak.container()]
+    assert "WT_KC_PASSWORD" not in " ".join(call) and "--temporary" not in call
     assert [e for i, e in enumerate(fake.envs) if i != index] == [None] * (len(fake.envs) - 1)
 
 
-def test_the_set_password_script_is_fixed_and_logs_in_like_the_other(fake: FakeProc) -> None:
-    script = keycloak.SET_PASSWORD_SCRIPT
+def test_the_reset_password_script_is_fixed_and_keeps_the_body_out_of_argv() -> None:
+    script = keycloak.RESET_PASSWORD_SCRIPT
     assert script.startswith(keycloak.LOGIN_SCRIPT)
-    assert "trap" in script and PASSWORD not in script and "--temporary" not in script
+    assert "printf '%s' \"$WT_KC_BODY\" | " in script and '"$@" -n -f - ' in script
+    assert "--new-password" not in script and PASSWORD not in script
 
 
 def test_a_failure_that_echoes_the_password_is_masked(fake: FakeProc) -> None:
     fake.on("get clients", clients())
-    fake.on("get users", named("alice"))
-    fake.on("set-password", proc.Result(1, "", f"Invalid password: {PASSWORD} is too weak\n"))
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
+    fake.on("reset-password", proc.Result(1, "", f"Invalid password: {PASSWORD} is too weak\n"))
     with pytest.raises(WtError) as err:
         provider(users=[ALICE]).create(ctx())
-    assert str(err.value) == "keycloak: Invalid password: *** is too weak (kcadm.sh set-password)"
+    assert str(err.value) == "keycloak: Invalid password: *** is too weak (kcadm.sh update users)"
 
 
-def test_a_failure_on_stdout_that_echoes_the_password_is_masked(fake: FakeProc) -> None:
+def test_a_failure_that_echoes_the_json_body_is_masked(fake: FakeProc) -> None:
     fake.on("get clients", clients())
-    fake.on("get users", named("alice"))
-    fake.on("set-password", proc.Result(1, f"bad {PASSWORD}", ""))
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
+    body = json.dumps({"type": "password", "value": PASSWORD, "temporary": False})
+    fake.on("reset-password", proc.Result(1, f"bad {body}", ""))
     with pytest.raises(WtError) as err:
         provider(users=[ALICE]).create(ctx())
     assert PASSWORD not in str(err.value) and "***" in str(err.value)
 
 
+def test_a_password_with_json_escapes_is_masked_in_both_forms(fake: FakeProc) -> None:
+    tricky = 'pa"ss\\word'
+    fake.on("get clients", clients())
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
+    fake.on("reset-password", proc.Result(1, "", f"rejected {tricky} / {json.dumps(tricky)}"))
+    with pytest.raises(WtError) as err:
+        provider(users=[{**ALICE, "password": tricky}]).create(ctx())
+    assert str(err.value) == 'keycloak: rejected *** / "***" (kcadm.sh update users)'
+
+
 def test_user_errors_keep_the_standard_form(fake: FakeProc) -> None:
     fake.on("get clients", clients())
-    fake.on("get users", named("alice"))
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e"))
     fake.on("get roles", named("admin", "dev", key="name"))
     fake.on("add-roles", proc.Result(1, "", "boom"))
     with pytest.raises(WtError) as err:
@@ -851,3 +905,15 @@ def test_verify_without_users_makes_no_user_call(fake: FakeProc) -> None:
 def test_the_call_name_ignores_realm_and_user_values() -> None:
     args = ("add-roles", "-r", "shop", "--uusername", "alice", "--rolename", "admin")
     assert keycloak._call_name(args) == "kcadm.sh add-roles"
+
+
+def test_a_long_url_error_keeps_its_cause_at_the_start_and_the_url_end(fake: FakeProc) -> None:
+    url = f"http://localhost:8080/admin/realms/shop/users/{UUID}/reset-password"
+    fake.on("get clients", clients())
+    fake.on("get users", profiled("alice", "a", "b", "c@d.e", UUID))
+    fake.on("reset-password", proc.Result(1, "", f"Resource not found for url: {url}\n"))
+    with pytest.raises(WtError) as err:
+        provider(users=[ALICE]).create(ctx())
+    message = str(err.value)
+    assert message.startswith("keycloak: Resource not found for url")
+    assert message.endswith("reset-password (kcadm.sh update users)") and len(message) < 130

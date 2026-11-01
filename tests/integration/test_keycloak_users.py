@@ -175,18 +175,6 @@ def users_config(pw1: str, pw2: str) -> list[dict[str, Any]]:
     ]
 
 
-def complete_profile(realm: str, username: str) -> None:
-    """Give the user a first name, last name and email, which Keycloak 26 needs to let her log in.
-
-    Used only by the tests that are about something else than the first login; the test about
-    the first login (`test_user_can_log_in_right_after_up`) does not call it.
-    """
-    ids = kcadm_json("get", "users", "-r", realm, "-q", f"username={username}", "--fields", "id")
-    profile = ("firstName=Dev", "lastName=User", f"email={username}@example.test")
-    flags = [part for field in profile for part in ("-s", field)]
-    keycloak.kcadm("update", f"users/{ids[0]['id']}", "-r", realm, *flags)
-
-
 def test_users_and_roles_are_created_and_nothing_leaks(stack: Stack) -> None:
     realm = realm_name()
     pw1, pw2 = (f"Pw-{uuid.uuid4().hex}" for _ in range(2))
@@ -228,7 +216,6 @@ def test_wrong_password_is_refused(stack: Stack) -> None:
     pw1, pw2 = (f"Pw-{uuid.uuid4().hex}" for _ in range(2))
     stack.write_catalog(realm, users_config(pw1, pw2))
     stack.up("feat/wrong", [pw1, pw2])
-    complete_profile(realm, "alice")
 
     assert login(realm, "alice", pw1).returncode == 0
     wrong = login(realm, "alice", "not-the-password")
@@ -244,8 +231,6 @@ def test_users_survive_other_branches_a_password_change_and_down(stack: Stack) -
     secrets = [pw1, pw2, pw3]
     stack.write_catalog(realm, users_config(pw1, pw2))
     stack.up("feat/one", secrets)
-    for username in ("alice", "bob"):
-        complete_profile(realm, username)
 
     # another branch of the same realm leaves users, roles and passwords alone
     stack.up("feat/two", secrets)
