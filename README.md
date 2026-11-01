@@ -92,6 +92,11 @@ one project; another project uses another file through `WT_CATALOG`. Each branch
 services with `wt add <branch> --uses a,b` (stored per branch); `wt up` on a branch without
 services fails with `branch <b> has no services yet; run wt add <b> --uses a,b`.
 
+`worktrees:` (optional) is the folder where wt creates its git worktrees, one folder per wt with a
+subfolder per repo. An existing wt keeps the folder it was created in; a non-empty folder that wt
+did not create is refused. A new worktree has no `.venv` or `node_modules` (they are not committed),
+so point `run:` at what exists (for example the main checkout's `.venv/bin/uvicorn`).
+
 Coming from 0.5.x? `wt migrate path/to/worktree.yaml` imports the old file into the catalog
 (idempotent; it reports every conflict by name and records the stack for branches you already
 have). A `worktree.yaml` is not read by anything else any more.
@@ -99,6 +104,9 @@ have). A `worktree.yaml` is not read by anything else any more.
 ```yaml
 project: shop
 domain: shop.localhost          # *.localhost resolves to 127.0.0.1 in browsers
+
+worktrees: ~/work/wt            # optional: a wt named feat-x gets ~/work/wt/feat-x/<repo>
+                                # (default: ~/.wt/<project>/worktrees/<name>/<repo>)
 
 repos:                          # each repo gets a git worktree per branch
   api: ../shop-api              # relative paths are relative to this file
