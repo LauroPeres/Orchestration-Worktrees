@@ -20,11 +20,13 @@ from tests.conftest import (
     PORT_WINDOW,
     PORT_WINDOW_FLOOR,
     SHARED,
+    SHOP_CATALOG,
     WINDOW_TRIES,
     FakeDocker,
     FakeProvider,
     _pick_free_window,
     _window_is_free,
+    write_global_catalog,
 )
 from tests.conftest import git as git_run
 from wt import compose, git, health, host, naming, orchestrator, proc, router, state, tls
@@ -2981,3 +2983,219 @@ def test_two_branches_with_different_selections_stay_independent(
     assert docker.kept_downs == ["wt-shop-feat-y-api"]
     assert [r.service for r in o.ls(probe=False)[0].services] == ["front", "back"]
     assert state_["feat/x"].uses is None and state_["feat/y"].uses == ["lone"]
+
+
+# --- global catalog: the selection comes with the branch (§21) ---
+def _stored(o: Orchestrator, branch: str) -> list[str] | None:
+    return o.store.load().branches[branch].uses
+
+
+def test_up_of_an_unknown_branch_with_uses_creates_it_and_stores_the_selection(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    reports = global_orch.up("feat/x", uses=["back"])
+    assert [r.service for r in reports] == ["back"]
+    assert _stored(global_orch, "feat/x") == ["back"]
+    assert global_orch.store.load().branches["feat/x"].status == "up"
+
+
+def test_up_without_a_selection_says_how_to_choose(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    with pytest.raises(WtError) as err:
+        global_orch.up("feat/x")
+    assert str(err.value) == "branch feat/x has no services yet; run wt add feat/x --uses a,b"
+    with pytest.raises(WtError, match="has no services yet"):
+        global_orch.add("feat/x")
+    assert global_orch.store.load().branches == {}
+
+
+def test_up_with_an_empty_selection_is_refused(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    for create in (global_orch.up, global_orch.add):
+        with pytest.raises(WtError) as err:
+            create("feat/x", uses=[])
+        assert str(err.value) == "choose at least one service (wt add <b> --uses a,b)"
+    assert global_orch.store.load().branches == {}
+
+
+def test_up_with_an_unknown_service_creates_nothing(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        global_orch.up("feat/x", uses=["nope"])
+    assert global_orch.store.load().branches == {}
+    assert docker.ups == []
+
+
+def test_the_stored_selection_wins_and_the_note_is_logged(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    logs: list[str] = []
+    o = Orchestrator(write_global_catalog(tmp_path, SHOP_CATALOG), log=logs.append)
+    o.add("feat/x", uses=["back"])
+    reports = o.up("feat/x", uses=["front"])
+    assert [r.service for r in reports] == ["back"]
+    assert _stored(o, "feat/x") == ["back"]
+    assert "branch feat/x already has services back; keeping them (use configure to change)" in logs
+
+
+def test_no_note_when_the_selection_is_not_repeated(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    logs: list[str] = []
+    o = Orchestrator(write_global_catalog(tmp_path, SHOP_CATALOG), log=logs.append)
+    o.up("feat/x", uses=["back"])
+    o.up("feat/x")
+    assert not [m for m in logs if "keeping them" in m]
+
+
+def test_the_dependency_closure_starts_but_only_the_choice_is_stored(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    reports = global_orch.up("feat/x", uses=["front"])
+    assert sorted(r.service for r in reports) == ["back", "front"]  # front needs back
+    assert _stored(global_orch, "feat/x") == ["front"]
+    assert sorted(r.service for r in global_orch.ls(probe=False)[0].services) == ["back", "front"]
+
+
+def test_add_then_up_without_uses_rebuilds_the_same_stack(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    assert global_orch.add("feat/x", uses=["front"]) is True
+    assert _stored(global_orch, "feat/x") == ["front"]
+    assert global_orch.store.load().branches["feat/x"].status == "stopped"
+    reports = global_orch.up("feat/x")
+    assert sorted(r.service for r in reports) == ["back", "front"]
+    assert global_orch.add("feat/x", uses=["back"]) is False  # known: nothing changes
+    assert _stored(global_orch, "feat/x") == ["front"]
+
+
+def test_a_branch_without_a_selection_takes_the_one_given_to_up(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    global_orch.up("feat/x", uses=["back"])
+    _set_uses(global_orch, "feat/x", None)  # a branch recorded before v0.6.0
+    with pytest.raises(WtError, match="has no services yet"):
+        global_orch.up("feat/x")
+    global_orch.up("feat/x", uses=["front"])
+    assert _stored(global_orch, "feat/x") == ["front"]
+
+
+def test_a_failed_up_of_a_new_branch_keeps_the_selection_for_down(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    docker.fail_up = True
+    with pytest.raises(WtError, match="compose up failed"):
+        global_orch.up("feat/x", uses=["front"])
+    bs = global_orch.store.load().branches["feat/x"]
+    assert (bs.status, bs.uses) == ("failed", ["front"])
+    docker.fail_up = False
+    assert global_orch.down("feat/x") is True
+    assert global_orch.store.load().branches == {}
+
+
+def test_uses_is_ignored_for_a_worktree_yaml_project(
+    catalog_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = catalog_orch
+    o.up("feat/x", uses=["db"])  # yaml selection [db, web] applies
+    assert _stored(o, "feat/x") is None
+    assert o.add("feat/y", uses=[]) is True
+
+
+def test_adopt_branches_only_touches_branches_without_a_selection(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    o = global_orch
+    for branch in ("feat/b", "feat/a", "feat/c"):
+        o.add(branch, uses=["back"])
+    _set_uses(o, "feat/b", None)
+    _set_uses(o, "feat/a", None)
+    assert o.adopt_branches(["front"]) == ["feat/a", "feat/b"]
+    assert _stored(o, "feat/a") == _stored(o, "feat/b") == ["front"]
+    assert _stored(o, "feat/c") == ["back"]
+    assert o.adopt_branches(["front"]) == []  # nothing left to adopt
+
+
+def test_adopt_branches_validates_the_names_before_writing(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    global_orch.add("feat/a", uses=["back"])
+    _set_uses(global_orch, "feat/a", None)
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        global_orch.adopt_branches(["nope"])
+    with pytest.raises(WtError, match="select at least one service"):
+        global_orch.adopt_branches([])
+    assert _stored(global_orch, "feat/a") is None
+
+
+def test_catalog_choices_without_a_branch_lists_the_catalog_with_direct_consumers(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    choices = global_orch.catalog_choices(None)
+    assert choices is not None
+    assert [(c.service, c.repo, c.selected, c.required_by) for c in choices] == [
+        ("back", "api", False, ("front",)),  # front consumes it
+        ("front", "api", False, ()),
+    ]
+    assert global_orch.catalog_choices() == choices
+
+
+def test_catalog_choices_of_a_branch_follow_its_stack(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    global_orch.add("feat/x", uses=["front"])
+    choices = global_orch.catalog_choices("feat/x")
+    assert choices is not None
+    assert [(c.service, c.selected, c.required_by) for c in choices] == [
+        ("back", True, ("front",)),
+        ("front", True, ()),
+    ]
+
+
+def test_catalog_choices_are_none_for_a_worktree_yaml_service_project(
+    orch, docker: FakeDocker
+) -> None:
+    assert orch().catalog_choices(None) is None
+
+
+def test_catalog_choices_without_a_branch_name_only_direct_consumers(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    chain = {
+        **SHOP_CATALOG,
+        "services": {
+            name: {
+                "repo": "api",
+                "compose": "docker-compose.yml",
+                "compose_service": "api",
+                "port": 8000,
+                "subdomain": name,
+                **({"consumes": {dep: dep.upper()}} if dep else {}),
+            }
+            for name, dep in (("c", None), ("b", "c"), ("a", "b"))
+        },
+    }
+    o = Orchestrator(write_global_catalog(tmp_path, chain), log=lambda m: None)
+    choices = o.catalog_choices(None)
+    assert choices is not None
+    assert [(c.service, c.selected, c.required_by) for c in choices] == [
+        ("a", False, ()),  # the file is dumped sorted, so catalog order is a, b, c
+        ("b", False, ("a",)),
+        ("c", False, ("b",)),  # a reaches c only through b: not listed
+    ]
+
+
+def test_log_command_uses_the_selection_stored_for_the_branch(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    global_orch.add("feat/x", uses=["front"])  # the anchor is back, the branch stores front
+    args = global_orch.log_command("feat/x", "front", follow=False, tail=9)
+    assert args[-1] == "api"  # front's compose service
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        global_orch.log_command("feat/x", "nope", follow=False, tail=9)
