@@ -1,4 +1,5 @@
 import copy
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -1158,3 +1159,378 @@ def test_catalog_check_needs_a_project_and_a_domain(
     result = _check_catalog(tmp_path, monkeypatch, CATALOG.replace("project: notes\n", ""))
     assert result.exit_code == 1, result.output
     assert "missing required key(s): project" in result.output
+
+
+# --- --json (SPEC §21) ---------------------------------------------------------------------
+
+BACK_URL = "https://back.feat-cart.shop.localhost"
+FRONT_URL = "https://front.feat-cart.shop.localhost"
+SERVICE_KEYS = {"name", "kind", "status", "health", "url", "port"}
+ACTION_KEYS = ["schema", "branch", "action", "status", "urls", "warnings"]
+NO_CATALOG_COMMANDS = [
+    ["ls"],
+    ["catalog"],
+    ["add", "feat/cart", "--uses", "front"],
+    ["up", "feat/cart", "--uses", "front"],
+    ["down", "feat/cart"],
+    ["stop", "feat/cart"],
+    ["remove", "feat/cart", "--yes"],
+]
+
+
+def _document(result: Any) -> dict[str, Any]:
+    """The one JSON document on stdout; json.loads rejects anything printed around it."""
+    return json.loads(result.stdout)
+
+
+def _stub_doctor(monkeypatch: pytest.MonkeyPatch, checks: list[doctor.Check]) -> None:
+    monkeypatch.setattr(doctor, "run_checks", lambda loaded, config_error, *, fix: checks)
+
+
+def test_ls_json_of_a_running_branch(shop, docker: FakeDocker) -> None:
+    shop()
+    assert runner.invoke(app, ["up", "feat/cart", "--uses", "front"]).exit_code == 0
+    result = runner.invoke(app, ["ls", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ["schema", "project", "branches"]
+    assert document["schema"] == 1 and document["project"] == "shop"
+    [branch] = document["branches"]
+    assert list(branch) == ["branch", "status", "services"]
+    assert branch["branch"] == "feat/cart" and branch["status"] == "up"
+    services = {svc["name"]: svc for svc in branch["services"]}
+    assert set(services) == {"back", "front"}  # the dependency came along
+    assert all(set(svc) == SERVICE_KEYS for svc in services.values())
+    assert services["back"] == {
+        "name": "back",
+        "kind": "compose",
+        "status": "up",
+        "health": "ok",
+        "url": BACK_URL,
+        "port": None,
+    }
+    assert services["front"]["url"] == FRONT_URL
+
+
+def test_ls_json_no_probe_has_no_health(shop, docker: FakeDocker) -> None:
+    shop()
+    runner.invoke(app, ["up", "feat/cart", "--uses", "back"])
+    result = runner.invoke(app, ["ls", "--json", "--no-probe"])
+    assert result.exit_code == 0, result.output
+    [branch] = _document(result)["branches"]
+    assert branch["services"] and all(svc["health"] is None for svc in branch["services"])
+    assert all(svc["status"] == branch["status"] for svc in branch["services"])
+
+
+def test_ls_json_of_a_stopped_branch_has_no_health(shop, docker: FakeDocker) -> None:
+    shop()
+    runner.invoke(app, ["add", "feat/cart", "--uses", "front"])
+    result = runner.invoke(app, ["ls", "--json"])
+    assert result.exit_code == 0, result.output
+    [branch] = _document(result)["branches"]
+    assert branch["status"] == "stopped"
+    assert branch["services"]
+    for svc in branch["services"]:
+        assert (svc["status"], svc["health"]) == ("stopped", None)
+
+
+def test_ls_json_without_branches_is_an_empty_list(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["ls", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {"schema": 1, "project": "shop", "branches": []}
+
+
+def test_ls_document_maps_probe_outcomes_and_sorts_branches() -> None:
+    statuses = [
+        BranchStatus(
+            "feat/b",
+            "degraded",
+            1,
+            2,
+            services=[
+                ServiceReport("web", "fail", "HTTP 502", "https://web.b.localhost", "run"),
+                ServiceReport("api", "ok", "HTTP 200", "https://api.b.localhost"),
+            ],
+        ),
+        BranchStatus(
+            "feat/a",
+            "stopped",
+            0,
+            1,
+            services=[ServiceReport("api", "skipped", "", "https://api.a.localhost")],
+        ),
+    ]
+    document = cli.ls_document("shop", statuses, probed=True)
+    assert [b["branch"] for b in document["branches"]] == ["feat/a", "feat/b"]
+    stopped, degraded = document["branches"]
+    assert [(s["status"], s["health"]) for s in stopped["services"]] == [("stopped", None)]
+    web, api = degraded["services"]
+    assert (web["kind"], web["status"], web["health"]) == ("run", "degraded", "fail")
+    assert (api["kind"], api["status"], api["health"]) == ("compose", "up", "ok")
+    unprobed = cli.ls_document("shop", statuses, probed=False)
+    healths = [s["health"] for b in unprobed["branches"] for s in b["services"]]
+    assert healths == [None, None, None]
+
+
+def test_doctor_json_lists_checks_and_fails_the_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_doctor(
+        monkeypatch,
+        [
+            doctor.Check("git", "ok", "git 2.45"),
+            doctor.Check("mkcert", "warn", "local CA not created", "run `wt doctor --fix`"),
+            doctor.Check("docker", "fail", "daemon not running", "start docker"),
+        ],
+    )
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 1, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "ok": False,
+        "checks": [
+            {"name": "git", "ok": True, "detail": "git 2.45", "fixable": False},
+            {"name": "mkcert", "ok": True, "detail": "local CA not created", "fixable": True},
+            {"name": "docker", "ok": False, "detail": "daemon not running", "fixable": False},
+        ],
+    }
+
+
+def test_doctor_json_when_all_is_well_exits_0(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_doctor(monkeypatch, [doctor.Check("git", "ok", "git 2.45")])
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert document["ok"] is True and list(document) == ["schema", "ok", "checks"]
+
+
+def test_doctor_json_reports_a_missing_catalog_as_a_failed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        doctor,
+        "run_checks",
+        lambda loaded, config_error, *, fix: [doctor.Check("config", "fail", config_error or "")],
+    )
+    result = runner.invoke(app, ["doctor", "--json"])
+    assert result.exit_code == 1, result.output
+    [check] = _document(result)["checks"]
+    assert check["name"] == "config" and check["ok"] is False
+    assert check["detail"].startswith(f"no catalog at {tmp_path / 'wt-home' / 'catalog.yaml'}")
+
+
+def test_catalog_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "project": "notes",
+        "domain": "notes.localhost",
+        "services": [
+            {
+                "name": "back",
+                "repo": "notes-back",
+                "kind": "compose",
+                "infra": ["postgres"],
+                "consumes": {},
+                "consumed_by": ["front"],
+                "remote": "https://api.staging.example",
+            },
+            {
+                "name": "front",
+                "repo": "notes-front",
+                "kind": "run",
+                "infra": [],
+                "consumes": {"back": "API_URL"},
+                "consumed_by": [],
+                "remote": None,
+            },
+        ],
+    }
+
+
+def test_catalog_json_refuses_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "c.yaml").write_text(CATALOG)
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "c.yaml"))
+    result = runner.invoke(app, ["catalog", "--check", "--json"])
+    assert result.exit_code == 1, result.output
+    document = _document(result)
+    assert list(document) == ["schema", "error"] and "--check" in document["error"]
+
+
+def test_up_json_reports_status_urls_and_warnings(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["up", "feat/cart", "--uses", "front", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ACTION_KEYS
+    assert document["schema"] == 1
+    assert (document["branch"], document["action"], document["status"]) == (
+        "feat/cart",
+        "up",
+        "up",
+    )
+    assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
+    assert document["warnings"] == []
+    assert docker.ups == ["wt-shop-feat-cart-api"]
+
+
+def test_up_json_degraded_exits_1_with_the_document(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker.healthy = False
+    docker.install(monkeypatch)
+    shop()
+    result = runner.invoke(app, ["up", "feat/cart", "--uses", "front", "--json"])
+    assert result.exit_code == 1, result.output
+    document = _document(result)
+    assert (document["action"], document["status"]) == ("up", "degraded")
+    assert document["warnings"]
+    assert all("is not healthy" in warning for warning in document["warnings"])
+
+
+def test_add_json(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["add", "feat/cart", "--uses", "front", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ACTION_KEYS
+    assert (document["branch"], document["action"], document["status"]) == (
+        "feat/cart",
+        "add",
+        "stopped",
+    )
+    assert document["urls"] == {} and document["warnings"] == []
+    assert docker.ups == []
+
+
+def test_add_json_of_a_known_branch_has_no_status(shop, docker: FakeDocker) -> None:
+    shop()
+    runner.invoke(app, ["add", "feat/cart", "--uses", "back"])
+    result = runner.invoke(app, ["add", "feat/cart", "--uses", "front", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result)["status"] is None
+    assert StateStore("shop").load().branches["feat/cart"].uses == ["back"]
+
+
+def test_add_json_never_prompts_on_a_terminal(shop, on_a_terminal) -> None:
+    shop()
+    result = runner.invoke(app, ["add", "feat/cart", "--json"], input="1\n")
+    assert result.exit_code == 1, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "error": "branch feat/cart has no services yet; run wt add feat/cart --uses a,b",
+    }
+    assert "Services" not in result.stdout
+    assert "feat/cart" not in StateStore("shop").load().branches
+
+
+def test_stop_json(shop, docker: FakeDocker) -> None:
+    shop()
+    runner.invoke(app, ["up", "feat/cart", "--uses", "front"])
+    result = runner.invoke(app, ["stop", "feat/cart", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ACTION_KEYS
+    assert (document["action"], document["status"]) == ("stop", "stopped")
+    assert document["urls"] == {} and document["warnings"] == []
+    assert docker.kept_downs == ["wt-shop-feat-cart-api"]
+
+
+def test_down_json(shop, docker: FakeDocker) -> None:
+    shop()
+    runner.invoke(app, ["up", "feat/cart", "--uses", "front"])
+    result = runner.invoke(app, ["down", "feat/cart", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ACTION_KEYS
+    assert (document["branch"], document["action"], document["status"]) == (
+        "feat/cart",
+        "down",
+        None,
+    )
+    assert docker.downs == ["wt-shop-feat-cart-api"]
+
+
+def test_down_json_of_an_unknown_branch_still_prints_the_document(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["down", "feat/nope", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result)["action"] == "down"
+
+
+def test_remove_json_with_yes(shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    calls = _record_removes(monkeypatch)
+    result = runner.invoke(app, ["remove", "feat/cart", "--yes", "--force", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ACTION_KEYS
+    assert (document["action"], document["status"]) == ("remove", None)
+    assert calls == [("feat/cart", True)]
+
+
+def test_remove_json_without_yes_is_an_error_and_never_asks(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    calls = _record_removes(monkeypatch)
+    result = runner.invoke(app, ["remove", "feat/cart", "--json"], input="y\n")
+    assert result.exit_code == 1, result.output
+    document = _document(result)
+    assert list(document) == ["schema", "error"] and "--yes" in document["error"]
+    assert "Remove?" not in result.stdout
+    assert calls == []
+
+
+def test_json_error_replaces_the_traceback_free_message(shop) -> None:
+    shop()
+    result = runner.invoke(app, ["up", "feat/cart", "--json"])
+    assert result.exit_code == 1, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "error": "branch feat/cart has no services yet; run wt add feat/cart --uses a,b",
+    }
+
+
+@pytest.mark.parametrize("args", NO_CATALOG_COMMANDS, ids=lambda args: args[0])
+def test_json_error_text_is_the_one_the_cli_prints(args: list[str], tmp_path: Path) -> None:
+    plain = runner.invoke(app, args)
+    assert isinstance(plain.exception, WtError)
+    result = runner.invoke(app, [*args, "--json"])
+    assert result.exit_code == 1, result.output
+    assert _document(result) == {"schema": 1, "error": str(plain.exception)}
+    assert str(tmp_path / "wt-home" / "catalog.yaml") in str(plain.exception)
+
+
+def test_json_mode_sends_progress_to_stderr(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    monkeypatch.setattr(Orchestrator, "stop", lambda self, branch: self.log("stopping now"))
+    result = runner.invoke(app, ["stop", "feat/cart", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result)["action"] == "stop"
+    assert "stopping now" in result.stderr
+    assert "stopping now" not in result.stdout
+
+
+def test_without_json_progress_stays_on_stdout(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    monkeypatch.setattr(Orchestrator, "stop", lambda self, branch: self.log("stopping now"))
+    result = runner.invoke(app, ["stop", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert "stopping now" in result.stdout
+    assert "stopping now" not in result.stderr
+
+
+def test_action_document_defaults() -> None:
+    assert cli.action_document("feat/x", "down", None) == {
+        "schema": 1,
+        "branch": "feat/x",
+        "action": "down",
+        "status": None,
+        "urls": {},
+        "warnings": [],
+    }

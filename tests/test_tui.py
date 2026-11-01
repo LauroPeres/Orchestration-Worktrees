@@ -695,7 +695,7 @@ def test_configure_on_services_project_shows_note() -> None:
             await pilot.press("c")
             await pilot.pause()
             assert str(app.screen.query_one("#message", Static).render()) == (
-                "configure needs a catalog project (uses: in worktree.yaml)"
+                "no catalog for this project. Run wt init or wt migrate"
             )
             assert not app.screen.query("#choices")
 

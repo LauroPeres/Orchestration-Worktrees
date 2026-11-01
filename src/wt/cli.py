@@ -3,10 +3,12 @@
 import json
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+import click
 import typer
 import yaml
 from rich.console import Console, ConsoleDimensions
@@ -15,6 +17,7 @@ from rich.table import Table
 
 from wt import __version__, doctor
 from wt.catalog import (
+    Catalog,
     MergeResult,
     catalog_path,
     load_catalog,
@@ -26,7 +29,7 @@ from wt.catalog import (
 from wt.config import CONFIG_NAME, LoadedConfig
 from wt.errors import WtError
 from wt.naming import slugify
-from wt.orchestrator import Choice, Orchestrator, ServiceReport
+from wt.orchestrator import BranchStatus, Choice, Orchestrator, ServiceReport
 from wt.projects import KnownProject, known_projects
 from wt.state import atomic_write
 
@@ -71,9 +74,22 @@ def _log(message: str) -> None:
     console.print(f"[dim]>[/] {message}")
 
 
+def _log_to_stderr(message: str) -> None:
+    err.print(f"[dim]>[/] {message}")
+
+
+def _progress(json_output: bool) -> Callable[[str], None]:
+    """Where progress lines go: stdout, or stderr when stdout is reserved for one JSON document."""
+    return _log_to_stderr if json_output else _log
+
+
 CATALOG_HELP = "Path to the catalog file (default: $WT_HOME/catalog.yaml)."
 CatalogOption = Annotated[
     Path | None, typer.Option("--catalog", "-c", envvar="WT_CATALOG", help=CATALOG_HELP)
+]
+JsonOption = Annotated[
+    bool,
+    typer.Option("--json", help="Print one JSON document on stdout (for scripts and agents)."),
 ]
 UsesOption = Annotated[
     str | None,
@@ -116,14 +132,148 @@ services:
 """
 
 
-def _catalog_file(ctx: typer.Context) -> Path:
+def _catalog_file(ctx: click.Context) -> Path:
     """The catalog: `--catalog` / WT_CATALOG, else $WT_HOME/catalog.yaml. Never the cwd."""
     explicit: Path | None = ctx.obj
     return explicit if explicit else catalog_path(None, None)
 
 
-def _load(ctx: typer.Context) -> LoadedConfig:
+def _load(ctx: click.Context) -> LoadedConfig:
     return load_project(_catalog_file(ctx))
+
+
+# ---- JSON output (SPEC §21) ---------------------------------------------------------------
+# One pure builder per document; the commands only choose between printing a table and emitting it.
+
+JSON_SCHEMA = 1
+FIX_COMMAND = "wt doctor --fix"  # a check whose hint names it can be fixed by that command
+JsonDocument = dict[str, Any]
+Action = Literal["up", "add", "down", "stop", "remove"]
+
+
+def _emit(document: JsonDocument) -> None:
+    typer.echo(json.dumps(document))
+
+
+@contextmanager
+def _json_errors(json_output: bool) -> Iterator[None]:
+    """In --json mode a WtError is the error document on stdout and exit code 1 (SPEC §21)."""
+    try:
+        yield
+    except WtError as exc:
+        if not json_output:
+            raise
+        _emit({"schema": JSON_SCHEMA, "error": str(exc)})
+        raise typer.Exit(1) from None
+
+
+def _service_status(report: ServiceReport, branch_status: str) -> str:
+    """A service has no status of its own: its probe says it, else it follows the branch."""
+    if report.outcome == "ok":
+        return "up"
+    if report.outcome == "fail":
+        return "degraded"
+    return branch_status
+
+
+def _service_health(report: ServiceReport, *, probed: bool) -> str | None:
+    return report.outcome if probed and report.outcome != "skipped" else None
+
+
+def ls_document(project: str, statuses: list[BranchStatus], *, probed: bool) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "project": project,
+        "branches": [
+            {
+                "branch": branch.branch,
+                "status": branch.status,
+                "services": [
+                    {
+                        "name": report.service,
+                        "kind": report.kind,
+                        "status": _service_status(report, branch.status),
+                        "health": _service_health(report, probed=probed),
+                        "url": report.url,
+                        "port": None,  # ServiceReport carries no port yet
+                    }
+                    for report in branch.services
+                ],
+            }
+            for branch in sorted(statuses, key=lambda b: b.branch)
+        ],
+    }
+
+
+def doctor_document(checks: list[doctor.Check]) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "ok": not any(c.level == "fail" for c in checks),
+        "checks": [
+            {
+                "name": c.name,
+                "ok": c.level != "fail",
+                "detail": c.detail,
+                "fixable": FIX_COMMAND in c.hint,
+            }
+            for c in checks
+        ],
+    }
+
+
+def catalog_document(cat: Catalog) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "project": cat.project,
+        "domain": cat.domain,
+        "services": [
+            {
+                "name": row.service,
+                "repo": row.repo,
+                "kind": row.kind,
+                "infra": row.infra,
+                "consumes": dict(cat.services[row.service].consumes),
+                "consumed_by": row.consumed_by,
+                "remote": row.remote,
+            }
+            for row in rows(cat)
+        ],
+    }
+
+
+def action_document(
+    branch: str,
+    action: Action,
+    status: str | None,
+    urls: dict[str, str] | None = None,
+    warnings: tuple[str, ...] | list[str] = (),
+) -> JsonDocument:
+    """What an action did. `status` is the branch's status afterwards (None: no longer known)."""
+    return {
+        "schema": JSON_SCHEMA,
+        "branch": branch,
+        "action": action,
+        "status": status,
+        "urls": urls or {},
+        "warnings": list(warnings),
+    }
+
+
+def _failed(report: ServiceReport) -> bool:
+    return report.outcome == "fail"
+
+
+def up_document(
+    branch: str, reports: list[ServiceReport], load_warnings: tuple[str, ...]
+) -> JsonDocument:
+    unhealthy = [f"{r.service} is not healthy: {r.detail}" for r in reports if _failed(r)]
+    return action_document(
+        branch,
+        "up",
+        "degraded" if unhealthy else "up",
+        urls={r.service: r.url for r in reports if r.url},
+        warnings=[*load_warnings, *unhealthy],
+    )
 
 
 def _version(value: bool) -> None:
@@ -220,23 +370,35 @@ def _report_table(reports: list[ServiceReport]) -> Table:
     return table
 
 
+def _print_up(branch: str, reports: list[ServiceReport]) -> None:
+    console.print()
+    console.print(_report_table(reports))
+    if any(_failed(r) for r in reports):
+        err.print(f"\n[red]{branch} is up but not healthy.[/] Check `wt logs {branch} <service>`.")
+        raise typer.Exit(1)
+    console.print(f"\n[green]{branch} is up.[/]")
+
+
 @app.command()
 def up(
-    ctx: typer.Context,
     branch: Annotated[str, typer.Argument(help="Git branch, e.g. feat/cart.")],
     uses: UsesOption = None,
     build: Annotated[bool, typer.Option("--build", help="Rebuild images.")] = False,
     timeout: Annotated[int, typer.Option(help="Seconds to wait for each step.")] = 120,
+    json_output: JsonOption = False,
 ) -> None:
     """Create worktrees, start services and routes for BRANCH, then verify them."""
-    orch = Orchestrator(_load(ctx), log=_log)
-    reports = orch.up(branch, uses=_split_uses(uses), build=build, timeout=timeout)
-    console.print()
-    console.print(_report_table(reports))
-    if any(r.outcome == "fail" for r in reports):
-        err.print(f"\n[red]{branch} is up but not healthy.[/] Check `wt logs {branch} <service>`.")
-        raise typer.Exit(1)
-    console.print(f"\n[green]{branch} is up.[/]")
+    ctx = click.get_current_context()  # not a parameter: the lint limit is 5 per function
+    with _json_errors(json_output):
+        loaded = _load(ctx)
+        orch = Orchestrator(loaded, log=_progress(json_output))
+        reports = orch.up(branch, uses=_split_uses(uses), build=build, timeout=timeout)
+        if not json_output:
+            _print_up(branch, reports)
+            return
+        _emit(up_document(branch, reports, loaded.warnings))
+        if any(_failed(r) for r in reports):
+            raise typer.Exit(1)  # same exit code as the table output: up but not healthy
 
 
 @app.command()
@@ -246,10 +408,15 @@ def down(
     force: Annotated[
         bool, typer.Option("--force", help="Remove worktrees with uncommitted changes.")
     ] = False,
+    json_output: JsonOption = False,
 ) -> None:
     """Stop and remove everything wt created for BRANCH. Branch commits are kept."""
-    if Orchestrator(_load(ctx), log=_log).down(branch, force=force):
-        console.print(f"[green]{branch} is down.[/]")
+    with _json_errors(json_output):
+        done = Orchestrator(_load(ctx), log=_progress(json_output)).down(branch, force=force)
+        if json_output:
+            _emit(action_document(branch, "down", None))
+        elif done:
+            console.print(f"[green]{branch} is down.[/]")
 
 
 @app.command()
@@ -257,24 +424,37 @@ def add(
     ctx: typer.Context,
     branch: Annotated[str, typer.Argument(help="Git branch, e.g. feat/cart.")],
     uses: UsesOption = None,
+    json_output: JsonOption = False,
 ) -> None:
     """Create worktrees and reserve ports for BRANCH without starting anything."""
-    orch = Orchestrator(_load(ctx), log=_log)
-    chosen = _split_uses(uses)
-    if chosen is None and _interactive():
-        chosen = _ask_services(orch)
-    if orch.add(branch, chosen):
-        console.print(f"[green]{branch} is added (stopped).[/] Start it with `wt up {branch}`.")
+    with _json_errors(json_output):
+        loaded = _load(ctx)
+        orch = Orchestrator(loaded, log=_progress(json_output))
+        chosen = _split_uses(uses)
+        if chosen is None and _interactive() and not json_output:  # --json never prompts
+            chosen = _ask_services(orch)
+        added = orch.add(branch, chosen)
+        if json_output:
+            # a branch that was already known keeps its state: its status is not read here
+            status = "stopped" if added else None
+            _emit(action_document(branch, "add", status, warnings=loaded.warnings))
+        elif added:
+            console.print(f"[green]{branch} is added (stopped).[/] Start it with `wt up {branch}`.")
 
 
 @app.command()
 def stop(
     ctx: typer.Context,
     branch: Annotated[str, typer.Argument(help="Git branch.")],
+    json_output: JsonOption = False,
 ) -> None:
     """Stop BRANCH's services; worktrees, volumes, databases and ports are kept."""
-    Orchestrator(_load(ctx), log=_log).stop(branch)
-    console.print(f"[green]{branch} is stopped.[/]")
+    with _json_errors(json_output):
+        Orchestrator(_load(ctx), log=_progress(json_output)).stop(branch)
+        if json_output:
+            _emit(action_document(branch, "stop", "stopped"))
+        else:
+            console.print(f"[green]{branch} is stopped.[/]")
 
 
 @app.command()
@@ -285,27 +465,27 @@ def remove(
         bool, typer.Option("--force", help="Remove worktrees with uncommitted changes.")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
+    json_output: JsonOption = False,
 ) -> None:
     """Do `down` for BRANCH, then delete the git branch (unpushed commits are lost)."""
-    if not yes:
-        typer.confirm(
-            f"remove {branch}: removes what wt created for it (containers, volumes, databases, "
-            "worktrees) and deletes the git branch in every repo of the project where it exists; "
-            "unpushed commits are lost. Remove?",
-            abort=True,
-        )
-    if Orchestrator(_load(ctx), log=_log).remove(branch, force=force):
-        console.print(f"[green]{branch} is removed.[/]")
+    with _json_errors(json_output):
+        if json_output and not yes:
+            raise WtError("remove --json never asks for confirmation: pass --yes")
+        if not yes:
+            typer.confirm(
+                f"remove {branch}: removes what wt created for it (containers, volumes, "
+                "databases, worktrees) and deletes the git branch in every repo of the project "
+                "where it exists; unpushed commits are lost. Remove?",
+                abort=True,
+            )
+        done = Orchestrator(_load(ctx), log=_progress(json_output)).remove(branch, force=force)
+        if json_output:
+            _emit(action_document(branch, "remove", None))
+        elif done:
+            console.print(f"[green]{branch} is removed.[/]")
 
 
-@app.command("ls")
-def ls_(
-    ctx: typer.Context,
-    no_probe: Annotated[bool, typer.Option("--no-probe", help="Skip HTTP checks.")] = False,
-    paths: Annotated[bool, typer.Option("--paths", help="Show worktree folders.")] = False,
-) -> None:
-    """List branches, URLs, status and health."""
-    rows = Orchestrator(_load(ctx), log=_log).ls(probe=not no_probe)
+def _print_branches(rows: list[BranchStatus], *, no_probe: bool, paths: bool) -> None:
     if not rows:
         console.print("no branches are up. Start one with [bold]wt up <branch>[/].")
         return
@@ -348,6 +528,23 @@ def ls_(
                 console.print(f"  {row.branch}  {repo}  {escape(path)}", soft_wrap=True)
 
 
+@app.command("ls")
+def ls_(
+    ctx: typer.Context,
+    no_probe: Annotated[bool, typer.Option("--no-probe", help="Skip HTTP checks.")] = False,
+    paths: Annotated[bool, typer.Option("--paths", help="Show worktree folders.")] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """List branches, URLs, status and health."""
+    with _json_errors(json_output):
+        loaded = _load(ctx)
+        statuses = Orchestrator(loaded, log=_progress(json_output)).ls(probe=not no_probe)
+        if json_output:
+            _emit(ls_document(loaded.config.project, statuses, probed=not no_probe))
+        else:
+            _print_branches(statuses, no_probe=no_probe, paths=paths)
+
+
 @app.command()
 def logs(
     ctx: typer.Context,
@@ -358,6 +555,17 @@ def logs(
 ) -> None:
     """Follow the logs of one service of BRANCH."""
     Orchestrator(_load(ctx), log=_log).logs(branch, service, follow=not no_follow, tail=tail)
+
+
+def _print_checks(checks: list[doctor.Check]) -> None:
+    table = Table(box=None, pad_edge=False, show_header=False)
+    for _ in range(3):
+        table.add_column(overflow="fold")
+    for c in checks:
+        table.add_row(LEVEL[c.level], c.name, escape(c.detail))
+        if c.hint:
+            table.add_row("", "", f"[dim]{escape(c.hint)}[/]")
+    console.print(table)
 
 
 @app.command("doctor")
@@ -371,6 +579,7 @@ def doctor_(
             "(and Postgres when configured).",
         ),
     ] = False,
+    json_output: JsonOption = False,
 ) -> None:
     """Check docker, git, ports, certificates and name resolution."""
     loaded: LoadedConfig | None = None
@@ -379,15 +588,12 @@ def doctor_(
         loaded = _load(ctx)
     except WtError as exc:
         config_error = str(exc)  # also the "no catalog at ..." of a missing file
-    checks = doctor.run_checks(loaded, config_error, fix=fix)
-    table = Table(box=None, pad_edge=False, show_header=False)
-    for _ in range(3):
-        table.add_column(overflow="fold")
-    for c in checks:
-        table.add_row(LEVEL[c.level], c.name, escape(c.detail))
-        if c.hint:
-            table.add_row("", "", f"[dim]{escape(c.hint)}[/]")
-    console.print(table)
+    with _json_errors(json_output):
+        checks = doctor.run_checks(loaded, config_error, fix=fix)
+        if json_output:
+            _emit(doctor_document(checks))
+        else:
+            _print_checks(checks)
     if any(c.level == "fail" for c in checks):
         raise typer.Exit(1)
 
@@ -504,20 +710,11 @@ def _service_failures(catalog_file: Path, names: list[str]) -> dict[str, str]:
     return failures
 
 
-@app.command()
-def catalog(
-    ctx: typer.Context,
-    check: Annotated[bool, typer.Option("--check", help="Validate the catalog and exit.")] = False,
-) -> None:
-    """Show the catalog (services, repos, infra, who consumes whom)."""
-    path = _catalog_file(ctx)
-    if check:
-        _check_catalog(path)
-        return
+def _print_catalog(cat: Catalog) -> None:
     table = Table(box=None, pad_edge=False)
     for col in ("SERVICE", "REPO", "KIND", "INFRA", "CONSUMES", "CONSUMED BY", "REMOTE"):
         table.add_column(col, overflow="fold", no_wrap=True)
-    for row in rows(load_catalog(path).catalog):
+    for row in rows(cat):
         table.add_row(
             row.service,
             row.repo,
@@ -528,6 +725,27 @@ def catalog(
             row.remote or "-",
         )
     console.print(table)
+
+
+@app.command()
+def catalog(
+    ctx: typer.Context,
+    check: Annotated[bool, typer.Option("--check", help="Validate the catalog and exit.")] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Show the catalog (services, repos, infra, who consumes whom)."""
+    with _json_errors(json_output):
+        path = _catalog_file(ctx)
+        if check and json_output:
+            raise WtError("--check prints its own report: use it without --json")
+        if check:
+            _check_catalog(path)
+            return
+        cat = load_catalog(path).catalog
+        if json_output:
+            _emit(catalog_document(cat))
+        else:
+            _print_catalog(cat)
 
 
 def _read_catalog_mapping(path: Path) -> dict[str, Any] | None:
