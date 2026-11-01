@@ -1019,7 +1019,12 @@ use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for
   `<path> already exists and was not created by wt; move it, or choose another name or worktrees folder`.
   (The `<worktrees>/<slug>` folder may exist and be empty or hold only wt worktrees of other repos.)
   `down`/`remove` delete only the worktree folders wt recorded, and the `<slug>` folder only when empty.
-- **TUI look.** No colors, backgrounds or borders: every widget uses the terminal's own colors. The
-  screen is the table (one row per worktree), the action line and the message line, redrawn in place
-  (the table refreshes every 2 s and after each action). Input and confirm boxes are plain text boxes.
-  The services checklist keeps its `[x]` markers and `(required by …)` labels as text only.
+- **TUI look (replaces the first wording).** A little color, a real table, one screen per action.
+  - Main screen: a bordered table (one row per worktree, columns `NAME` and `STATUS`) whose column
+    names are green, the action line (`u: up  d: down  a: add  r: remove  q: quit`) with the key
+    letters in green, and the message line. Everything else uses the terminal's own colors; the
+    selected row is reverse video. No other colors or backgrounds.
+  - Every action that needs input clears the page and shows only that step, then returns to the
+    table: `a` shows the "Enter name" input, then the services checklist (own page each); `r` shows
+    the confirmation alone. `u` and `d` act on the selected row and report on the message line.
+  - The services checklist keeps `[x]` markers and `(required by …)` labels as text.
