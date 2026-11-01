@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -41,6 +42,13 @@ class FakeOrch:
             Choice("back", "api", True),
             Choice("db", "api", False),
         ]
+        # what `catalog_choices(None)` answers: nothing selected, back is a dependency of front
+        self.new_choices: list[Choice] | None = [
+            Choice("front", "web", False),
+            Choice("back", "api", False, required_by=("front",)),
+            Choice("db", "api", False),
+        ]
+        self.choices_error: Exception | None = None
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         self.ls_count += 1
@@ -61,8 +69,8 @@ class FakeOrch:
         self._act("stop", branch)
         return True
 
-    def add(self, branch: str) -> object:
-        self._act("add", branch)
+    def add(self, branch: str, uses: list[str]) -> object:
+        self._act("add", branch, list(uses))
         return True
 
     def remove(self, branch: str, *, force: bool = False) -> object:
@@ -75,8 +83,10 @@ class FakeOrch:
             raise self.services_error
         return self.service_rows
 
-    def catalog_choices(self, branch: str) -> list[Choice] | None:
-        return self.choices
+    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
+        if self.choices_error is not None:
+            raise self.choices_error
+        return self.new_choices if branch is None else self.choices
 
     def configure(self, branch: str, uses: list[str]) -> None:
         self._act("configure", branch, list(uses))
@@ -132,18 +142,250 @@ def test_u_and_d_call_up_and_stop_of_selected() -> None:
     asyncio.run(scenario())
 
 
-def test_a_asks_for_name_and_cancel_does_nothing() -> None:
+async def add_worktree(pilot: Any, name: str, *keys: str) -> None:
+    """`a`, type `name`, Enter, then the keys pressed on the services checklist."""
+    await pilot.press("a", *name, "enter")
+    await pilot.pause()
+    if keys:
+        await pilot.press(*keys)
+    await settle(pilot)
+
+
+def test_a_asks_for_name_then_services_and_adds_without_starting() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
         app = WtApp(orch)
         async with app.run_test() as pilot:
             await settle(pilot)
-            await pilot.press("a", "escape")
+            await pilot.press("a")
+            await pilot.pause()
+            prompt = app.screen.query_one("#dialog Label", Label)
+            assert str(prompt.render()) == "Enter name"
+            await pilot.press(*"new-x", "enter")
+            await pilot.pause()
+            title = app.screen.query_one("#dialog Label", Label)
+            assert str(title.render()) == "Services for new-x"
+            assert checked(app) == []  # a new worktree starts with nothing selected
+            await pilot.press("space", "enter")  # front
             await settle(pilot)
+            assert orch.calls == [("add", "new-x", ["front"])]  # never an `up`
+            assert message(app) == "add new-x: done"
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_name_or_the_services_has_no_side_effect() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", "escape")  # at the name
+            await settle(pilot)
+            assert orch.calls == [] and app.screen is app.screen_stack[0]
+            await pilot.press("a", *"new-x", "enter")
+            await pilot.pause()
+            await pilot.press("space", "escape")  # at the services, with a box checked
+            await settle(pilot)
+            assert orch.calls == [] and app.screen is app.screen_stack[0]
+            assert message(app) == ""
+            await add_worktree(pilot, "new-y", "down", "down", "space", "enter")
+            assert orch.calls == [("add", "new-y", ["db"])]
+
+    asyncio.run(scenario())
+
+
+def test_an_empty_name_never_reaches_the_services_step() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", "enter")
+            await settle(pilot)
+            assert not app.screen.query("#choices") and orch.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_checking_a_consumer_checks_and_locks_its_dependencies_on_add() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", *"new-x", "enter")
+            await pilot.pause()
+            await pilot.press("space")  # front
+            await pilot.pause()
+            assert checked(app) == ["front", "back"]
+            assert labels(app) == ["front (web)", "back (api) (required by front)", "db (api)"]
+            await pilot.press("down", "space")  # back is locked
+            await pilot.pause()
+            assert checked(app) == ["front", "back"]
+            assert str(app.screen.query_one("#error", Static).render()) == (
+                "back is required by front"
+            )
+            await pilot.press("up", "space")  # uncheck front: back is free but stays checked
+            await pilot.pause()
+            assert checked(app) == ["back"]
+            assert labels(app)[1] == "back (api)"
+            await pilot.press("down", "space", "up", "space")  # back off, front on: back returns
+            await pilot.pause()
+            assert sorted(checked(app)) == ["back", "front"]
+            assert labels(app)[1] == "back (api) (required by front)"
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("add", "new-x", ["front"])]  # explicit = checked minus locked
+
+    asyncio.run(scenario())
+
+
+def test_dependencies_are_followed_down_a_chain() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.new_choices = [
+            Choice("c", "api", False, required_by=("b",)),
+            Choice("b", "api", False, required_by=("a",)),
+            Choice("a", "web", False),
+        ]
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", *"new-x", "enter")
+            await pilot.pause()
+            await pilot.press("down", "down", "space")  # a
+            await pilot.pause()
+            assert sorted(checked(app)) == ["a", "b", "c"]
+            assert labels(app) == [
+                "c (api) (required by b)",
+                "b (api) (required by a)",
+                "a (web)",
+            ]
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("add", "new-x", ["a"])]
+
+    asyncio.run(scenario())
+
+
+def test_a_one_service_catalog_is_added_with_that_service() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.new_choices = [Choice("app", "app", False)]
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await add_worktree(pilot, "new-x", "space", "enter")
+            assert orch.calls == [("add", "new-x", ["app"])]
+
+    asyncio.run(scenario())
+
+
+def test_confirming_with_nothing_checked_asks_for_a_service() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", *"new-x", "enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert str(app.screen.query_one("#error", Static).render()) == (
+                "check at least one service"
+            )
             assert orch.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_add_error_from_the_core_is_shown_and_the_app_stays_open() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.error = WtError("branch name is not valid")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await add_worktree(pilot, "bad", "space", "enter")
+            assert message(app) == "branch name is not valid"
+            assert app.is_running
+
+    asyncio.run(scenario())
+
+
+def test_add_says_so_when_the_catalog_cannot_be_read() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices_error = WtError("no catalog at /x/catalog.yaml. Run wt init")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
             await pilot.press("a", *"new-x", "enter")
             await settle(pilot)
-            assert orch.calls == [("add", "new-x")]
+            assert message(app) == "no catalog at /x/catalog.yaml. Run wt init"
+            assert not app.screen.query("#choices") and orch.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_add_without_catalog_services_says_so() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.new_choices = None
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", *"new-x", "enter")
+            await settle(pilot)
+            assert message(app) == "demo: no catalog services to choose from"
+            assert orch.calls == []
+
+    asyncio.run(scenario())
+
+
+def test_add_is_blocked_while_an_action_runs() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.gate = threading.Event()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("u")
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert "busy" in message(app) and app.screen is app.screen_stack[0]
+            orch.gate.set()
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+
+def test_without_a_catalog_a_has_nothing_to_add_to_and_says_where_it_looked() -> None:
+    async def scenario() -> None:
+        app = WtApp(projects=lambda: [], missing_catalog=Path("/x/catalog.yaml"))
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a")
+            await settle(pilot)
+            assert message(app) == "no catalog at /x/catalog.yaml. Run wt init or wt migrate"
+            assert app.screen is app.screen_stack[0]
+
+    asyncio.run(scenario())
+
+
+def test_without_a_catalog_a_still_adds_to_the_selected_project() -> None:
+    async def scenario() -> None:
+        shop = FakeOrch("shop")
+        app = WtApp(
+            projects=lambda: [ProjectEntry("shop", lambda: shop, "")],
+            missing_catalog=Path("/x/catalog.yaml"),
+        )
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await add_worktree(pilot, "zz", "space", "enter")
+            assert shop.calls == [("add", "zz", ["front"])]
 
     asyncio.run(scenario())
 
@@ -284,9 +526,9 @@ def test_all_projects_names_and_add_uses_selected_project() -> None:
         async with app.run_test() as pilot:
             await settle(pilot)
             assert [c[0] for c in cells(app)] == ["gone", "main", "feat-a", "main"]
-            await pilot.press("down", "down", "a", *"zz", "enter")
-            await settle(pilot)
-            assert shop.calls == [("add", "zz")]
+            await pilot.press("down", "down")
+            await add_worktree(pilot, "zz", "space", "enter")
+            assert shop.calls == [("add", "zz", ["front"])]
             await pilot.press("up", "up", "u")  # stale project row: no call
             await settle(pilot)
             assert "config not found" in message(app)
@@ -711,9 +953,8 @@ def test_add_works_on_an_empty_table_in_a_single_project() -> None:
             await settle(pilot)
             assert cells(app) == []
             assert message(app) == "no worktrees yet: press a to add"
-            await pilot.press("a", *"new-x", "enter")
-            await settle(pilot)
-            assert orch.calls == [("add", "new-x")]
+            await add_worktree(pilot, "new-x", "space", "enter")
+            assert orch.calls == [("add", "new-x", ["front"])]
 
     asyncio.run(scenario())
 
@@ -729,9 +970,8 @@ def test_add_on_an_empty_table_with_one_usable_project() -> None:
         async with app.run_test() as pilot:
             await settle(pilot)
             assert cells(app) == []
-            await pilot.press("a", *"zz", "enter")
-            await settle(pilot)
-            assert shop.calls == [("add", "zz")]
+            await add_worktree(pilot, "zz", "space", "enter")
+            assert shop.calls == [("add", "zz", ["front"])]
 
     asyncio.run(scenario())
 

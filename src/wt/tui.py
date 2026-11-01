@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import ClassVar, Protocol, Self, cast
 
 from rich.text import Text
@@ -39,13 +40,13 @@ class OrchestratorLike(Protocol):
 
     def stop(self, branch: str) -> object: ...
 
-    def add(self, branch: str) -> object: ...
+    def add(self, branch: str, uses: list[str]) -> object: ...
 
     def remove(self, branch: str, *, force: bool = False) -> object: ...
 
     def services(self, branch: str) -> list[RepoRow]: ...
 
-    def catalog_choices(self, branch: str) -> list[Choice] | None: ...
+    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None: ...
 
     def configure(self, branch: str, uses: list[str]) -> None: ...
 
@@ -80,6 +81,8 @@ SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
 CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
 NEEDS_CATALOG = "configure needs a catalog project (uses: in worktree.yaml)"
 NOTHING_CHECKED = "check at least one service"
+NO_CATALOG = "no catalog at {path}. Run wt init or wt migrate"
+ENTER_NAME = "Enter name"
 
 
 def choice_label(choice: Choice, holders: tuple[str, ...] = ()) -> Text:
@@ -88,6 +91,11 @@ def choice_label(choice: Choice, holders: tuple[str, ...] = ()) -> Text:
     if holders:
         label += f" (required by {', '.join(holders)})"
     return Text(label)
+
+
+def error_text(exc: Exception) -> str:
+    """What to show for an error that must not close the app."""
+    return str(exc) if isinstance(exc, WtError) else f"{type(exc).__name__}: {exc}"
 
 
 def required_note(service: str, holders: tuple[str, ...]) -> str:
@@ -155,7 +163,7 @@ class ServicesScreen(Screen[None]):
         try:
             choices = self._orch().catalog_choices(self.branch)
         except Exception as exc:  # keep the app open whatever the orchestrator raises
-            self.say(str(exc) if isinstance(exc, WtError) else f"{type(exc).__name__}: {exc}")
+            self.say(error_text(exc))
             return
         if choices is None:
             self.say(NEEDS_CATALOG)
@@ -290,6 +298,20 @@ class ChoiceList(SelectionList[str]):
         checked = self.selected
         return [c.service for c in self._choices if c.service in checked and not self.holders(c)]
 
+    def check_dependencies(self) -> None:
+        """Check what a checked consumer needs: it then shows locked, as in an existing stack.
+
+        Each `select` is synchronous, so one pass over the catalog order reaches the whole chain
+        only when consumers come first; looping until nothing changes makes order irrelevant.
+        """
+        changed = True
+        while changed:
+            changed = False
+            for choice in self._choices:
+                if choice.service not in self.selected and self.holders(choice):
+                    self.select(choice.service)
+                    changed = True
+
     def relabel(self) -> None:
         """Show `(required by ...)` only for the consumers that are still checked."""
         for index, choice in enumerate(self._choices):
@@ -329,13 +351,14 @@ class ConfigureScreen(ModalScreen[list[str] | None]):
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, choices: list[Choice]) -> None:
+    def __init__(self, choices: list[Choice], title: str = "Services") -> None:
         super().__init__()
         self.choices = choices
+        self.title_text = title
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label(Text("Services"))
+            yield Label(Text(self.title_text))
             yield ChoiceList(self.choices)
             yield Static(actions_text(CONFIGURE_HINTS), id="hints")
             yield Static("", id="error")
@@ -358,6 +381,7 @@ class ConfigureScreen(ModalScreen[list[str] | None]):
 
     @on(SelectionList.SelectedChanged)
     def _selection_changed(self) -> None:
+        self._options.check_dependencies()
         self._options.relabel()
         self._say("")  # a note about the previous selection no longer applies
 
@@ -398,13 +422,18 @@ class WtApp(App[None]):
         orch: OrchestratorLike | None = None,
         *,
         projects: Callable[[], list[ProjectEntry]] | None = None,
+        missing_catalog: Path | None = None,
     ) -> None:
-        """One project (`orch`), or all projects from `projects` (called on every refresh)."""
+        """One project (`orch`), or all projects from `projects` (called on every refresh).
+
+        `missing_catalog` is the catalog file that was looked for and is not there.
+        """
         super().__init__()
         if (orch is None) == (projects is None):
             raise ValueError("pass either orch or projects")
         self.orch = orch
         self._discover = projects
+        self._missing_catalog = missing_catalog
         self._entries: dict[str, ProjectEntry] = {}
         self.rows: list[Row] = []
         self._loading = False
@@ -517,9 +546,12 @@ class WtApp(App[None]):
         usable = self._usable_projects()
         if len(usable) == 1:
             return usable[0]
-        self.say(
-            "several projects: run wt tui inside one to add" if usable else "no project to add to"
-        )
+        if usable:
+            self.say("several projects: run wt tui inside one to add")
+        elif self._missing_catalog is not None:
+            self.say(NO_CATALOG.format(path=self._missing_catalog))
+        else:
+            self.say("no project to add to")
         return None
 
     def action_add_new(self) -> None:
@@ -528,10 +560,27 @@ class WtApp(App[None]):
             return
 
         def got(name: str | None) -> None:
-            if name and self.guard():
-                self.start(f"add {name}", lambda: self._orch_for(project).add(name))
+            if name:
+                self._choose_services(project, name)
 
-        self.push_screen(InputScreen("New worktree name"), got)
+        self.push_screen(InputScreen(ENTER_NAME), got)
+
+    def _choose_services(self, project: str, name: str) -> None:
+        """Second step of `a`: pick the catalog services of the new worktree, then add it."""
+        try:
+            choices = self._orch_for(project).catalog_choices(None)
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            self.say(error_text(exc))
+            return
+        if not choices:
+            self.say(f"{project}: no catalog services to choose from")
+            return
+
+        def chosen(uses: list[str] | None) -> None:
+            if uses is not None and self.guard():
+                self.start(f"add {name}", lambda: self._orch_for(project).add(name, uses))
+
+        self.push_screen(ConfigureScreen(choices, f"Services for {name}"), chosen)
 
     def action_remove_selected(self) -> None:
         row = self._selected_worktree()
@@ -560,7 +609,7 @@ class WtApp(App[None]):
         except WtError as exc:
             self.call_from_thread(self._action_done, str(exc))
         except Exception as exc:  # keep the app open whatever the orchestrator raises
-            self.call_from_thread(self._action_done, f"{type(exc).__name__}: {exc}")
+            self.call_from_thread(self._action_done, error_text(exc))
         else:
             self.call_from_thread(self._action_done, f"{label}: done")
 
