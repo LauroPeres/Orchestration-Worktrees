@@ -162,7 +162,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
-| v0.6.0 (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
+| v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
 | v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |
