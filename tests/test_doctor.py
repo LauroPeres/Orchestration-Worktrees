@@ -1,8 +1,10 @@
+import copy
 import socket
 from collections.abc import Callable
 
 import pytest
 
+from tests.conftest import SHOP_CATALOG, write_global_catalog
 from wt import compose, doctor, host, proc, router
 from wt.config import STARTER, LoadedConfig, load_config
 from wt.errors import WtError
@@ -536,6 +538,83 @@ def test_run_checks_only_checks_keycloak_when_configured(
     names = [c.name for c in doctor.run_checks(loaded, None, fix=True)]
     assert ("keycloak" in names) is with_keycloak
     assert calls == ([True] if with_keycloak else [])
+
+
+def _stub_run_checks_environment(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub everything but the shared-provider checks; return the names they get called by."""
+    called: list[str] = []
+    monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
+    monkeypatch.setattr(doctor, "check_tls", lambda fix: doctor.Check("mkcert", "ok", ""))
+    monkeypatch.setattr(doctor, "check_routing", lambda fix: [])
+    monkeypatch.setattr(doctor, "check_resolution", lambda d: doctor.Check("resolver", "ok", ""))
+
+    def fake_postgres(dbs: list[str], fix: bool) -> list[doctor.Check]:
+        called.append("postgres:" + ",".join(dbs))
+        return [doctor.Check("postgres", "ok", "")]
+
+    def fake_server(name: str) -> Callable[..., doctor.Check]:
+        def check(*, fix: bool) -> doctor.Check:
+            called.append(name)
+            return doctor.Check(name, "ok", "")
+
+        return check
+
+    monkeypatch.setattr(doctor, "check_postgres", fake_postgres)
+    for name in ("redis", "kafka", "keycloak"):
+        monkeypatch.setattr(doctor, f"check_{name}", fake_server(name))
+    return called
+
+
+def _infra_catalog(infra: dict[str, dict[str, object]]) -> dict[str, object]:
+    """SHOP_CATALOG with `infra` per service name (back is the anchor: first in catalog order)."""
+    services = copy.deepcopy(SHOP_CATALOG["services"])
+    assert isinstance(services, dict)
+    for name, value in infra.items():
+        services[name]["infra"] = value
+    return {**SHOP_CATALOG, "services": services}
+
+
+def test_catalog_run_checks_covers_the_infra_of_every_service(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    catalog = _infra_catalog(
+        {"back": {"postgres": {"databases": ["shop"]}}, "front": {"redis": {}}}
+    )
+    loaded = write_global_catalog(tmp_path, catalog)
+    assert loaded.config.shared.redis is None  # the anchor (back) alone would miss redis
+    doctor.run_checks(loaded, None, fix=False)
+    assert sorted(called) == ["postgres:shop", "redis"]
+
+
+def test_catalog_run_checks_merges_postgres_databases(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    catalog = _infra_catalog(
+        {
+            "back": {"postgres": {"databases": ["shop"]}},
+            "front": {"postgres": {"databases": ["shop", "web"]}},
+        }
+    )
+    doctor.run_checks(write_global_catalog(tmp_path, catalog), None, fix=False)
+    assert called == ["postgres:shop,web"]
+
+
+def test_catalog_run_checks_reports_an_unreadable_catalog(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    loaded = write_global_catalog(tmp_path, _infra_catalog({"back": {"redis": {}}}))
+    loaded.path.write_text("services: [")
+    checks = doctor.run_checks(loaded, None, fix=False)
+    assert called == []
+    failed = [c for c in checks if c.name == "catalog"]
+    assert [c.level for c in failed] == ["fail"]
 
 
 def _record_process(port: int | None) -> None:

@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 from wt import compose, host, proc, router, tls
-from wt.config import LoadedConfig
+from wt.catalog import load_catalog
+from wt.config import LoadedConfig, Postgres, Shared
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import StateStore, file_lock
@@ -394,6 +395,46 @@ def check_ports(project: str) -> list[Check]:
     return checks
 
 
+def _union_shared(shared_list: list[Shared]) -> Shared:
+    """Which providers any of `shared_list` configures; the first config wins, databases merge."""
+    merged: dict[str, object] = {}
+    for shared in shared_list:
+        for name in shared.configured():
+            conf = getattr(shared, name)
+            current = merged.setdefault(name, conf)
+            if isinstance(current, Postgres) and isinstance(conf, Postgres):
+                extra = [db for db in conf.databases if db not in current.databases]
+                merged[name] = current.model_copy(
+                    update={"databases": [*current.databases, *extra]}
+                )
+    return Shared.model_validate(merged)
+
+
+def _checked_infra(loaded: LoadedConfig) -> Shared:
+    """The infra to check: a catalog project's anchor holds one service's, so take all of them."""
+    if not loaded.from_catalog:
+        return loaded.config.shared
+    services = load_catalog(loaded.path).catalog.services.values()
+    return _union_shared([svc.infra for svc in services])
+
+
+def _check_shared(loaded: LoadedConfig, fix: bool) -> list[Check]:
+    try:
+        shared = _checked_infra(loaded)
+    except WtError as exc:
+        return [Check("catalog", "fail", str(exc).splitlines()[0])]
+    checks: list[Check] = []
+    if shared.postgres is not None:
+        checks += check_postgres(shared.postgres.databases, fix=fix)
+    if shared.redis is not None:
+        checks.append(check_redis(fix=fix))
+    if shared.kafka is not None:
+        checks.append(check_kafka(fix=fix))
+    if shared.keycloak is not None:
+        checks.append(check_keycloak(fix=fix))
+    return checks
+
+
 def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bool) -> list[Check]:
     checks = [check_git()]
     docker = check_docker()
@@ -407,14 +448,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
     elif loaded:
         checks.append(Check("config", "ok", f"{loaded.path} (project '{loaded.config.project}')"))
         checks.append(check_resolution(loaded.config.domain))
-        if docker_ok and loaded.config.shared.postgres is not None:
-            checks += check_postgres(loaded.config.shared.postgres.databases, fix=fix)
-        if docker_ok and loaded.config.shared.redis is not None:
-            checks.append(check_redis(fix=fix))
-        if docker_ok and loaded.config.shared.kafka is not None:
-            checks.append(check_kafka(fix=fix))
-        if docker_ok and loaded.config.shared.keycloak is not None:
-            checks.append(check_keycloak(fix=fix))
+        if docker_ok:
+            checks += _check_shared(loaded, fix)
         checks += check_ports(loaded.config.project)
     else:
         checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))
