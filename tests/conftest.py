@@ -10,7 +10,8 @@ import pytest
 import yaml
 
 from wt import compose, health, host, naming, providers, router, tls
-from wt.config import load_config
+from wt.catalog import load_project
+from wt.config import LoadedConfig, load_config
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers.base import BranchContext, Check, Resources
@@ -229,6 +230,44 @@ def orch(make_repo, tmp_path: Path):
         return Orchestrator(load_config(path), log=lambda m: None)
 
     return build
+
+
+SHOP_CATALOG: dict[str, object] = {
+    "project": "shop",
+    "domain": "shop.localhost",
+    "repos": {"api": "./shop-api"},
+    "services": {
+        "back": {
+            "repo": "api",
+            "compose": "docker-compose.yml",
+            "compose_service": "db",
+            "port": 5432,
+            "subdomain": "back",
+        },
+        "front": {
+            "repo": "api",
+            "compose": "docker-compose.yml",
+            "compose_service": "api",
+            "port": 8000,
+            "subdomain": "front",
+            "consumes": {"back": "BACK_URL"},
+        },
+    },
+}
+
+
+def write_global_catalog(folder: Path, catalog: dict[str, object]) -> LoadedConfig:
+    """Write `catalog` as the global catalog file in `folder` and load it as the anchor."""
+    path = folder / "catalog.yaml"
+    path.write_text(yaml.safe_dump(catalog))
+    return load_project(path)
+
+
+@pytest.fixture
+def global_orch(make_repo, tmp_path: Path, docker: FakeDocker):
+    """An orchestrator over the global catalog `SHOP_CATALOG` (front consumes back)."""
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    return Orchestrator(write_global_catalog(tmp_path, SHOP_CATALOG), log=lambda m: None)
 
 
 @dataclass

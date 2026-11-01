@@ -145,12 +145,42 @@ class Orchestrator:
         self.log = log
         self.out = out
 
-    def _for(self, branch: str) -> "Orchestrator":
-        """This orchestrator, or one built on the branch's stored selection (§17 D-a)."""
+    def _for(self, branch: str, uses: list[str] | None = None) -> "Orchestrator":
+        """This orchestrator, or one built on the branch's selection (§17 D-a, §21).
+
+        The stored selection always wins. `uses` (an explicit choice when creating) only counts
+        for a catalog project whose branch has none yet; worktree.yaml projects ignore it.
+        """
         bs = self.store.load().branches.get(branch)
-        if bs is None or bs.uses is None or self.loaded.uses == tuple(bs.uses):
+        stored = None if bs is None else bs.uses
+        if stored is not None:
+            if uses is not None and self.loaded.from_catalog:
+                self.log(
+                    f"branch {branch} already has services {','.join(stored)}; "
+                    "keeping them (use configure to change)"
+                )
+            return self._with_selection(stored)
+        if uses is not None and self.loaded.from_catalog:
+            return self._with_selection(uses)
+        return self
+
+    def _with_selection(self, uses: list[str]) -> "Orchestrator":
+        if self.loaded.uses == tuple(dict.fromkeys(uses)):
             return self
-        return Orchestrator(self.loaded.with_uses(bs.uses), self.log, self.out)
+        return Orchestrator(self.loaded.with_uses(uses), self.log, self.out)
+
+    def _for_creating(self, branch: str, uses: list[str] | None) -> "Orchestrator":
+        """`_for` for `up` and `add`: a catalog branch must come with a selection (§21)."""
+        if self.loaded.from_catalog:
+            bs = self.store.load().branches.get(branch)
+            if bs is None or bs.uses is None:
+                if uses is None:
+                    raise WtError(
+                        f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
+                    )
+                if not uses:
+                    raise WtError("choose at least one service (wt add <b> --uses a,b)")
+        return self._for(branch, uses)
 
     # ---- naming helpers -------------------------------------------------------------------
 
@@ -272,10 +302,19 @@ class Orchestrator:
 
     # ---- up -------------------------------------------------------------------------------
 
-    def up(self, branch: str, *, build: bool = False, timeout: int = 120) -> list[ServiceReport]:
+    def up(
+        self,
+        branch: str,
+        *,
+        uses: list[str] | None = None,
+        build: bool = False,
+        timeout: int = 120,
+    ) -> list[ServiceReport]:
         git.check_branch_name(branch)
-        if (other := self._for(branch)) is not self:
-            return other.up(branch, build=build, timeout=timeout)
+        return self._for_creating(branch, uses)._up(branch, build=build, timeout=timeout)
+
+    def _up(self, branch: str, *, build: bool, timeout: int) -> list[ServiceReport]:
+        """`up` on the orchestrator that owns the branch's selection."""
         names = self.names(branch)
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         self._log_warnings()
@@ -391,6 +430,10 @@ class Orchestrator:
                     current = state.branches.setdefault(
                         branch, BranchState(branch=branch, slug=names.slug)
                     )
+                    if self.loaded.from_catalog and current.uses is None:
+                        # The explicit choice, not the closure: later operations rebuild the
+                        # same stack from it through `_for` (like `configure`).
+                        current.uses = list(self.loaded.uses or ())
                     current.status = "creating"
                     current.index = index
                     current.ports = dict(ports)
@@ -400,11 +443,13 @@ class Orchestrator:
                 raise
         return envs, commands, ports
 
-    def add(self, branch: str) -> bool:
+    def add(self, branch: str, uses: list[str] | None = None) -> bool:
         """Worktrees and reserved ports only, status `stopped`. False when already known."""
         git.check_branch_name(branch)
-        if (other := self._for(branch)) is not self:
-            return other.add(branch)
+        return self._for_creating(branch, uses)._add(branch)
+
+    def _add(self, branch: str) -> bool:
+        """`add` on the orchestrator that owns the branch's selection."""
         names = self.names(branch)
         self.start_plan()  # a cycle fails here, before anything is created
         self._log_warnings()
@@ -1103,10 +1148,16 @@ class Orchestrator:
             return "unhealthy"
         return "healthy"
 
-    def catalog_choices(self, branch: str) -> list[Choice] | None:
-        """Every catalog service with its repo and its place in the branch's stack (§20)."""
+    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
+        """Every catalog service with its repo and its place in the branch's stack (§20).
+
+        Without a branch (one that is about to be created) nothing is selected.
+        """
         if self.loaded.uses is None or self.loaded.catalog is None:
             return None
+        if branch is None:
+            catalog = load_catalog(self.loaded.catalog).catalog
+            return [Choice(name, svc.repo, False) for name, svc in catalog.services.items()]
         if self.store.load().branches.get(branch) is None:
             raise WtError(f"branch {branch!r} not found (see `wt ls`)")
         mine = self._for(branch).loaded
@@ -1123,6 +1174,19 @@ class Orchestrator:
             Choice(name, svc.repo, name in stack, required_by(name))
             for name, svc in catalog.services.items()
         ]
+
+    def adopt_branches(self, uses: list[str]) -> list[str]:
+        """Give every branch of this project that has no selection `uses` (`wt migrate`, §21).
+
+        Returns the adopted branches, sorted. Branches that already have a selection are left alone.
+        """
+        self.loaded.with_uses(uses)  # validates the names against the catalog
+        with self.store.edit() as state:
+            adopted = sorted(b for b, bs in state.branches.items() if bs.uses is None)
+            for branch in adopted:
+                state.branches[branch].uses = list(uses)
+                state.branches[branch].updated_at = now()
+        return adopted
 
     def configure(self, branch: str, uses: list[str]) -> None:
         """Change the services of a branch: store the selection, tear down what left, `up`.
