@@ -371,8 +371,8 @@ x`) and does not break commands that do not use it. A plugin cannot take a built
 
 ## Terminal UI (`wt tui`)
 
-`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit; in the services
-view `c` configures and `l` follows the log of a service.
+`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit. In the
+services view `c` configures and `l` follows the log of a service.
 `wt tui` shows one compact table with one row per worktree of the catalog's project
 (`wt tui --all` lists every project wt knows). `a` asks "Enter name", then which catalog services
 that worktree runs. Columns: `NAME` and `STATUS`. Below the table is the action line and a message
@@ -609,7 +609,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.5 | Keycloak provider ✔ (shared realm, one client per branch; the shop has a Sign in link) |
 | v0.5.1 ✔ | Stabilise, dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ | One global `catalog.yaml`, `wt add/up --uses` from any folder, `wt migrate`, `--json` |
-| v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from hands-on tests |
+| v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from tests |
 | later | plugin entry points (v0.7), shared dependency caches (v0.8), native Windows (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
