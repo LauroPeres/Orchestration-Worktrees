@@ -344,14 +344,15 @@ infra:
     realm: shop
     client: web
     users:
-      - {username: alice, password: dev-password, email: alice@example.test, roles: [editor, viewer]}
+      - {username: alice, password: dev-pw, email: alice@example.test, roles: [editor]}
       - {username: bob, password: dev-password}
 ```
 
-On `up`, wt creates each missing user in the shared realm (with a first name, last name and email
-so the login works), sets the configured password every time, and creates and assigns the roles. Users
-are shared by all branches and `down` never deletes them, like the realm. The password is a development
-value: wt keeps it out of logs, errors, `--json` output and the argument list of every process.
+On `up`, wt creates each missing user in the shared realm (with a first name, last name and email so
+the login works), sets the configured password every time, and creates and assigns the roles. Users
+are shared by all branches and `down` never deletes them, like the realm. The password is a
+development value: wt keeps it out of logs, errors, `--json` output and the argument list of every
+process.
 
 ## Names on the shared servers
 
