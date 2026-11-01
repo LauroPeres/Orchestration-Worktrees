@@ -24,7 +24,21 @@ from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 
 REFRESH_SECONDS = 2.0
-KEY_STYLE = Style(color="green")  # the one color in the UI, with the table's column names
+GREEN = Style(color="green")  # keys, column names, healthy statuses
+YELLOW = Style(color="yellow")
+RED = Style(color="red")
+# A status shows in color; any other value (`stopped`, `starting`, `-`) keeps the terminal's own.
+STATUS_STYLES: dict[str, Style] = {
+    "up": GREEN,
+    "healthy": GREEN,
+    "ok": GREEN,
+    "degraded": YELLOW,
+    "creating": YELLOW,
+    "removing": YELLOW,
+    "failed": RED,
+    "fail": RED,
+    "unhealthy": RED,
+}
 KEY_GAP = "  "  # separates the `key: words` items of a hint line
 ACTIONS = "enter: services  u: up  d: down  a: add  r: remove  q: quit"
 CONFIRM_REMOVE = (
@@ -97,6 +111,16 @@ MARKER_UNCHECKED = "[ ] "
 BUTTON_SEGMENTS = 4
 
 
+def status_style(value: str) -> Style | None:
+    """The color of a status value, or None to leave it in the terminal's own."""
+    return STATUS_STYLES.get(value)
+
+
+def status_cell(value: str) -> Text:
+    """A table cell with the status as written, in the color of its value."""
+    return Text(value, style=status_style(value) or "")
+
+
 def keys_text(line: str) -> Text:
     """A hint line (`key: words  key: words`) with the keys in green and the words plain."""
     text = Text()
@@ -104,7 +128,7 @@ def keys_text(line: str) -> Text:
         key, colon, words = item.partition(":")
         if index:
             text.append(KEY_GAP)
-        text.append(key, KEY_STYLE)
+        text.append(key, GREEN)
         text.append(colon + words)
     return text
 
@@ -206,7 +230,7 @@ class ServicesScreen(Screen[None]):
             table.clear()
             for r in rows:
                 port = Text(str(r.port) if r.port is not None else "-")
-                table.add_row(Text(r.name), Text(r.status), port, Text(r.url or "-"))
+                table.add_row(Text(r.name), status_cell(r.status), port, Text(r.url or "-"))
             if rows:
                 table.move_cursor(row=min(cursor, len(rows) - 1))
             if self._failed_shown:
@@ -418,8 +442,8 @@ class WtApp(App[None]):
     """Table of worktrees with up/down/add/remove actions (SPEC §16)."""
 
     TITLE = "wt"
-    # The terminal's own colors, plus green for the column names and the keys. The selected row
-    # shows as reverse video, never as a color.
+    # The terminal's own colors, plus green for the column names and keys; the selected row or
+    # option is a green bar (black text). The text input cursor stays reverse video.
     CSS = """
     DataTable { height: auto; max-height: 1fr; border: solid ansi_default; }
     #actions { height: auto; }  /* wraps on a narrow terminal */
@@ -435,8 +459,11 @@ class WtApp(App[None]):
     DataTable:focus > .datatable--cursor,
     OptionList > .option-list--option-highlighted,
     OptionList:focus > .option-list--option-highlighted,
-    Input > .input--cursor,
-    Input > .input--selection {
+    SelectionList > .option-list--option-highlighted,
+    SelectionList:focus > .option-list--option-highlighted {
+        text-style: none; background: ansi_green; color: ansi_black;
+    }
+    Input > .input--cursor, Input > .input--selection {
         text-style: reverse; background: ansi_default; color: ansi_default;
     }
     OptionList > .option-list--option-hover { background: ansi_default; }
@@ -709,7 +736,7 @@ class WtApp(App[None]):
             table.clear()
             for r in rows:
                 if r.status is not None:
-                    cells = (Text(r.status.branch), Text(r.status.status))
+                    cells = (Text(r.status.branch), status_cell(r.status.status))
                 else:
                     cells = (Text(r.project), Text(r.note))
                 table.add_row(*cells, key=r.key)

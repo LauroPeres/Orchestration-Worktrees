@@ -9,7 +9,15 @@ from textual.widgets import DataTable, Label, SelectionList, Static
 
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
-from wt.tui import CONFIRM_REMOVE, ConfigureScreen, ConfirmScreen, InputScreen, ProjectEntry, WtApp
+from wt.tui import (
+    CONFIRM_REMOVE,
+    ConfigureScreen,
+    ConfirmScreen,
+    InputScreen,
+    ProjectEntry,
+    WtApp,
+    status_style,
+)
 
 
 def status(branch: str, state: str, ports: list[int] | None = None) -> BranchStatus:
@@ -109,10 +117,18 @@ def message(app: WtApp) -> str:
 
 
 ANSI_GREEN = 2  # Rich's number for the terminal's own green
+ANSI_BLACK = 0
 
 
 def is_green(style: Any) -> bool:
     return isinstance(style, Style) and style.color is not None and style.color.number == ANSI_GREEN
+
+
+def is_green_bar(style: Style) -> bool:
+    """Black text on a green background: the selected row or option."""
+    black = style.color is not None and style.color.number == ANSI_BLACK
+    green = style.bgcolor is not None and style.bgcolor.number == ANSI_GREEN
+    return black and green and not style.reverse
 
 
 def green_keys(text: Any) -> list[str]:
@@ -155,6 +171,9 @@ def test_the_table_has_a_plain_border_and_green_column_names() -> None:
             assert is_green(rendered_style(app, "NAME"))
             assert is_green(rendered_style(app, "STATUS"))
             assert not is_green(rendered_style(app, "stopped"))  # cells keep the terminal's colors
+            assert is_green_bar(rendered_style(app, "feat-a"))  # the selected row
+            assert not is_green_bar(rendered_style(app, "stopped"))
+            assert not is_green_bar(rendered_style(app, "NAME"))  # green text, not a bar
 
     asyncio.run(scenario())
 
@@ -610,17 +629,54 @@ def test_all_projects_names_and_add_uses_selected_project() -> None:
     asyncio.run(scenario())
 
 
-def test_cells_have_no_color_markup() -> None:
+def cell_color(cell: Any) -> str | None:
+    """The color a table cell is written in, or None for the terminal's own."""
+    style = cell.style
+    return style.color.name if isinstance(style, Style) and style.color else None
+
+
+def test_the_name_is_plain_text_and_the_status_has_its_color() -> None:
     async def scenario() -> None:
-        app = WtApp(FakeOrch(rows=[status("[red]x[/]", "up")]))
+        rows = [
+            status("[red]x[/]", "up"),
+            status("b-failed", "failed"),
+            status("c-degraded", "degraded"),
+            status("d-creating", "creating"),
+            status("e-removing", "removing"),
+            status("f-stopped", "stopped"),
+        ]
+        app = WtApp(FakeOrch(rows=rows))
         async with app.run_test() as pilot:
             await settle(pilot)
-            assert cells(app) == [["[red]x[/]", "up"]]
+            assert cells(app)[0] == ["[red]x[/]", "up"]  # the text is as written, no markup
             table = app.query_one("#table", DataTable)
-            for cell in table.get_row_at(0):
-                assert not cell.spans
+            by_status = {}
+            for index in range(table.row_count):
+                name, state = table.get_row_at(index)
+                assert cell_color(name) is None and not name.spans
+                assert not state.spans
+                by_status[str(state)] = cell_color(state)
+            assert by_status == {
+                "up": "green",
+                "failed": "red",
+                "degraded": "yellow",
+                "creating": "yellow",
+                "removing": "yellow",
+                "stopped": None,
+            }
 
     asyncio.run(scenario())
+
+
+def test_status_style_maps_each_value_to_its_color() -> None:
+    colors = {"green": ["up", "healthy", "ok"], "yellow": ["degraded", "creating", "removing"]}
+    colors["red"] = ["failed", "fail", "unhealthy"]
+    for color, values in colors.items():
+        for value in values:
+            style = status_style(value)
+            assert style is not None and style.color is not None and style.color.name == color
+    for value in ["stopped", "starting", "-", "anything else"]:
+        assert status_style(value) is None
 
 
 def services_cells(app: WtApp) -> list[list[str]]:
@@ -647,13 +703,42 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
                 ["db", "stopped", "-", "-"],
             ]
             for row in range(table.row_count):
-                assert not any(cell.spans or cell.style for cell in table.get_row_at(row))
+                name, state, port, url = table.get_row_at(row)
+                assert not any(cell.spans or cell.style for cell in (name, port, url))
+                assert not state.spans
+            assert [cell_color(table.get_row_at(i)[1]) for i in range(3)] == [
+                "green", None, None,
+            ]  # healthy, starting, stopped  # fmt: skip
             actions: Any = app.screen.query_one("#actions", Static).render()
             assert actions.plain == "c: configure  esc: back  q: quit"
             assert green_keys(actions) == ["c", "esc", "q"]
             await pilot.press("escape")
             await settle(pilot)
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
+
+    asyncio.run(scenario())
+
+
+def test_services_status_cells_have_their_color() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.service_rows = [
+            RepoRow("a", "healthy", None, None),
+            RepoRow("b", "unhealthy", None, None),
+            RepoRow("c", "starting", None, None),
+            RepoRow("d", "stopped", None, None),
+        ]
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("enter")
+            await settle(pilot)
+            table = app.screen.query_one("#services", DataTable)
+            colors = [cell_color(table.get_row_at(i)[1]) for i in range(table.row_count)]
+            assert colors == ["green", "red", None, None]
+            assert [str(table.get_row_at(i)[1]) for i in range(4)] == [
+                "healthy", "unhealthy", "starting", "stopped",
+            ]  # fmt: skip
 
     asyncio.run(scenario())
 
@@ -1013,6 +1098,8 @@ def test_checklist_shows_its_state_as_text_markers() -> None:
             lines = [line.rstrip() for line in screen_lines(app)]
             assert lines[0] == "Services"  # the title, then a blank line, then the boxes
             assert lines[2:5] == ["[x] front (web)", "[x] back (api)", "[ ] db (api)"]
+            assert is_green_bar(rendered_style(app, "front (web)"))  # the highlighted option
+            assert not is_green_bar(rendered_style(app, "db (api)"))
             await pilot.press("space")  # uncheck front
             await pilot.pause()
             assert screen_lines(app)[2].rstrip() == "[ ] front (web)"
