@@ -5,11 +5,12 @@ import os
 import re
 import secrets
 from collections.abc import Callable
+from itertools import takewhile
 from pathlib import Path
 from typing import Any
 
 from wt import compose, proc
-from wt.config import Config
+from wt.config import Config, KeycloakUser
 from wt.config import Keycloak as KeycloakConfig
 from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
@@ -26,12 +27,21 @@ SCOPE_SEPARATOR = "."
 # One fixed script per kcadm call. It logs in with the container's own bootstrap admin
 # variables (the password never reaches the host argv) into a unique config file that a trap
 # removes, then runs the caller's arguments, which arrive only as "$@".
-SCRIPT = (
+LOGIN_SCRIPT = (
     "CFG=$(mktemp /tmp/kcadm-XXXXXXXX.config); trap 'rm -f \"$CFG\"' EXIT; "
     '/opt/keycloak/bin/kcadm.sh config credentials --config "$CFG" '
     f"--server http://localhost:{INTERNAL_PORT} --realm master "
     '--user "$KC_BOOTSTRAP_ADMIN_USERNAME" --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" '
-    '>/dev/null && /opt/keycloak/bin/kcadm.sh "$@" --config "$CFG"'
+    ">/dev/null && "
+)
+SCRIPT = LOGIN_SCRIPT + '/opt/keycloak/bin/kcadm.sh "$@" --config "$CFG"'
+# Same login, for `set-password`: the new password is read from the container's environment
+# (`docker exec -e PASSWORD_VAR`, copied from the host process), so it is in no argv. No
+# `--temporary`: the dev user can log in at once.
+PASSWORD_VAR = "WT_KC_PASSWORD"
+SET_PASSWORD_SCRIPT = (
+    LOGIN_SCRIPT
+    + f'/opt/keycloak/bin/kcadm.sh "$@" --new-password "${PASSWORD_VAR}" --config "$CFG"'
 )
 
 # What kcadm 26.8.1 prints (stderr, exit 1) when an admin REST path answers 404, which is how a
@@ -44,7 +54,7 @@ LOGIN_NOTICE = "Logging into"
 FRAGMENT = re.compile(r"[\[\]{}<]")
 # `down` shows the first ~120 characters of the message: 10 for the prefix, 26 for the call name.
 REASON_MAX = 80
-CALL_WORDS = 2
+MASK = "***"
 
 
 def container() -> str:
@@ -141,9 +151,12 @@ def _short(reason: str) -> str:
 
 
 def _call_name(args: tuple[str, ...]) -> str:
-    """`kcadm.sh <verb> <resource>`: never ids, realm or client names, the script or a password."""
-    words = [arg.split("/")[0] for arg in args if not arg.startswith("-")]
-    return " ".join(["kcadm.sh", *words[:CALL_WORDS]])
+    """`kcadm.sh <verb> <resource>`: never ids, realm, client or user names, script or password.
+
+    Only the words before the first option count; option values (`-r shop`) come after it.
+    """
+    words = [arg.split("/")[0] for arg in takewhile(lambda arg: not arg.startswith("-"), args)]
+    return " ".join(["kcadm.sh", *words])
 
 
 def _failure(args: tuple[str, ...], reason: str) -> WtError:
@@ -151,8 +164,10 @@ def _failure(args: tuple[str, ...], reason: str) -> WtError:
     return WtError(f"keycloak: {_short(reason)} ({_call_name(args)})")
 
 
-def _kcadm_error(args: tuple[str, ...], res: proc.Result) -> WtError:
-    return _failure(args, _failure_reason(res))
+def _kcadm_error(args: tuple[str, ...], res: proc.Result, secret: str = "") -> WtError:
+    """`secret` is masked in the reason: kcadm may echo a rejected value back."""
+    reason = _failure_reason(res)
+    return _failure(args, reason.replace(secret, MASK) if secret else reason)
 
 
 def kcadm(*args: str, check: bool = True) -> proc.Result:
@@ -163,6 +178,19 @@ def kcadm(*args: str, check: bool = True) -> proc.Result:
     if check and not res.ok:
         raise _kcadm_error(args, res)
     return res
+
+
+def set_password(realm: str, username: str, new_password: str) -> None:
+    """Set a user's (non-temporary) password. The value is passed only through the environment."""
+    args = ("set-password", "-r", realm, "--username", username)
+    docker_exec = ["docker", "exec", "-e", PASSWORD_VAR, container()]
+    res = proc.run(
+        [*docker_exec, "bash", "-c", SET_PASSWORD_SCRIPT, "kcadm", *args],
+        check=False,
+        env={PASSWORD_VAR: new_password},
+    )
+    if not res.ok:
+        raise _kcadm_error(args, res, new_password)
 
 
 def wait_ready(timeout: float = 120.0, total: float | None = None) -> None:
@@ -193,16 +221,11 @@ def ensure_server(realm: str | None = None, timeout: int = 120) -> None:
         ensure_realm(realm)
 
 
-def find_client(realm: str, client_id: str) -> dict[str, Any] | None:
-    """The client whose clientId is exactly `client_id` (the server filter is a substring).
+def _rows(args: tuple[str, ...]) -> list[dict[str, Any]] | None:
+    """The rows a `kcadm get` printed; None only when the realm does not exist.
 
-    None only when the realm or the client does not exist; every other failure raises, so a
-    stopped server is never read as "nothing to do".
+    Every other failure raises, so a stopped server is never read as "nothing to do".
     """
-    args = (
-        "get", "clients", "-r", realm, "-q", f"clientId={client_id}",
-        "--fields", "id,clientId,redirectUris",
-    )  # fmt: skip
     res = kcadm(*args, check=False)
     if not res.ok:
         if NOT_FOUND.search(res.stderr):
@@ -214,10 +237,55 @@ def find_client(realm: str, client_id: str) -> dict[str, Any] | None:
         raise _failure(args, "did not return JSON") from e
     if not isinstance(rows, list):
         raise _failure(args, "did not return a list")
-    for row in rows:
+    return rows
+
+
+def find_client(realm: str, client_id: str) -> dict[str, Any] | None:
+    """The client whose clientId is exactly `client_id` (the server filter is a substring)."""
+    args = (
+        "get", "clients", "-r", realm, "-q", f"clientId={client_id}",
+        "--fields", "id,clientId,redirectUris",
+    )  # fmt: skip
+    for row in _rows(args) or []:
         if row.get("clientId") == client_id:
             return dict(row)
     return None
+
+
+def user_exists(realm: str, username: str) -> bool:
+    """Exact match: the server filter is a substring and Keycloak lower-cases usernames."""
+    args = ("get", "users", "-r", realm, "-q", f"username={username}", "--fields", "id,username")
+    return any(str(row.get("username")) == username.lower() for row in _rows(args) or [])
+
+
+def ensure_role(realm: str, role: str) -> None:
+    args = ("get", "roles", "-r", realm, "-q", f"search={role}", "--fields", "id,name")
+    if any(row.get("name") == role for row in _rows(args) or []):
+        return
+    create = ("create", "roles", "-r", realm, "-s", f"name={role}")
+    res = kcadm(*create, check=False)
+    if not res.ok and "already exists" not in f"{res.stdout}{res.stderr}":
+        raise _kcadm_error(create, res)
+
+
+def ensure_user(realm: str, user: KeycloakUser) -> None:
+    """Create the user if missing, then (every time) set its password and assign its roles."""
+    if not user_exists(realm, user.username):
+        flags = [
+            "-s",
+            f"username={user.username}",
+            "-s",
+            "enabled=true",
+            "-s",
+            "emailVerified=true",
+        ]
+        if user.email is not None:
+            flags += ["-s", f"email={user.email}"]
+        kcadm("create", "users", "-r", realm, *flags)
+    set_password(realm, user.username, user.password)
+    for role in user.roles:
+        ensure_role(realm, role)
+        kcadm("add-roles", "-r", realm, "--uusername", user.username, "--rolename", role)
 
 
 class KeycloakProvider:
@@ -265,6 +333,8 @@ class KeycloakProvider:
             kcadm("create", "clients", "-r", realm, *flags)
         else:
             kcadm("update", f"clients/{existing['id']}", "-r", realm, *flags)
+        for user in self._cfg().users:
+            ensure_user(realm, user)
         return Resources([f"{realm}/{client_id}"])
 
     def verify(self, ctx: BranchContext) -> Check:
@@ -274,6 +344,9 @@ class KeycloakProvider:
             return Check(False, f"client {client_id!r} not found in realm {realm!r}")
         if set(row.get("redirectUris", [])) != set(self.redirect_uris(ctx)):
             return Check(False, f"client {client_id!r} has unexpected redirect URIs")
+        for user in self._cfg().users:
+            if not user_exists(realm, user.username):
+                return Check(False, f"user {user.username!r} not found in realm {realm!r}")
         warnings = [] if ctx.urls else ["no routed services: the client has no redirect URIs"]
         return Check(True, f"client {client_id!r} in realm {realm!r} is ready", warnings)
 

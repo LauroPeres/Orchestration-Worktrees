@@ -1,6 +1,6 @@
 import json
 import stat
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import pytest
 
@@ -17,8 +17,11 @@ URLS = ("https://shop.feat-cart.shop.localhost", "https://api.feat-cart.shop.loc
 UUID = "11111111-2222-3333-4444-555555555555"
 
 
-def config(with_keycloak: bool = True) -> Config:
-    shared = {"keycloak": {"realm": "shop", "client": "web"}} if with_keycloak else {}
+def config(with_keycloak: bool = True, users: Sequence[Mapping[str, object]] = ()) -> Config:
+    section: dict[str, object] = {"realm": "shop", "client": "web"}
+    if users:
+        section["users"] = list(users)
+    shared = {"keycloak": section} if with_keycloak else {}
     return Config.model_validate(
         {
             "project": "shop",
@@ -33,6 +36,7 @@ def config(with_keycloak: bool = True) -> Config:
 class FakeProc:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.envs: list[object] = []
         self.rules: list[tuple[str, proc.Result]] = []
 
     def on(self, needle: str, result: proc.Result) -> None:
@@ -44,6 +48,7 @@ class FakeProc:
 
     def __call__(self, args: Sequence[str], *, check: bool = True, **kwargs: object) -> proc.Result:
         self.calls.append(list(args))
+        self.envs.append(kwargs.get("env"))
         line = " ".join(args[args.index("kcadm") :]) if "kcadm" in args else " ".join(args)
         result = proc.Result(0, "", "")
         for needle, rule in self.rules:
@@ -73,8 +78,10 @@ def ctx(
     )
 
 
-def provider(with_keycloak: bool = True) -> KeycloakProvider:
-    return KeycloakProvider(config(with_keycloak), lambda message: None)
+def provider(
+    with_keycloak: bool = True, users: Sequence[Mapping[str, object]] = ()
+) -> KeycloakProvider:
+    return KeycloakProvider(config(with_keycloak, users), lambda message: None)
 
 
 def clients(*rows: tuple[str, str, list[str]]) -> proc.Result:
@@ -662,3 +669,185 @@ def test_template_vars_by_kind(monkeypatch: pytest.MonkeyPatch) -> None:
     assert p.template_vars(ctx(), "run") == {
         "keycloak": {**base, "internal_url": "http://localhost:58080"}
     }
+
+
+# --- dev users (docs/SPEC.md section 25) ---
+
+PASSWORD = "hunter2-dev"
+ALICE: dict[str, object] = {
+    "username": "alice",
+    "password": PASSWORD,
+    "email": "alice@shop.localhost",
+    "roles": ["admin", "dev"],
+}
+
+
+def named(*names: str, key: str = "username") -> proc.Result:
+    return proc.Result(0, json.dumps([{"id": f"id-{n}", key: n} for n in names]), "")
+
+
+def user_calls(fake: FakeProc) -> list[list[str]]:
+    """Every kcadm call after the client was created: what the users step did."""
+    return fake.kc()[2:]
+
+
+def test_create_adds_a_new_user_sets_its_password_and_assigns_roles(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", proc.Result(0, "[ ]", ""))
+    fake.on("get roles", named("dev", "devops", key="name"))
+    res = provider(users=[ALICE]).create(ctx())
+    assert res.names == ["shop/web-shop.feat-cart"]
+    assert user_calls(fake) == [
+        ["get", "users", "-r", "shop", "-q", "username=alice", "--fields", "id,username"],
+        [
+            *("create", "users", "-r", "shop", "-s", "username=alice"),
+            *("-s", "enabled=true", "-s", "emailVerified=true", "-s", "email=alice@shop.localhost"),
+        ],
+        ["set-password", "-r", "shop", "--username", "alice"],
+        ["get", "roles", "-r", "shop", "-q", "search=admin", "--fields", "id,name"],
+        ["create", "roles", "-r", "shop", "-s", "name=admin"],
+        ["add-roles", "-r", "shop", "--uusername", "alice", "--rolename", "admin"],
+        ["get", "roles", "-r", "shop", "-q", "search=dev", "--fields", "id,name"],
+        ["add-roles", "-r", "shop", "--uusername", "alice", "--rolename", "dev"],
+    ]
+
+
+def test_a_user_without_email_or_roles_is_created_without_them(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", proc.Result(0, "[ ]", ""))
+    bob = {"username": "bob", "password": "pw-bob"}
+    provider(users=[bob]).create(ctx())
+    create = next(c for c in user_calls(fake) if c[:2] == ["create", "users"])
+    assert not any(part.startswith("email=") for part in create)
+    assert [c[0] for c in user_calls(fake)] == ["get", "create", "set-password"]
+
+
+def test_an_existing_user_is_not_recreated_but_gets_its_password_again(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    provider(users=[{**ALICE, "roles": []}]).create(ctx())
+    verbs = [c[:2] for c in user_calls(fake)]
+    assert ["create", "users"] not in verbs
+    assert ["set-password", "-r"] in verbs
+
+
+def test_the_user_match_is_exact_and_ignores_case(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice2", "malice"))
+    provider(users=[{**ALICE, "roles": []}]).create(ctx())
+    assert ["create", "users"] in [c[:2] for c in user_calls(fake)]
+    # Keycloak stores usernames in lower case: "Alice" finds the stored "alice".
+    fake.calls.clear()
+    fake.rules.clear()
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    provider(users=[{**ALICE, "username": "Alice", "roles": []}]).create(ctx())
+    assert ["create", "users"] not in [c[:2] for c in user_calls(fake)]
+
+
+def test_an_existing_role_is_not_recreated_and_still_assigned(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    fake.on("get roles", named("admin", key="name"))
+    provider(users=[{**ALICE, "roles": ["admin"]}]).create(ctx())
+    verbs = [c[:2] for c in user_calls(fake)]
+    assert ["create", "roles"] not in verbs and ["add-roles", "-r"] in verbs
+
+
+def test_a_role_created_by_a_concurrent_up_counts_as_done(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    fake.on("get roles", proc.Result(0, "[ ]", ""))
+    fake.on("create roles", proc.Result(1, "", "Role with name admin already exists"))
+    provider(users=[{**ALICE, "roles": ["admin"]}]).create(ctx())
+    assert ["add-roles", "-r"] in [c[:2] for c in user_calls(fake)]
+
+
+def test_the_password_travels_in_the_environment_never_in_argv(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", proc.Result(0, "[ ]", ""))
+    fake.on("get roles", proc.Result(0, "[ ]", ""))
+    provider(users=[ALICE]).create(ctx())
+    assert all(PASSWORD not in part for call in fake.calls for part in call)
+    index = next(i for i, c in enumerate(fake.calls) if "set-password" in c)
+    call = fake.calls[index]
+    assert fake.envs[index] == {"WT_KC_PASSWORD": PASSWORD}
+    assert call[:5] == ["docker", "exec", "-e", "WT_KC_PASSWORD", keycloak.container()]
+    assert "--temporary" not in call
+    assert '--new-password "$WT_KC_PASSWORD"' in call[call.index("-c") + 1]
+    assert [e for i, e in enumerate(fake.envs) if i != index] == [None] * (len(fake.envs) - 1)
+
+
+def test_the_set_password_script_is_fixed_and_logs_in_like_the_other(fake: FakeProc) -> None:
+    script = keycloak.SET_PASSWORD_SCRIPT
+    assert script.startswith(keycloak.LOGIN_SCRIPT)
+    assert "trap" in script and PASSWORD not in script and "--temporary" not in script
+
+
+def test_a_failure_that_echoes_the_password_is_masked(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    fake.on("set-password", proc.Result(1, "", f"Invalid password: {PASSWORD} is too weak\n"))
+    with pytest.raises(WtError) as err:
+        provider(users=[ALICE]).create(ctx())
+    assert str(err.value) == "keycloak: Invalid password: *** is too weak (kcadm.sh set-password)"
+
+
+def test_a_failure_on_stdout_that_echoes_the_password_is_masked(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    fake.on("set-password", proc.Result(1, f"bad {PASSWORD}", ""))
+    with pytest.raises(WtError) as err:
+        provider(users=[ALICE]).create(ctx())
+    assert PASSWORD not in str(err.value) and "***" in str(err.value)
+
+
+def test_user_errors_keep_the_standard_form(fake: FakeProc) -> None:
+    fake.on("get clients", clients())
+    fake.on("get users", named("alice"))
+    fake.on("get roles", named("admin", "dev", key="name"))
+    fake.on("add-roles", proc.Result(1, "", "boom"))
+    with pytest.raises(WtError) as err:
+        provider(users=[ALICE]).create(ctx())
+    assert str(err.value) == "keycloak: boom (kcadm.sh add-roles)"
+    fake.on("get users", LOGIN_REFUSED)
+    fake.rules.insert(0, ("get users", UNREACHABLE))
+    with pytest.raises(WtError, match=r"Connection refused.*\(kcadm\.sh get users\)$"):
+        provider(users=[ALICE]).create(ctx())
+
+
+def test_destroy_never_touches_users_or_roles(fake: FakeProc) -> None:
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", [])))
+    provider(users=[ALICE]).destroy(ctx())
+    assert fake.kc() == [
+        [
+            *("get", "clients", "-r", "shop", "-q", "clientId=web-shop.feat-cart"),
+            *("--fields", "id,clientId,redirectUris"),
+        ],
+        ["delete", f"clients/{UUID}", "-r", "shop"],
+    ]
+
+
+def test_verify_checks_that_the_users_exist(fake: FakeProc) -> None:
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", rendered())))
+    fake.on("get users", named("alice"))
+    check = provider(users=[ALICE]).verify(ctx())
+    assert check.ok
+
+
+def test_verify_fails_naming_a_missing_user(fake: FakeProc) -> None:
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", rendered())))
+    fake.on("get users", proc.Result(0, "[ ]", ""))
+    check = provider(users=[ALICE]).verify(ctx())
+    assert not check.ok and "alice" in check.detail and PASSWORD not in check.detail
+
+
+def test_verify_without_users_makes_no_user_call(fake: FakeProc) -> None:
+    fake.on("get clients", clients((UUID, "web-shop.feat-cart", rendered())))
+    assert provider().verify(ctx()).ok
+    assert not any(c[1] == "users" for c in fake.kc())
+
+
+def test_the_call_name_ignores_realm_and_user_values() -> None:
+    args = ("add-roles", "-r", "shop", "--uusername", "alice", "--rolename", "admin")
+    assert keycloak._call_name(args) == "kcadm.sh add-roles"

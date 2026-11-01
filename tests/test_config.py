@@ -3,10 +3,11 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from tests.conftest import write_global_catalog
 from wt.catalog import load_project
-from wt.config import Config, LoadedConfig, Shared
+from wt.config import Config, Keycloak, LoadedConfig, Shared, _format_errors
 from wt.errors import WtError
 
 SHARED = {"postgres": {"databases": ["shop"]}, "kafka": {"groups": ["orders"]}}
@@ -303,3 +304,105 @@ def test_setup_cache_flows_into_the_resolved_service(tmp_path: Path, preset: str
     services = load(tmp_path, data).config.services
     assert services["web"].setup_cache == preset
     assert services["api"].setup_cache is None
+
+
+# --- Keycloak dev users (SPEC section 25) ---
+
+SECRET = "hunter2-SECRET"
+REALM = {"realm": "shop", "client": "web"}
+
+
+def keycloak_with(*users: dict[str, Any]) -> dict[str, Any]:
+    return with_infra({"keycloak": {**REALM, "users": list(users)}})
+
+
+def test_keycloak_users_default_to_none(tmp_path: Path) -> None:
+    cfg = load(tmp_path, with_infra({"keycloak": REALM})).config
+    assert cfg.shared.keycloak is not None
+    assert cfg.shared.keycloak.users == []
+
+
+def test_keycloak_users_are_loaded(tmp_path: Path) -> None:
+    data = keycloak_with(
+        {"username": "alice", "password": SECRET, "email": "a@x.io", "roles": ["admin", "dev"]},
+        {"username": "bob.b-2_x", "password": "p"},
+    )
+    keycloak = load(tmp_path, data).config.shared.keycloak
+    assert keycloak is not None
+    users = keycloak.users
+    assert [u.username for u in users] == ["alice", "bob.b-2_x"]
+    assert (users[0].password, users[0].email, users[0].roles) == (
+        SECRET,
+        "a@x.io",
+        ["admin", "dev"],
+    )
+    assert (users[1].email, users[1].roles) == (None, [])
+
+
+@pytest.mark.parametrize(
+    ("user", "message"),
+    [
+        ({"username": "a b", "password": "p"}, "users.0.username"),
+        ({"username": "", "password": "p"}, "users.0.username"),
+        ({"username": "a" * 65, "password": "p"}, "users.0.username"),
+        ({"username": "ali/ce", "password": "p"}, "users.0.username"),
+        ({"username": "alice", "password": ""}, "users.0.password: String should have at least 1"),
+        ({"username": "alice"}, "users.0.password"),
+        ({"password": "p"}, "users.0.username"),
+        ({"username": "alice", "password": "p", "email": "nope"}, "users.0.email: must look like"),
+        ({"username": "alice", "password": "p", "email": "a@"}, "users.0.email"),
+        (
+            {"username": "alice", "password": "p", "roles": ["ok", "b d"]},
+            "users.0.roles: role 'b d'",
+        ),
+        ({"username": "alice", "password": "p", "roles": ["x", "x"]}, "duplicate role 'x'"),
+        ({"username": "alice", "password": "p", "typo": 1}, "users.0.typo"),
+    ],
+)
+def test_keycloak_user_rejects_invalid(tmp_path: Path, user: dict[str, Any], message: str) -> None:
+    with pytest.raises(WtError, match=message):
+        load(tmp_path, keycloak_with(user))
+
+
+def test_keycloak_usernames_must_be_unique_without_leaking_passwords(tmp_path: Path) -> None:
+    data = keycloak_with(
+        {"username": "alice", "password": SECRET}, {"username": "alice", "password": "other-pw"}
+    )
+    with pytest.raises(WtError, match="duplicate keycloak user 'alice'") as caught:
+        load(tmp_path, data)
+    assert SECRET not in str(caught.value)
+    assert "other-pw" not in str(caught.value)
+
+
+def test_keycloak_password_never_shows_in_repr() -> None:
+    keycloak = Keycloak.model_validate({**REALM, "users": [{"username": "a", "password": SECRET}]})
+    assert SECRET not in repr(keycloak)
+    assert SECRET not in repr(keycloak.users[0])
+    assert keycloak.users[0].password == SECRET  # the provider needs the raw value
+
+
+@pytest.mark.parametrize(
+    "users",
+    [
+        [{"username": "a", "password": SECRET}, {"username": "a", "password": SECRET}],
+        [{"username": "a b", "password": SECRET}],
+        [{"username": "a", "password": SECRET, "email": "nope"}],
+        [{"username": "a", "password": SECRET, "roles": ["x", "x"]}],
+        [{"username": "a", "password": SECRET, "typo": SECRET}],
+        [{"username": "a", "password": 12345678}],
+    ],
+)
+def test_keycloak_validation_errors_do_not_echo_the_input(users: list[dict[str, Any]]) -> None:
+    with pytest.raises(ValidationError) as caught:
+        Keycloak.model_validate({**REALM, "users": users})
+    assert SECRET not in str(caught.value)
+    assert "12345678" not in str(caught.value)
+    assert SECRET not in _format_errors(caught.value)
+    assert "12345678" not in _format_errors(caught.value)
+
+
+def test_keycloak_password_does_not_leak_through_the_whole_config() -> None:
+    infra = {"keycloak": {**REALM, "users": [{"username": "a b", "password": SECRET}]}}
+    with pytest.raises(ValidationError) as caught:
+        Shared.model_validate(infra)
+    assert SECRET not in str(caught.value)
