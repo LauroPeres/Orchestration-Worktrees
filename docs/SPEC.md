@@ -166,7 +166,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
 | v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
 | v0.7.1 | Keycloak dev users (`infra.keycloak.users`) |
-| v0.8 | shared dependency caches |
+| v0.8.0 (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 | v0.9 | native Windows (spike first) |
 
 ## 11. Clean-room rules
@@ -1139,3 +1139,47 @@ wt catalog remove-repo NAME         # refused while a service uses it
 They edit the file in place with `ruamel.yaml` (round-trip: comments and key order stay), validate the result
 with `load_project` (and each service alone, as `--check` does) **before** writing, and write atomically. An
 existing name is an error (`service 'x' already exists`). `ruamel.yaml` becomes a runtime dependency.
+
+## 24. v0.8.0: install caches (uv and npm)
+
+Decided 2026-11-01 (plan `roadmap-to-v09`; approval step skipped in away mode; scope uv and npm only, the user's
+choice). Everything not named here is unchanged. A new worktree has no `.venv` or `node_modules`; with `setup:`
+(§22) it installs them, and this section makes the second install cheap.
+
+**Key.** `CatalogService.setup_cache: Literal["uv", "npm"] | None = None` (needs `setup:`; otherwise
+`setup_cache: needs setup:`). The preset says which cache applies.
+
+**`npm`: restore the install.** `node_modules` is relocatable, so wt keeps a copy per lock state.
+- Key = sha256 of the preset name, the content of `package-lock.json` (and `.nvmrc` or `.node-version` when
+  present), the rendered `setup` text and the output of `node --version`. A missing `package-lock.json` is an
+  error: `setup_cache: npm needs package-lock.json in <repo>`.
+- Store: `$WT_HOME/cache/installs/<key>/node_modules` plus `meta.json`
+  (`{"preset","service","setup","created_at","last_used","bytes"}`).
+- In `up`, before `setup` (§22): on a hit, copy `node_modules` into the service's repo worktree (a reflink or
+  clone copy when the filesystem supports it, else a plain recursive copy that keeps symlinks and modes),
+  update `last_used`, record `setup_done` and skip `setup`. On a miss run `setup`; on success copy the resulting
+  `node_modules` into the store (atomic: write to `<key>.tmp`, rename). A failing copy is a note, never an
+  error: `setup` already succeeded.
+- Because the worktree gets a copy, pruning the store never breaks a worktree.
+
+**`uv`: share uv's own cache.** A virtualenv is not relocatable (its scripts hold the absolute path of the
+folder they were created in), so wt does not copy `.venv`. `setup` runs normally; what is shared is uv's
+download/build cache.
+
+**Environment.** For a service with `setup_cache`, its `setup` and `run` processes get `UV_CACHE_DIR=$WT_HOME/
+cache/uv` (preset `uv`) or `npm_config_cache=$WT_HOME/cache/npm` (preset `npm`), unless the service's own
+`env` already sets that variable.
+
+**`wt cache ls [--json]`.** One row per install entry (key, preset, service, size, last used) and one row per
+tool cache folder (`uv`, `npm`) with its size, then the total. JSON: `{"schema":1,"entries":[{"key","preset",
+"service","bytes","last_used"}],"tools":{"uv":bytes,"npm":bytes},"total_bytes":n}`.
+
+**`wt cache prune [--all] [--older-than DAYS]`.** Removes install entries whose `last_used` is older than DAYS
+(default 30); `--all` removes every entry and the `uv` and `npm` tool caches. Prints what it removed and the
+bytes freed (`--json`: `{"schema":1,"removed":[keys],"bytes_freed":n}`).
+
+**Doctor.** A `cache` check: `info` with the total cache size, `warn` when the disk that holds `$WT_HOME` has
+less than 2 GiB free (`low disk space: <n> free; wt cache prune frees <m>`).
+
+**Benchmarks.** `examples/` gets a script that measures a cold install and a restored install of a small npm
+project with a local registry mirror/cache; README numbers come only from it, with the command.
