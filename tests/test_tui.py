@@ -4,11 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from rich.style import Style
 from textual.widgets import DataTable, Label, SelectionList, Static
 
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, Choice, RepoRow
-from wt.tui import CONFIRM_REMOVE, ProjectEntry, WtApp
+from wt.tui import CONFIRM_REMOVE, ConfigureScreen, ConfirmScreen, InputScreen, ProjectEntry, WtApp
 
 
 def status(branch: str, state: str, ports: list[int] | None = None) -> BranchStatus:
@@ -107,6 +108,28 @@ def message(app: WtApp) -> str:
     return str(app.query_one("#message", Static).render())
 
 
+ANSI_GREEN = 2  # Rich's number for the terminal's own green
+
+
+def is_green(style: Any) -> bool:
+    return isinstance(style, Style) and style.color is not None and style.color.number == ANSI_GREEN
+
+
+def green_keys(text: Any) -> list[str]:
+    """The words of a hint line that are green; asserts that nothing else is styled."""
+    assert all(is_green(span.style) for span in text.spans)
+    return [text.plain[span.start : span.end] for span in text.spans]
+
+
+def rendered_style(app: WtApp, word: str) -> Style:
+    """The style the terminal gets for the first piece of text on screen that contains `word`."""
+    for strip in app.screen._compositor.render_strips():
+        for segment in strip:
+            if word in segment.text:
+                return segment.style or Style()
+    raise AssertionError(f"{word!r} is not on screen")
+
+
 def test_rows_and_columns() -> None:
     async def scenario() -> None:
         app = WtApp(FakeOrch())
@@ -117,7 +140,21 @@ def test_rows_and_columns() -> None:
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
             actions: Any = app.query_one("#actions", Static).render()
             assert actions.plain == "enter: services  u: up  d: down  a: add  r: remove  q: quit"
-            assert not actions.spans
+            assert green_keys(actions) == ["enter", "u", "d", "a", "r", "q"]  # the words are plain
+
+    asyncio.run(scenario())
+
+
+def test_the_table_has_a_plain_border_and_green_column_names() -> None:
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#table", DataTable)
+            assert table.styles.border_top[0] == "solid"
+            assert is_green(rendered_style(app, "NAME"))
+            assert is_green(rendered_style(app, "STATUS"))
+            assert not is_green(rendered_style(app, "stopped"))  # cells keep the terminal's colors
 
     asyncio.run(scenario())
 
@@ -134,6 +171,49 @@ def test_u_and_d_call_up_and_stop_of_selected() -> None:
             await settle(pilot)
             assert orch.calls == [("up", "feat-a"), ("stop", "main")]
             assert message(app) == "down main: done"
+
+    asyncio.run(scenario())
+
+
+def page_title(app: WtApp) -> str:
+    return str(app.screen.query_one("#title", Label).render())
+
+
+def test_each_action_is_a_page_of_its_own_and_cancel_returns_to_the_table() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table_page = app.screen
+            await pilot.press("a")
+            await pilot.pause()
+            assert isinstance(app.screen, InputScreen) and app.screen is not table_page
+            assert page_title(app) == "Add a worktree" and not app.screen.query("#table")
+            await pilot.press(*"new-x", "enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfigureScreen) and not app.screen.query("#table")
+            pages = len(app.screen_stack)
+            await pilot.press("a", "r", "u", "d")  # the table's keys do nothing here
+            await pilot.pause()
+            assert isinstance(app.screen, ConfigureScreen) and len(app.screen_stack) == pages
+            assert green_keys(app.screen.query_one("#hints", Static).render()) == [
+                "space", "enter", "esc",
+            ]  # fmt: skip
+            await pilot.press("escape")
+            await settle(pilot)
+            assert app.screen is table_page and app.query_one("#table", DataTable)
+            await pilot.press("r")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen) and app.screen is not table_page
+            assert page_title(app) == "Remove a worktree" and not app.screen.query("#table")
+            pages = len(app.screen_stack)
+            await pilot.press("a", "r")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen) and len(app.screen_stack) == pages
+            await pilot.press("escape")
+            await settle(pilot)
+            assert app.screen is table_page and orch.calls == []
 
     asyncio.run(scenario())
 
@@ -159,8 +239,7 @@ def test_a_asks_for_name_then_services_and_adds_without_starting() -> None:
             assert str(prompt.render()) == "Enter name"
             await pilot.press(*"new-x", "enter")
             await pilot.pause()
-            title = app.screen.query_one("#dialog Label", Label)
-            assert str(title.render()) == "Services for new-x"
+            assert page_title(app) == "Services for new-x"
             assert checked(app) == []  # a new worktree starts with nothing selected
             await pilot.press("space", "enter")  # front
             await settle(pilot)
@@ -571,6 +650,7 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
                 assert not any(cell.spans or cell.style for cell in table.get_row_at(row))
             actions: Any = app.screen.query_one("#actions", Static).render()
             assert actions.plain == "c: configure  esc: back  q: quit"
+            assert green_keys(actions) == ["c", "esc", "q"]
             await pilot.press("escape")
             await settle(pilot)
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
@@ -931,10 +1011,11 @@ def test_checklist_shows_its_state_as_text_markers() -> None:
         async with app.run_test() as pilot:
             await open_configure(pilot)
             lines = [line.rstrip() for line in screen_lines(app)]
-            assert lines[1:4] == ["[x] front (web)", "[x] back (api)", "[ ] db (api)"]
+            assert lines[0] == "Services"  # the title, then a blank line, then the boxes
+            assert lines[2:5] == ["[x] front (web)", "[x] back (api)", "[ ] db (api)"]
             await pilot.press("space")  # uncheck front
             await pilot.pause()
-            assert screen_lines(app)[1].rstrip() == "[ ] front (web)"
+            assert screen_lines(app)[2].rstrip() == "[ ] front (web)"
 
     asyncio.run(scenario())
 
