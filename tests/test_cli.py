@@ -11,7 +11,8 @@ import yaml
 from typer.testing import CliRunner
 
 from tests.conftest import COMPOSE, SHARED, SHOP_CATALOG, FakeDocker
-from wt import __version__, cli, compose, doctor, host, proc
+from tests.test_catalog_edit import EDIT_CATALOG
+from wt import __version__, catalog_edit, cli, compose, doctor, host, proc
 from wt.catalog import load_project
 from wt.cli import app
 from wt.errors import WtError
@@ -1157,7 +1158,7 @@ def test_catalog_check_runs_each_service_through_load_project(
         asked.append(uses)
         return real(path, uses=uses)
 
-    monkeypatch.setattr(cli, "load_project", spy)
+    monkeypatch.setattr(catalog_edit, "load_project", spy)
     result = _check_catalog(tmp_path, monkeypatch, CATALOG)
     assert result.exit_code == 0, result.output
     assert asked == [["back"], ["front"]]
@@ -1645,3 +1646,234 @@ def test_action_document_carries_the_outcome() -> None:
     assert list(document) == ACTION_KEYS
     assert (document["changed"], document["status"]) == (False, "up")
     assert document["urls"] == {"front": FRONT_URL} and document["warnings"] == ["careful"]
+
+
+# --- wt init --with (SPEC §23) -------------------------------------------------------------
+
+
+def _init_with(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *args: str) -> Any:
+    folder = tmp_path / "shop"
+    folder.mkdir()
+    monkeypatch.chdir(folder)
+    return runner.invoke(app, ["init", *args])
+
+
+def test_init_with_enables_the_infra_sections_on_the_sample_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _init_with(tmp_path, monkeypatch, "--with", "postgres,redis,kafka,keycloak")
+    assert result.exit_code == 0, result.output
+    target = tmp_path / "wt-home" / "catalog.yaml"
+    shared = load_project(target).config.shared
+    assert shared.postgres is not None
+    assert shared.postgres.model_dump() == {
+        "databases": ["app"],
+        "strategy": "template",
+        "verify": True,
+        "base_branch": "main",
+    }
+    assert shared.redis is not None
+    assert shared.kafka is not None
+    assert (shared.kafka.groups, shared.kafka.topic_prefix) == (["app"], True)
+    assert shared.keycloak is not None
+    assert (shared.keycloak.realm, shared.keycloak.client) == ("shop", "app")
+    assert "catalog invalid" not in runner.invoke(app, ["catalog", "--check"]).output
+    assert runner.invoke(app, ["catalog", "--check"]).exit_code == 0
+
+
+def test_init_with_one_provider_keeps_the_starter_comments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _init_with(tmp_path, monkeypatch, "--with", "redis")
+    assert result.exit_code == 0, result.output
+    text = (tmp_path / "wt-home" / "catalog.yaml").read_text()
+    assert "# --- examples: uncomment to try" in text
+    assert load_project(tmp_path / "wt-home" / "catalog.yaml").config.shared.configured() == [
+        "redis"
+    ]
+
+
+def test_init_without_with_has_no_infra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _init_with(tmp_path, monkeypatch).exit_code == 0
+    assert load_project(tmp_path / "wt-home" / "catalog.yaml").config.shared.configured() == []
+
+
+def test_init_with_an_unknown_provider_lists_the_known_ones_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _init_with(tmp_path, monkeypatch, "--with", "redis,mongo")
+    assert isinstance(result.exception, WtError)
+    assert str(result.exception) == (
+        "unknown provider 'mongo' (providers: kafka, keycloak, postgres, redis)"
+    )
+    assert not (tmp_path / "wt-home" / "catalog.yaml").exists()
+
+
+# --- wt catalog add-repo | add-service | remove-service | remove-repo (SPEC §23) ----------------
+# The edits themselves (byte-for-byte, refusals) are tested in test_catalog_edit.py: here only
+# the options, the printed text and the JSON documents.
+
+
+@pytest.fixture
+def edit_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "c.yaml"
+    path.write_text(EDIT_CATALOG)
+    monkeypatch.setenv("WT_CATALOG", str(path))
+    return path
+
+
+def _edit(*args: str) -> Any:
+    return runner.invoke(app, ["catalog", *args])
+
+
+def test_add_repo_prints_what_it_did(edit_file: Path) -> None:
+    result = _edit("add-repo", "docs", "/srv/docs")
+    assert result.exit_code == 0, result.output
+    assert "added repo docs" in result.output
+    assert "  docs: /srv/docs" in edit_file.read_text()
+
+
+def test_catalog_option_after_the_subcommand_picks_the_file(
+    edit_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WT_CATALOG")
+    result = _edit("add-repo", "docs", "/srv/docs", "--catalog", str(edit_file))
+    assert result.exit_code == 0, result.output
+    assert "docs: /srv/docs" in edit_file.read_text()
+
+
+def test_add_service_passes_every_option_through(edit_file: Path) -> None:
+    result = _edit(
+        "add-service", "admin", "--repo", "notes-front", "--run", "npm start -- {{ port }}",
+        "--port", "auto", "--subdomain", "admin", "--health", "/ping",
+        "--env", "MODE=dev", "--env", "NAME=a b", "--consumes", "back:API_URL",
+        "--infra", "postgres:notes,audit", "--infra", "kafka:g1", "--infra", "redis",
+        "--setup", "npm ci",
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert "added service admin" in result.output
+    loaded = load_project(edit_file, uses=["admin"]).config
+    svc = loaded.services["admin"]
+    assert (svc.repo, svc.run, svc.setup) == ("notes-front", "npm start -- {{ port }}", "npm ci")
+    assert (svc.port, svc.subdomain, svc.health) == ("auto", "admin", "/ping")
+    assert svc.env["MODE"] == "dev" and svc.env["NAME"] == "a b"
+    assert loaded.shared.postgres is not None
+    assert loaded.shared.postgres.databases == ["notes", "audit"]
+    assert loaded.shared.kafka is not None and loaded.shared.redis is not None
+
+
+def test_add_service_with_a_numeric_port_and_a_compose_file(edit_file: Path) -> None:
+    args = ["add-service", "ui", "--repo", "notes-back", "--compose", "ui.yml", "--port", "9000"]
+    assert _edit(*args).exit_code == 0
+    assert load_project(edit_file, uses=["ui"]).config.services["ui"].port == 9000
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (["--env", "NOEQUALS"], "--env 'NOEQUALS': expected KEY=VALUE"),
+        (["--port", "http"], "--port 'http': expected a number or 'auto'"),
+        (["--consumes", "back"], "--consumes 'back': expected KEY:VALUE"),
+        (["--infra", "mongo:a"], "unknown provider 'mongo'"),
+        (["--infra", "redis:a"], "--infra 'redis:a': only postgres and kafka take a list"),
+        (["--setup", "s", "--compose", "c.yml"], "choose exactly one of --run or --compose"),
+    ],
+)
+def test_add_service_option_errors_are_one_line_errors(
+    edit_file: Path, extra: list[str], message: str
+) -> None:
+    result = _edit("add-service", "x", "--repo", "notes-back", "--run", "r", *extra)
+    assert isinstance(result.exception, WtError)
+    assert message in str(result.exception)
+    assert edit_file.read_text() == EDIT_CATALOG
+
+
+def test_add_service_json(edit_file: Path) -> None:
+    result = _edit("add-service", "jobs", "--repo", "notes-back", "--run", "./jobs", "--json")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "schema": 1,
+        "changed": True,
+        "action": "add-service",
+        "name": "jobs",
+    }
+
+
+def test_an_invalid_result_is_the_json_error_and_changes_nothing(edit_file: Path) -> None:
+    result = _edit(
+        "add-service", "x", "--repo", "notes-back", "--run", "r", "--subdomain", "x", "--json"
+    )
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert document["schema"] == 1 and "needs a 'port'" in document["error"]
+    assert edit_file.read_text() == EDIT_CATALOG
+
+
+def test_a_parse_error_is_also_the_json_error(edit_file: Path) -> None:
+    result = _edit(
+        "add-service", "x", "--repo", "notes-back", "--run", "r", "--port", "x", "--json"
+    )
+    assert result.exit_code == 1
+    assert "--port 'x'" in json.loads(result.stdout)["error"]
+
+
+def test_remove_commands_print_and_emit_json(edit_file: Path) -> None:
+    text = _edit("remove-service", "worker")
+    assert text.exit_code == 0 and "removed service worker" in text.output
+    document = _edit("remove-repo", "spare", "--json")
+    assert json.loads(document.stdout) == {
+        "schema": 1,
+        "changed": True,
+        "action": "remove-repo",
+        "name": "spare",
+    }
+    text_after = edit_file.read_text()
+    assert "worker" not in text_after and "spare: /srv/spare" not in text_after
+
+
+def test_remove_service_refusal_is_the_json_error(edit_file: Path) -> None:
+    result = _edit("remove-service", "back", "--json")
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "schema": 1,
+        "error": "service 'back' is consumed by 'front'",
+    }
+    assert edit_file.read_text() == EDIT_CATALOG
+
+
+def test_remove_repo_refusal_is_a_one_line_error(edit_file: Path) -> None:
+    result = _edit("remove-repo", "notes-front")
+    assert isinstance(result.exception, WtError)
+    assert str(result.exception) == "repo 'notes-front' is used by service 'front'"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["add-repo", "a", "/a"],
+        ["add-service", "a", "--repo", "r", "--run", "x"],
+        ["remove-service", "a"],
+        ["remove-repo", "a"],
+    ],
+)
+def test_edit_commands_need_a_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    missing = tmp_path / "nope.yaml"
+    monkeypatch.setenv("WT_CATALOG", str(missing))
+    result = _edit(*args)
+    assert isinstance(result.exception, WtError)
+    assert str(result.exception) == f"no catalog at {missing}. Run wt init"
+    json_result = _edit(*args, "--json")
+    assert json.loads(json_result.stdout) == {
+        "schema": 1,
+        "error": f"no catalog at {missing}. Run wt init",
+    }
+    assert json_result.exit_code == 1
+
+
+def test_the_edited_catalog_passes_catalog_check(edit_file: Path) -> None:
+    assert _edit("add-service", "jobs", "--repo", "notes-back", "--run", "./jobs").exit_code == 0
+    assert _edit("remove-service", "worker").exit_code == 0
+    check = runner.invoke(app, ["catalog", "--check"])
+    assert check.exit_code == 0, check.output

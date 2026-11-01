@@ -11,6 +11,7 @@ import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from wt.config import (
+    BUILTIN_INFRA,
     DOMAIN,
     MAX_SERVICES,
     NAME,
@@ -199,7 +200,8 @@ def _dummy_context(catalog: Catalog) -> dict[str, Any]:
         **reference,
         "services": {name: {**reference, "port": 10000} for name in catalog.services},
     }
-    context.update({provider: _Anything() for provider in Shared.model_fields})
+    plugins = {key for svc in catalog.services.values() for key in svc.infra.extra}
+    context.update({provider: _Anything() for provider in [*BUILTIN_INFRA, *sorted(plugins)]})
     return context
 
 
@@ -242,15 +244,21 @@ def worktrees_folder(catalog: Catalog, catalog_file: Path) -> Path | None:
     return folder if folder.is_absolute() else (catalog_file.parent / folder).resolve()
 
 
+def _infra_settings(infra: Shared, provider: str) -> dict[str, Any]:
+    """The keys the user set in one `infra` section, built in or not."""
+    if provider in infra.extra:
+        return infra.extra[provider]
+    conf = getattr(infra, provider)
+    return {key: getattr(conf, key) for key in sorted(conf.model_fields_set)}
+
+
 def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     owner: dict[tuple[str, str], str] = {}
     for name, svc in services.items():
         for provider in svc.infra.configured():
-            conf = getattr(svc.infra, provider)
             target = merged.setdefault(provider, {})
-            for key in conf.model_fields_set:
-                value = getattr(conf, key)
+            for key, value in _infra_settings(svc.infra, provider).items():
                 if isinstance(value, list):
                     target[key] = [
                         *target.get(key, []),
@@ -464,11 +472,20 @@ def _incoming_services(legacy: dict[str, Any], legacy_dir: Path) -> _Incoming:
     )
 
 
+def _service_as_written(svc: CatalogService) -> dict[str, Any]:
+    """The service as a catalog file spells it: plugin infra keys beside the built-in ones."""
+    data = svc.model_dump(exclude_unset=True)
+    infra = data.get("infra")
+    if infra and "extra" in infra:
+        data["infra"] = {**{k: v for k, v in infra.items() if k != "extra"}, **infra["extra"]}
+    return data
+
+
 def _incoming_uses(legacy: dict[str, Any], legacy_dir: Path) -> _Incoming:
     loaded = load_catalog(catalog_path(legacy.get("catalog"), legacy_dir))
     stack = expand_uses(loaded.catalog, _uses_list(legacy))
     services = {  # catalog order: the position is the service index
-        name: svc.model_dump(exclude_unset=True)
+        name: _service_as_written(svc)
         for name, svc in loaded.catalog.services.items()
         if name in stack
     }

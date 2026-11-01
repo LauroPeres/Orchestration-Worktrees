@@ -4,7 +4,6 @@ import json
 import os
 import re
 import secrets
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -15,13 +14,14 @@ from wt.config import Keycloak as KeycloakConfig
 from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
 from wt.providers import server
-from wt.providers.base import BranchContext, Check, Kind, Resources
+from wt.providers.base import BranchContext, Check, Kind, Resources, branch_scope, recorded_names
 from wt.state import atomic_write, file_lock
 
 DEFAULT_IMAGE = "quay.io/keycloak/keycloak:26.8.1"
 DEFAULT_PORT = 58080
 ADMIN = "admin"
 INTERNAL_PORT = 8080
+SCOPE_SEPARATOR = "."
 
 # One fixed script per kcadm call. It logs in with the container's own bootstrap admin
 # variables (the password never reaches the host argv) into a unique config file that a trap
@@ -166,18 +166,16 @@ def kcadm(*args: str, check: bool = True) -> proc.Result:
 
 
 def wait_ready(timeout: float = 120.0, total: float | None = None) -> None:
-    deadline = time.monotonic() + timeout
-    while True:
-        if kcadm("get", "realms/master", check=False).ok:
-            return
-        if time.monotonic() >= deadline:
-            raise WtError(
-                f"Keycloak did not accept the admin login in {(total or timeout):.0f}s "
-                f"({container()}). "
-                f"If {password_file()} was deleted while the volume {volume()} stayed, the "
-                "stored admin password no longer matches: restore the file or remove the volume."
-            )
-        time.sleep(1)
+    server.wait_until(
+        lambda: kcadm("get", "realms/master", check=False).ok,
+        timeout,
+        total,
+        lambda waited: (
+            f"Keycloak did not accept the admin login in {waited:.0f}s ({container()}). "
+            f"If {password_file()} was deleted while the volume {volume()} stayed, the "
+            "stored admin password no longer matches: restore the file or remove the volume."
+        ),
+    )
 
 
 def ensure_realm(realm: str) -> None:
@@ -190,8 +188,7 @@ def ensure_realm(realm: str) -> None:
 
 
 def ensure_server(realm: str | None = None, timeout: int = 120) -> None:
-    left = server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(left, total=timeout)
+    server.start(container(), server_dir(), compose_doc(), timeout, wait_ready)
     if realm is not None:
         ensure_realm(realm)
 
@@ -239,7 +236,7 @@ class KeycloakProvider:
 
     def client_id(self, ctx: BranchContext) -> str:
         """`feat/cart` in project `shop` with client `web` -> `web-shop.feat-cart`."""
-        return f"{self._cfg().client}-{ctx.names.project}.{ctx.names.slug}"
+        return f"{self._cfg().client}-{branch_scope(ctx, SCOPE_SEPARATOR)}"
 
     @staticmethod
     def redirect_uris(ctx: BranchContext) -> list[str]:
@@ -281,10 +278,7 @@ class KeycloakProvider:
         return Check(True, f"client {client_id!r} in realm {realm!r} is ready", warnings)
 
     def destroy(self, ctx: BranchContext) -> None:
-        wanted: list[str] = []
-        bs = ctx.state.load().branches.get(ctx.branch)
-        if bs is not None:
-            wanted.extend(bs.providers.get(self.name, []))
+        wanted = recorded_names(ctx, self.name)
         if self.cfg is not None:
             wanted.append(f"{self.cfg.realm}/{self.client_id(ctx)}")
         for entry in dict.fromkeys(wanted):

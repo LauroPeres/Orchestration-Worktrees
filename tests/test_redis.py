@@ -56,7 +56,7 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     monkeypatch.setattr(proc, "run", f)
     f.on("docker port", proc.Result(0, f"6379/tcp -> 127.0.0.1:{redis.host_port()}\n", ""))
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
-    monkeypatch.setattr("wt.providers.redis.time.sleep", lambda s: None)
+    monkeypatch.setattr("wt.providers.server.time.sleep", lambda s: None)
     return f
 
 
@@ -127,7 +127,7 @@ def test_ensure_server_starts_then_pings(fake: FakeProc) -> None:
 def test_wait_ready_times_out(fake: FakeProc, monkeypatch: pytest.MonkeyPatch) -> None:
     fake.on("redis-cli ping", proc.Result(1, "", "refused"))
     ticks = iter(range(0, 1000, 10))
-    monkeypatch.setattr("wt.providers.redis.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("wt.providers.server.time.monotonic", lambda: next(ticks))
     with pytest.raises(WtError, match="did not become ready"):
         redis.wait_ready(timeout=25)
 

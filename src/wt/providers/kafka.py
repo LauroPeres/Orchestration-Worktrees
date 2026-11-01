@@ -13,7 +13,15 @@ from wt.config import Kafka as KafkaConfig
 from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
 from wt.providers import server
-from wt.providers.base import BranchContext, Check, Kind, Resources, keeps_one_segment_prefix
+from wt.providers.base import (
+    BranchContext,
+    Check,
+    Kind,
+    Resources,
+    branch_scope,
+    keeps_one_segment_prefix,
+    recorded_names,
+)
 
 DEFAULT_IMAGE = "apache/kafka:3.9.1"
 DEFAULT_PORT = 59092
@@ -100,20 +108,16 @@ def tool(script: str, *args: str, check: bool = True) -> proc.Result:
 
 
 def wait_ready(timeout: float = 90.0, total: float | None = None) -> None:
-    deadline = time.monotonic() + timeout
-    while True:
-        if tool("kafka-broker-api-versions.sh", check=False).ok:
-            return
-        if time.monotonic() >= deadline:
-            raise WtError(
-                f"Kafka did not become ready in {(total or timeout):.0f}s ({container()})"
-            )
-        time.sleep(1)
+    server.wait_until(
+        lambda: tool("kafka-broker-api-versions.sh", check=False).ok,
+        timeout,
+        total,
+        lambda waited: f"Kafka did not become ready in {waited:.0f}s ({container()})",
+    )
 
 
 def ensure_server(timeout: int = 90) -> None:
-    left = server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(left, total=timeout)
+    server.start(container(), server_dir(), compose_doc(), timeout, wait_ready)
 
 
 def _checked(name: str) -> str:
@@ -141,12 +145,12 @@ class KafkaProvider:
 
     def prefix(self, ctx: BranchContext) -> str:
         """`feat/cart` in project `shop` -> `shop.feat-cart.`; empty without `topic_prefix`."""
-        return f"{self.scope(ctx)}." if self.topic_prefix else ""
+        return f"{self.scope(ctx)}{SEPARATOR}" if self.topic_prefix else ""
 
     @staticmethod
     def scope(ctx: BranchContext) -> str:
         """`<project>.<slug>`: neither part can hold a `.`, so two projects never collide."""
-        return f"{ctx.names.project}.{ctx.names.slug}"
+        return branch_scope(ctx, SEPARATOR)
 
     def group(self, name: str, ctx: BranchContext) -> str:
         if name not in self.groups:
@@ -192,10 +196,8 @@ class KafkaProvider:
     def destroy(self, ctx: BranchContext) -> None:
         groups = [self.group(g, ctx) for g in self.groups]
         prefixes = [self.prefix(ctx)] if self.prefix(ctx) else []
-        bs = ctx.state.load().branches.get(ctx.branch)
-        if bs is not None:
-            for recorded in bs.providers.get(self.name, []):
-                (prefixes if recorded.endswith(".") else groups).append(recorded)
+        for recorded in recorded_names(ctx, self.name):
+            (prefixes if recorded.endswith(SEPARATOR) else groups).append(recorded)
         for group in dict.fromkeys(groups):
             if NAME.fullmatch(group):
                 self._delete_group(group)

@@ -15,7 +15,7 @@ from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
-from wt import __version__, doctor
+from wt import __version__, catalog_edit, doctor
 from wt.catalog import (
     LEGACY_NAME,
     Catalog,
@@ -116,7 +116,7 @@ services:
     health: /                    # path probed after `up`
     env:
       PUBLIC_URL: "{{{{ url }}}}"
-# --- examples: uncomment to try (a host process that needs `app` and a shared Postgres) ---
+{infra}# --- examples: uncomment to try (a host process that needs `app` and a shared Postgres) ---
 #   web:
 #     repo: app
 #     run: npm run dev -- --host 0.0.0.0 --port {{{{ port }}}}  # 0.0.0.0 so Traefik reaches it
@@ -133,6 +133,32 @@ services:
 #         verify: true            # compare row counts after clone
 #         base_branch: main
 """
+# One block per provider, indented for the sample service; `{project}` is the project name.
+INFRA_STARTER = {
+    "postgres": (
+        "      postgres:\n"
+        "        databases: [app]\n"
+        "        strategy: template      # template | dump-restore\n"
+        "        verify: true            # compare row counts after clone\n"
+        "        base_branch: main\n"
+    ),
+    "redis": "      redis: {{}}\n",
+    "kafka": "      kafka:\n        groups: [app]\n        topic_prefix: true\n",
+    "keycloak": "      keycloak:\n        realm: {project}\n        client: app\n",
+}
+INFRA_HEADER = "    infra:                      # shared servers this service needs\n"
+
+
+def _starter_infra(providers: list[str], project: str) -> str:
+    """The `infra:` block of the sample service for `providers` (empty when there are none)."""
+    if not providers:
+        return ""
+    # an installed plugin has no default section: enable it with an empty mapping
+    blocks = [
+        INFRA_STARTER.get(name, f"      {name}: {{{{}}}}\n").format(project=project)
+        for name in providers
+    ]
+    return INFRA_HEADER + "".join(blocks)
 
 
 def _catalog_file(ctx: typer.Context) -> Path:
@@ -339,16 +365,26 @@ def init(
         str | None, typer.Option(help="Project name (default: folder name).")
     ] = None,
     force: Annotated[bool, typer.Option("--force", help="Overwrite an existing catalog.")] = False,
+    with_providers: Annotated[
+        str | None,
+        typer.Option(
+            "--with", help="Infra for the sample service, comma separated: postgres,redis."
+        ),
+    ] = None,
 ) -> None:
     """Write a starter catalog (one project, this folder as its repo, one compose service)."""
     target = _catalog_file(ctx)
     if target.exists() and not force:
         raise WtError(f"catalog already exists at {target}")
+    providers = catalog_edit.split_names(with_providers)
+    catalog_edit.check_providers(providers)
     name = project or slugify(Path.cwd().name)
     if not name[0].isalpha():
         name = f"app-{name}"
     # a JSON string is a valid YAML scalar: a path with `:` or `#` cannot break the file
-    atomic_write(target, STARTER.format(project=name, repo=json.dumps(str(Path.cwd()))))
+    repo = json.dumps(str(Path.cwd()))
+    infra = _starter_infra(providers, name)
+    atomic_write(target, STARTER.format(project=name, repo=repo, infra=infra))
     console.print(
         f"wrote {escape(str(target))}\n"
         "edit it, then run [bold]wt doctor[/] and [bold]wt add <branch> --uses app[/]"
@@ -812,7 +848,7 @@ def _check_catalog(path: Path) -> None:
         console.print(f"[red]catalog invalid:[/] {escape(str(exc))}")
         raise typer.Exit(1) from None
     failures = [
-        _service_failures(loaded.path, list(loaded.catalog.services)),
+        catalog_edit.service_failures(loaded.path, list(loaded.catalog.services)),
         render_check(loaded),
     ]
     for problems in failures:
@@ -823,17 +859,6 @@ def _check_catalog(path: Path) -> None:
     if any(failures):
         raise typer.Exit(1)
     console.print(f"[green]catalog ok:[/] {escape(str(loaded.path))}")
-
-
-def _service_failures(catalog_file: Path, names: list[str]) -> dict[str, str]:
-    """Why each service fails to resolve on its own (services that resolve are left out)."""
-    failures: dict[str, str] = {}
-    for name in names:
-        try:
-            load_project(catalog_file, uses=[name])
-        except WtError as exc:
-            failures[name] = str(exc)
-    return failures
 
 
 def _print_catalog(cat: Catalog) -> None:
@@ -853,13 +878,24 @@ def _print_catalog(cat: Catalog) -> None:
     console.print(table)
 
 
-@app.command()
+catalog_app = typer.Typer(
+    help="Show the catalog, validate it, or edit it (add-repo, add-service, ...).",
+    invoke_without_command=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(catalog_app, name="catalog")
+
+
+@catalog_app.callback()
 def catalog(
     ctx: typer.Context,
     check: Annotated[bool, typer.Option("--check", help="Validate the catalog and exit.")] = False,
     json_output: JsonOption = False,
 ) -> None:
-    """Show the catalog (services, repos, infra, who consumes whom)."""
+    """Show the catalog (services, repos, infra, who consumes whom), or edit it."""
+    if ctx.invoked_subcommand is not None:
+        return
     with _json_errors(json_output):
         path = _catalog_file(ctx)
         if check and json_output:
@@ -872,6 +908,111 @@ def catalog(
             _emit(catalog_document(cat))
         else:
             _print_catalog(cat)
+
+
+# ---- wt catalog add-repo | add-service | remove-service | remove-repo (SPEC section 23) -------
+# The file is edited as a ruamel round-trip document (comments, order and quoting stay), checked
+# like `wt catalog --check` checks it, and only then written.
+
+DONE = {
+    "add-repo": "added repo",
+    "add-service": "added service",
+    "remove-service": "removed service",
+    "remove-repo": "removed repo",
+}
+
+
+def _print_edit(result: catalog_edit.EditResult, *, as_json: bool) -> None:
+    if as_json:
+        _emit(
+            {"schema": JSON_SCHEMA, "changed": True, "action": result.action, "name": result.name}
+        )
+    else:
+        console.print(f"[green]{DONE[result.action]} {escape(result.name)}[/]")
+
+
+def _edit_target(ctx: typer.Context, catalog: Path | None) -> Path:
+    return catalog or _catalog_file(ctx)
+
+
+@catalog_app.command("add-repo")
+def add_repo(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Repo name used by services.")],
+    path: Annotated[Path, typer.Argument(help="Folder of the git repo (relative: from here).")],
+    catalog: CatalogOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Add a repo to the catalog."""
+    with _json_errors(json_output):
+        result = catalog_edit.add_repo(_edit_target(ctx, catalog), name, path)
+        _print_edit(result, as_json=json_output)
+
+
+@catalog_app.command("add-service")
+def add_service(  # noqa: PLR0913  (one parameter per option; typer needs them as parameters)
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Service name.")],
+    repo: Annotated[str, typer.Option(help="Repo of the service (must be in the catalog).")],
+    run: Annotated[str | None, typer.Option(help="Command of a host process.")] = None,
+    compose: Annotated[str | None, typer.Option(help="Compose file, relative to the repo.")] = None,
+    port: Annotated[str | None, typer.Option(help="Port number, or 'auto' (run only).")] = None,
+    subdomain: Annotated[str | None, typer.Option(help='Route: "" is the branch root.')] = None,
+    health: Annotated[str | None, typer.Option(help="Health check path, e.g. /health.")] = None,
+    env: Annotated[list[str] | None, typer.Option(help="Env var KEY=VALUE (repeatable).")] = None,
+    consumes: Annotated[
+        list[str] | None, typer.Option(help="Service whose URL it needs, DEP:VAR (repeatable).")
+    ] = None,
+    infra: Annotated[
+        list[str] | None,
+        typer.Option(help="Shared server: provider or provider:db1,db2 (repeatable)."),
+    ] = None,
+    setup: Annotated[str | None, typer.Option(help="Command run before --run starts.")] = None,
+    catalog: CatalogOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Add a service to the catalog."""
+    with _json_errors(json_output):
+        spec = catalog_edit.ServiceSpec(
+            name=name,
+            repo=repo,
+            run=run,
+            compose=compose,
+            setup=setup,
+            port=catalog_edit.parse_port(port),
+            subdomain=subdomain,
+            health=health,
+            env=catalog_edit.parse_pairs(env or [], "--env", "="),
+            consumes=catalog_edit.parse_pairs(consumes or [], "--consumes", ":"),
+            infra=catalog_edit.parse_infra(infra or []),
+        )
+        _print_edit(catalog_edit.add_service(_edit_target(ctx, catalog), spec), as_json=json_output)
+
+
+@catalog_app.command("remove-service")
+def remove_service(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Service name.")],
+    catalog: CatalogOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Remove a service from the catalog (refused while another service consumes it)."""
+    with _json_errors(json_output):
+        result = catalog_edit.remove_service(_edit_target(ctx, catalog), name)
+        _print_edit(result, as_json=json_output)
+
+
+@catalog_app.command("remove-repo")
+def remove_repo(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Repo name.")],
+    catalog: CatalogOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Remove a repo from the catalog (refused while a service uses it)."""
+    with _json_errors(json_output):
+        result = catalog_edit.remove_repo(_edit_target(ctx, catalog), name)
+        _print_edit(result, as_json=json_output)
 
 
 def _read_catalog_mapping(path: Path) -> dict[str, Any] | None:

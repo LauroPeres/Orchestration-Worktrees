@@ -149,30 +149,28 @@ def _rows(result: proc.Result) -> list[str]:
 
 
 def wait_ready(timeout: float = 60.0, total: float | None = None) -> None:
-    deadline = time.monotonic() + timeout
-    while True:
-        ready = proc.run(
-            [
-                "docker",
-                "exec",
-                container(),
-                "pg_isready",
-                "-h",
-                "127.0.0.1",
-                "-U",
-                USER,
-                "-d",
-                "postgres",
-            ],
-            check=False,
-        )
-        if ready.ok:
-            return
-        if time.monotonic() >= deadline:
-            raise WtError(
-                f"Postgres did not become ready in {(total or timeout):.0f}s ({container()})"
-            )
-        time.sleep(1)
+    server.wait_until(
+        lambda: (
+            proc.run(
+                [
+                    "docker",
+                    "exec",
+                    container(),
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    USER,
+                    "-d",
+                    "postgres",
+                ],
+                check=False,
+            ).ok
+        ),
+        timeout,
+        total,
+        lambda waited: f"Postgres did not become ready in {waited:.0f}s ({container()})",
+    )
 
 
 def _like(database: str) -> str:
@@ -202,8 +200,7 @@ def repair_connections(databases: list[str]) -> None:
 
 
 def ensure_server(databases: list[str], timeout: int = 60) -> None:
-    left = server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(left, total=timeout)
+    server.start(container(), server_dir(), compose_doc(), timeout, wait_ready)
     repair_connections(databases)
 
 

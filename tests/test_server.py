@@ -176,3 +176,49 @@ def test_expected_ports_reads_every_form_of_a_ports_entry(
 def test_expected_ports_derives_the_container_name_the_way_compose_does() -> None:
     doc = {"services": {"db": {"ports": ["55432:5432"]}, "other": {"image": "x"}}}
     assert server.expected_ports("t", doc) == {"t-db-1": {55432}}
+
+
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Time moves only when the code sleeps; the list holds every sleep."""
+    now = [0.0]
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+        slept.append(seconds)
+
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", sleep)
+    return slept
+
+
+def test_wait_until_returns_as_soon_as_the_probe_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    slept = fake_clock(monkeypatch)
+    answers = iter([False, False, True])
+    server.wait_until(lambda: next(answers), 10, None, lambda waited: "late")
+    assert slept == [1, 1]
+
+
+def test_wait_until_names_the_total_deadline_not_the_leftover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clock(monkeypatch)
+    with pytest.raises(WtError, match=r"gave up after 60s"):
+        server.wait_until(lambda: False, 5, 60, lambda waited: f"gave up after {waited:.0f}s")
+
+
+def test_wait_until_names_its_own_timeout_when_there_is_no_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clock(monkeypatch)
+    with pytest.raises(WtError, match=r"gave up after 5s"):
+        server.wait_until(lambda: False, 5, None, lambda waited: f"gave up after {waited:.0f}s")
+
+
+def test_start_gives_the_readiness_wait_what_the_up_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "up", lambda name, folder, doc, timeout: 7.0)
+    seen: list[tuple[float, float]] = []
+    server.start("t-redis", tmp_path, {}, 30, lambda left, total: seen.append((left, total)))
+    assert seen == [(7.0, 30)]

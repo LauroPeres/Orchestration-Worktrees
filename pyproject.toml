@@ -14,6 +14,7 @@ dependencies = [
     "jinja2>=3.1",
     "rich>=13.0",
     "textual>=0.80",
+    "ruamel-yaml>=0.18",
 ]
 
 [project.scripts]
@@ -82,7 +83,7 @@ root_package = "wt"
 name = "Layers: interface -> core -> providers -> runtime -> model"
 type = "layers"
 layers = [
-    "wt.cli : wt.tui : wt.__main__",
+    "wt.cli : wt.tui : wt.catalog_edit : wt.__main__",
     "wt.orchestrator : wt.doctor",
     "wt.providers",
     "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects",

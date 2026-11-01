@@ -6,7 +6,7 @@ import pytest
 
 from tests.conftest import SHOP_CATALOG, write_global_catalog
 from wt import compose, doctor, host, proc, router
-from wt.config import LoadedConfig
+from wt.config import LoadedConfig, Shared
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
@@ -604,6 +604,53 @@ def test_catalog_run_checks_merges_postgres_databases(
     )
     doctor.run_checks(write_global_catalog(tmp_path, catalog), None, fix=False)
     assert called == ["postgres:shop,web"]
+
+
+def test_catalog_run_checks_skips_built_in_checks_for_plugin_keys(
+    monkeypatch: pytest.MonkeyPatch, make_repo, tmp_path
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": "services: {}\n"})
+    called = _stub_run_checks_environment(monkeypatch)
+    catalog = _infra_catalog(
+        {"back": {"postgres": {"databases": ["shop"]}, "echo": {}}, "front": {"echo": {}}}
+    )
+    loaded = write_global_catalog(tmp_path, catalog)
+    checks = doctor.run_checks(loaded, None, fix=False)
+    assert called == ["postgres:shop"]
+    assert [c.name for c in checks if c.level == "fail"] == []
+
+
+def test_union_shared_keeps_the_first_section_of_each_plugin_key() -> None:
+    first = Shared.model_validate({"echo": {"prefix": "a"}, "redis": {}})
+    second = Shared.model_validate({"echo": {"prefix": "b"}, "other": {}})
+    merged = doctor._union_shared([first, second])
+    assert merged.extra == {"echo": {"prefix": "a"}, "other": {}}
+    assert merged.redis is not None
+
+
+def test_run_checks_fails_once_per_plugin_that_cannot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_run_checks_environment(monkeypatch)
+    monkeypatch.setattr(
+        doctor,
+        "plugin_problems",
+        lambda: {"zeta": "provider plugin 'zeta' failed to load: boom", "echo": "it is built in"},
+    )
+    checks = doctor.run_checks(None, None, fix=False)
+    plugin_checks = [c for c in checks if c.name.startswith("plugin ")]
+    assert [(c.name, c.level, c.detail) for c in plugin_checks] == [
+        ("plugin echo", "fail", "it is built in"),
+        ("plugin zeta", "fail", "provider plugin 'zeta' failed to load: boom"),
+    ]
+
+
+def test_run_checks_has_no_plugin_check_when_every_plugin_loads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_run_checks_environment(monkeypatch)
+    monkeypatch.setattr(doctor, "plugin_problems", lambda: {})
+    assert not [c for c in doctor.run_checks(None, None, fix=False) if "plugin" in c.name]
 
 
 def test_catalog_run_checks_reports_an_unreadable_catalog(

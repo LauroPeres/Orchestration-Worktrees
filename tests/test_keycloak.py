@@ -61,7 +61,7 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeProc:
     monkeypatch.setattr(proc, "run", f)
     f.on("docker port", proc.Result(0, f"8080/tcp -> 127.0.0.1:{keycloak.host_port()}\n", ""))
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
-    monkeypatch.setattr("wt.providers.keycloak.time.sleep", lambda s: None)
+    monkeypatch.setattr("wt.providers.server.time.sleep", lambda s: None)
     return f
 
 
@@ -238,7 +238,7 @@ def test_ensure_server_without_the_section_still_fails_when_the_login_is_refused
 ) -> None:
     fake.on("get realms/master", LOGIN_REFUSED)
     ticks = iter(range(0, 1000, 100))
-    monkeypatch.setattr("wt.providers.keycloak.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("wt.providers.server.time.monotonic", lambda: next(ticks))
     with pytest.raises(WtError, match="did not accept the admin login"):
         provider(with_keycloak=False).ensure_server()
 
@@ -271,7 +271,7 @@ def test_wait_ready_times_out_naming_password_file_and_volume(
 ) -> None:
     fake.on("get realms/master", proc.Result(1, "", "Invalid user credentials"))
     ticks = iter(range(0, 1000, 10))
-    monkeypatch.setattr("wt.providers.keycloak.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("wt.providers.server.time.monotonic", lambda: next(ticks))
     with pytest.raises(WtError) as err:
         keycloak.wait_ready(timeout=25)
     assert str(keycloak.password_file()) in str(err.value)
