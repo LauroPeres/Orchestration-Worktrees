@@ -188,7 +188,16 @@ class Orchestrator:
         return Names(self.cfg.project, branch, self.cfg.domain)
 
     def worktree_target(self, names: Names, repo: str) -> Path:
-        return project_dir(self.cfg.project) / "worktrees" / names.slug / repo
+        """Where the worktree of `repo` lives: the recorded path wins, so a branch never moves."""
+        bs = self.store.load().branches.get(names.branch)
+        if bs is not None and repo in bs.repos:
+            return Path(bs.repos[repo].path)
+        return self._slug_dir(names) / repo
+
+    def _slug_dir(self, names: Names) -> Path:
+        """The folder that groups the worktrees of one branch (§21 "Worktree location")."""
+        root = self.loaded.worktrees_dir or project_dir(self.cfg.project) / "worktrees"
+        return root / names.slug
 
     def branch_dir(self, names: Names) -> Path:
         return project_dir(self.cfg.project) / "branches" / names.slug
@@ -319,6 +328,7 @@ class Orchestrator:
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
         self._log_warnings()
         with self._branch_lock(names):
+            self._check_worktree_targets(names)
             self._check_hosts_free(names)
             envs, commands, ports = self._reserve(branch, names)
 
@@ -384,6 +394,25 @@ class Orchestrator:
             except Exception:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
+
+    def _check_worktree_targets(self, names: Names) -> None:
+        """Fail `up` and `add` before anything is created when a target folder is not ours.
+
+        A folder that already holds something other than a worktree of the repo (a file, or a
+        non-empty folder) is never touched. A branch that has its worktree recorded is exempt.
+        """
+        recorded = self.store.load().branches.get(names.branch)
+        for repo in self.cfg.repos:
+            if recorded is not None and repo in recorded.repos:
+                continue
+            target = self.worktree_target(names, repo)
+            if _holds_foreign_content(target) and not _is_worktree_of(
+                self.loaded.repo_path(repo), target
+            ):
+                raise WtError(
+                    f"{target} already exists and was not created by wt; move it, or choose "
+                    "another name or worktrees folder"
+                )
 
     def _check_hosts_free(self, names: Names) -> None:
         """Fail `up` before anything is created when another route file already routes a host.
@@ -457,6 +486,7 @@ class Orchestrator:
             if branch in self.store.load().branches:
                 self.log(f"branch {branch} is already known; nothing to add")
                 return False
+            self._check_worktree_targets(names)
             self._reserve(branch, names)
             try:
                 self._up_worktrees(branch, names)
@@ -953,9 +983,8 @@ class Orchestrator:
         for source, path in removals:
             self.log(f"removing worktree {path}")
             git.remove_worktree(source, path, force=force)
-        slug_dir = self.worktree_target(names, "x").parent
-        if slug_dir.is_dir() and not any(slug_dir.iterdir()):
-            slug_dir.rmdir()
+        for slug_dir in {self._slug_dir(names), *(path.parent for _, path in removals)}:
+            _remove_if_empty(slug_dir)
 
         with ports_lock():
             with self.store.edit() as state:
@@ -1276,6 +1305,17 @@ def _is_worktree_of(repo: Path, path: Path) -> bool:
     except WtError:
         return False
     return any(tree.path.resolve() == path.resolve() for tree in trees)
+
+
+def _holds_foreign_content(path: Path) -> bool:
+    """True when `path` is a file or a folder with something in it (an empty folder is fine)."""
+    return path.exists() and (not path.is_dir() or any(path.iterdir()))
+
+
+def _remove_if_empty(folder: Path) -> None:
+    """Never `rmtree`: a folder that holds anything is somebody's and stays."""
+    if folder.is_dir() and not any(folder.iterdir()):
+        folder.rmdir()
 
 
 def _env_hash(env: dict[str, str]) -> str:

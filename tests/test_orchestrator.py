@@ -3199,3 +3199,191 @@ def test_log_command_uses_the_selection_stored_for_the_branch(
     assert args[-1] == "api"  # front's compose service
     with pytest.raises(WtError, match="unknown service 'nope'"):
         global_orch.log_command("feat/x", "nope", follow=False, tail=9)
+
+
+# --- global catalog: where the worktrees live (§21 "Worktree location") ---
+def _trees_orch(make_repo, tmp_path: Path, trees: Path | None) -> Orchestrator:
+    """Two repos (api, web), one service each, and the catalog's `worktrees` key set to `trees`."""
+    for name in ("shop-api", "shop-web"):
+        if not (tmp_path / name).exists():
+            make_repo(name, {"docker-compose.yml": COMPOSE})
+    catalog: dict[str, object] = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"api": "./shop-api", "web": "./shop-web"},
+        "services": {
+            "back": {
+                "repo": "api",
+                "compose": "docker-compose.yml",
+                "compose_service": "db",
+                "port": 5432,
+                "subdomain": "back",
+            },
+            "web": {
+                "repo": "web",
+                "compose": "docker-compose.yml",
+                "compose_service": "api",
+                "port": 8000,
+                "subdomain": "web",
+            },
+        },
+        **({"worktrees": str(trees)} if trees is not None else {}),
+    }
+    return Orchestrator(write_global_catalog(tmp_path, catalog), log=lambda m: None)
+
+
+BOTH_REPOS = ["back", "web"]
+FOREIGN_MESSAGE = (
+    "{target} already exists and was not created by wt; move it, or choose another name "
+    "or worktrees folder"
+)
+
+
+def test_worktrees_land_under_the_configured_folder_grouped_by_slug(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    repos = o.store.load().branches["feat/x"].repos
+    assert Path(repos["api"].path) == trees / "feat-x" / "api"
+    assert Path(repos["web"].path) == trees / "feat-x" / "web"
+    assert (trees / "feat-x" / "api" / "docker-compose.yml").is_file()
+    assert (trees / "feat-x" / "web" / "docker-compose.yml").is_file()
+    assert not (isolated_home / "shop" / "worktrees").exists()
+
+
+def test_without_the_worktrees_key_the_default_folder_is_used(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    o.add("feat/x", uses=BOTH_REPOS)
+    repos = o.store.load().branches["feat/x"].repos
+    assert Path(repos["web"].path) == isolated_home / "shop" / "worktrees" / "feat-x" / "web"
+
+
+def test_the_recorded_path_wins_after_the_worktrees_key_changes(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    old, new = tmp_path / "old-trees", tmp_path / "new-trees"
+    _trees_orch(make_repo, tmp_path, old).add("feat/x", uses=BOTH_REPOS)
+    o = _trees_orch(make_repo, tmp_path, new)  # same catalog file, another folder
+    names = o.names("feat/x")
+    assert o.worktree_target(names, "api") == old / "feat-x" / "api"
+    o.up("feat/x")
+    assert o.store.load().branches["feat/x"].status == "up"
+    assert not new.exists()  # nothing moved, nothing created at the new place
+    assert o.down("feat/x") is True
+    assert not (old / "feat-x").exists()
+    assert not new.exists()
+
+
+def test_a_new_branch_uses_the_new_folder_while_an_old_one_stays(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    old, new = tmp_path / "old-trees", tmp_path / "new-trees"
+    _trees_orch(make_repo, tmp_path, old).add("feat/x", uses=BOTH_REPOS)
+    o = _trees_orch(make_repo, tmp_path, new)
+    o.add("feat/y", uses=BOTH_REPOS)
+    assert (new / "feat-y" / "api").is_dir()
+    assert (old / "feat-x" / "api").is_dir()
+    assert not (new / "feat-x").exists()
+
+
+@pytest.mark.parametrize("action", ["add", "up"])
+def test_a_foreign_folder_is_refused_before_anything_is_created(
+    make_repo, tmp_path: Path, docker: FakeDocker, action: str
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    foreign = trees / "feat-x" / "web"  # the second repo: the first must not be created either
+    foreign.mkdir(parents=True)
+    (foreign / "notes.txt").write_text("mine")
+    with pytest.raises(WtError) as err:
+        getattr(o, action)("feat/x", uses=BOTH_REPOS)
+    assert str(err.value) == FOREIGN_MESSAGE.format(target=foreign)
+    assert o.store.load().branches == {}
+    assert not (trees / "feat-x" / "api").exists()
+    assert (foreign / "notes.txt").read_text() == "mine"
+    assert docker.ups == []
+    o.add("feat/y", uses=BOTH_REPOS)  # the refusal reserved no worktree index
+    assert o.store.load().branches["feat/y"].index == 0
+
+
+def test_a_plain_file_at_the_target_is_refused(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    (trees / "feat-x").mkdir(parents=True)
+    (trees / "feat-x" / "api").write_text("a file")
+    with pytest.raises(WtError, match="already exists and was not created by wt"):
+        o.add("feat/x", uses=BOTH_REPOS)
+    assert o.store.load().branches == {}
+
+
+def test_a_folder_that_is_a_worktree_of_another_repo_is_refused(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    (trees / "feat-x").mkdir(parents=True)
+    git_run(tmp_path / "shop-web", "worktree", "add", "-b", "other", str(trees / "feat-x" / "api"))
+    with pytest.raises(WtError, match="already exists and was not created by wt"):
+        o.add("feat/x", uses=BOTH_REPOS)
+    assert o.store.load().branches == {}
+
+
+def test_an_empty_folder_at_the_target_is_used(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    (trees / "feat-x" / "api").mkdir(parents=True)  # e.g. made by hand, holds nothing
+    assert o.add("feat/x", uses=BOTH_REPOS) is True
+    assert (trees / "feat-x" / "api" / "docker-compose.yml").is_file()
+
+
+def test_a_worktree_wt_made_is_not_foreign_when_the_state_was_lost(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    o.store.path.unlink()  # the worktrees are still there and still git's
+    assert o.add("feat/x", uses=BOTH_REPOS) is True
+    assert o.store.load().branches["feat/x"].repos["api"].path == str(trees / "feat-x" / "api")
+
+
+def test_a_branch_that_is_already_known_is_not_refused_by_its_own_worktrees(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")
+    o.up("feat/x", uses=BOTH_REPOS)
+    o.up("feat/x")  # the folders exist and are recorded: not "foreign"
+    assert o.store.load().branches["feat/x"].status == "up"
+
+
+def test_down_removes_the_slug_folder_when_it_is_empty(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    assert o.down("feat/x") is True
+    assert not (trees / "feat-x").exists()
+    assert trees.is_dir()  # the configured folder itself is the user's
+
+
+def test_down_keeps_a_slug_folder_that_holds_something_else(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    (trees / "feat-x" / "notes.txt").write_text("mine")
+    assert o.down("feat/x") is True
+    assert not (trees / "feat-x" / "api").exists()
+    assert not (trees / "feat-x" / "web").exists()
+    assert (trees / "feat-x" / "notes.txt").read_text() == "mine"
+    assert o.down("feat/x") is False  # idempotent
