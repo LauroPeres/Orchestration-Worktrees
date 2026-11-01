@@ -103,7 +103,7 @@ def _kind(svc: Service) -> Literal["compose", "run"]:
 class ComposeGroup:
     repo: str
     file: str  # compose file, relative to the repo root
-    services: list[str]  # worktree.yaml service names in this group
+    services: list[str]  # catalog service names in this group
 
 
 @dataclass(frozen=True)
@@ -149,18 +149,18 @@ class Orchestrator:
         """This orchestrator, or one built on the branch's selection (§17 D-a, §21).
 
         The stored selection always wins. `uses` (an explicit choice when creating) only counts
-        for a catalog project whose branch has none yet; worktree.yaml projects ignore it.
+        for a branch that has none yet.
         """
         bs = self.store.load().branches.get(branch)
         stored = None if bs is None else bs.uses
         if stored is not None:
-            if uses is not None and self.loaded.from_catalog:
+            if uses is not None:
                 self.log(
                     f"branch {branch} already has services {','.join(stored)}; "
                     "keeping them (use configure to change)"
                 )
             return self._with_selection(stored)
-        if uses is not None and self.loaded.from_catalog:
+        if uses is not None:
             return self._with_selection(uses)
         return self
 
@@ -170,16 +170,15 @@ class Orchestrator:
         return Orchestrator(self.loaded.with_uses(uses), self.log, self.out)
 
     def _for_creating(self, branch: str, uses: list[str] | None) -> "Orchestrator":
-        """`_for` for `up` and `add`: a catalog branch must come with a selection (§21)."""
-        if self.loaded.from_catalog:
-            bs = self.store.load().branches.get(branch)
-            if bs is None or bs.uses is None:
-                if uses is None:
-                    raise WtError(
-                        f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
-                    )
-                if not uses:
-                    raise WtError("choose at least one service (wt add <b> --uses a,b)")
+        """`_for` for `up` and `add`: a branch must come with a selection (§21)."""
+        bs = self.store.load().branches.get(branch)
+        if bs is None or bs.uses is None:
+            if uses is None:
+                raise WtError(
+                    f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
+                )
+            if not uses:
+                raise WtError("choose at least one service (wt add <b> --uses a,b)")
         return self._for(branch, uses)
 
     # ---- naming helpers -------------------------------------------------------------------
@@ -305,7 +304,7 @@ class Orchestrator:
             bs.updated_at = now()
 
     def _log_warnings(self) -> None:
-        """The notes `load_config` produced, e.g. a `remote:` the stack makes irrelevant."""
+        """The notes `load_project` produced, e.g. a `remote:` the stack makes irrelevant."""
         for warning in self.loaded.warnings:
             self.log(f"warning: {warning}")
 
@@ -459,10 +458,10 @@ class Orchestrator:
                     current = state.branches.setdefault(
                         branch, BranchState(branch=branch, slug=names.slug)
                     )
-                    if self.loaded.from_catalog and current.uses is None:
+                    if current.uses is None:
                         # The explicit choice, not the closure: later operations rebuild the
                         # same stack from it through `_for` (like `configure`).
-                        current.uses = list(self.loaded.uses or ())
+                        current.uses = list(self.loaded.uses)
                     current.status = "creating"
                     current.index = index
                     current.ports = dict(ports)
@@ -1191,14 +1190,12 @@ class Orchestrator:
             return "unhealthy"
         return "healthy"
 
-    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
+    def catalog_choices(self, branch: str | None = None) -> list[Choice]:
         """Every catalog service with its repo and its place in the branch's stack (§20).
 
         Without a branch (one that is about to be created) nothing is selected and `required_by`
         lists each service's direct consumers in the whole catalog.
         """
-        if self.loaded.uses is None or self.loaded.catalog is None:
-            return None
         if branch is None:
             catalog = load_catalog(self.loaded.catalog).catalog
             return [
@@ -1210,7 +1207,7 @@ class Orchestrator:
         mine = self._for(branch).loaded
         catalog = load_catalog(self.loaded.catalog).catalog
         stack = list(mine.config.services)
-        explicit = set(mine.uses or ())
+        explicit = set(mine.uses)
 
         def required_by(name: str) -> tuple[str, ...]:
             if name in explicit or name not in stack:

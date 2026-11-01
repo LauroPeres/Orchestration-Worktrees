@@ -411,9 +411,7 @@ def _union_shared(shared_list: list[Shared]) -> Shared:
 
 
 def _checked_infra(loaded: LoadedConfig) -> Shared:
-    """The infra to check: a catalog project's anchor holds one service's, so take all of them."""
-    if not loaded.from_catalog:
-        return loaded.config.shared
+    """The infra to check: the anchor holds one service's, so take every catalog service's."""
     services = load_catalog(loaded.path).catalog.services.values()
     return _union_shared([svc.infra for svc in services])
 
@@ -452,5 +450,5 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
             checks += _check_shared(loaded, fix)
         checks += check_ports(loaded.config.project)
     else:
-        checks.append(Check("config", "info", "no worktree.yaml here", "run `wt init`"))
+        checks.append(Check("config", "info", "no catalog loaded", "run `wt init`"))
     return checks

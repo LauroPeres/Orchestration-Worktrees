@@ -65,7 +65,7 @@ class OrchestratorLike(Protocol):
 
     def services(self, branch: str) -> list[RepoRow]: ...
 
-    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None: ...
+    def catalog_choices(self, branch: str | None = None) -> list[Choice]: ...
 
     def configure(self, branch: str, uses: list[str]) -> None: ...
 
@@ -95,7 +95,6 @@ class Row:
 
 SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
 CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
-NEEDS_CATALOG = "no catalog for this project. Run wt init or wt migrate"
 NOTHING_CHECKED = "check at least one service"
 NO_CATALOG = "no catalog at {path}. Run wt init or wt migrate"
 ENTER_NAME = "Enter name"
@@ -189,9 +188,6 @@ class ServicesScreen(Screen[None]):
             choices = self._orch().catalog_choices(self.branch)
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.say(error_text(exc))
-            return
-        if choices is None:
-            self.say(NEEDS_CATALOG)
             return
         branch = self.branch
 

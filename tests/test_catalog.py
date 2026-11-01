@@ -14,7 +14,6 @@ from wt.catalog import (
     merge_legacy,
     read_legacy,
 )
-from wt.config import load_config
 from wt.errors import WtError
 from wt.templating import render
 
@@ -125,16 +124,16 @@ def test_two_consumed_services_cannot_share_an_env_var() -> None:
         )
 
 
-# --- resolve (uses:) ---
-def project(tmp_path: Path, catalog: str, extra: str = "uses: [front]\n") -> Path:
-    (tmp_path / "catalog.yaml").write_text(catalog)
-    cfg = tmp_path / "worktree.yaml"
-    cfg.write_text(f"project: notes\ndomain: notes.localhost\ncatalog: ./catalog.yaml\n{extra}")
-    return cfg
+# --- load_project: a selection of the catalog (SPEC sections 20, 21) ---
+PROJECT_HEADER = "project: notes\ndomain: notes.localhost\n"
+
+
+def project_catalog(tmp_path: Path, text: str = GOOD, header: str = PROJECT_HEADER) -> Path:
+    return write(tmp_path, header + text)
 
 
 def test_uses_resolves(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front", "back"])
     cfg = loaded.config
     assert loaded.catalog == tmp_path / "catalog.yaml"
     assert list(cfg.services) == ["front", "back"]  # selection order
@@ -150,7 +149,7 @@ IGNORED_BACK = "remote of 'back' is ignored: 'front' needs it, so it runs locall
 
 
 def test_uses_pulls_in_the_dependency_and_ignores_its_remote(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front"])
     cfg = loaded.config
     assert list(cfg.services) == ["front", "back"]  # the selection, then its dependencies
     assert sorted(cfg.repos) == ["notes-back", "notes-front"]
@@ -162,7 +161,7 @@ def test_uses_pulls_in_the_dependency_and_ignores_its_remote(tmp_path: Path) -> 
 
 
 def test_uses_only_dep(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [back]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["back"])
     assert list(loaded.config.services) == ["back"]
     assert list(loaded.config.repos) == ["notes-back"]
     assert loaded.remotes == {"front": ""}  # nothing consumes front, so it has no remote
@@ -171,7 +170,7 @@ def test_uses_only_dep(tmp_path: Path) -> None:
 
 def test_consumed_service_needs_no_remote(tmp_path: Path) -> None:
     text = GOOD.replace("    remote: https://api.staging.example\n", "")
-    loaded = load_config(project(tmp_path, text, "uses: [front]\n"))
+    loaded = load_project(project_catalog(tmp_path, text), ["front"])
     assert list(loaded.config.services) == ["front", "back"]
     assert loaded.config.services["front"].env == {"API_URL": "{{ services['back'].url }}"}
     assert loaded.warnings == ()
@@ -184,31 +183,16 @@ def test_remote_must_be_http_url(tmp_path: Path) -> None:
         load_catalog(write(tmp_path, text))
 
 
-@pytest.mark.parametrize(
-    ("extra", "msg"),
-    [
-        ("uses: [front]\nservices: {}\n", "exactly one"),
-        ("uses: [front]\nshared: {}\n", "'shared'"),
-        ("uses: [nope]\n", "unknown service 'nope'"),
-        ("uses: []\n", "non-empty"),
-        ("uses: [front]\nrepos: {x: .}\n", "repos"),
-    ],
-)
-def test_uses_errors(tmp_path: Path, extra: str, msg: str) -> None:
-    with pytest.raises(WtError, match=msg):
-        load_config(project(tmp_path, GOOD, extra))
-
-
 def test_consumes_dep_without_route(tmp_path: Path) -> None:
     text = GOOD.replace("    subdomain: api\n", "")
     with pytest.raises(WtError, match="no 'subdomain'"):
-        load_config(project(tmp_path, text, "uses: [front]\n"))
+        load_project(project_catalog(tmp_path, text), ["front"])
 
 
 def test_consumes_var_already_in_env(tmp_path: Path) -> None:
     text = GOOD.replace("    consumes:", "    env: {API_URL: x}\n    consumes:")
     with pytest.raises(WtError, match="API_URL"):
-        load_config(project(tmp_path, text, "uses: [front]\n"))
+        load_project(project_catalog(tmp_path, text), ["front"])
 
 
 def two_infra(a: str, b: str) -> str:
@@ -234,7 +218,7 @@ services:
 
 def test_infra_union_and_conflict(tmp_path: Path) -> None:
     ok = two_infra("{databases: [a]}", "{databases: [b, a], strategy: dump-restore}")
-    shared = load_config(project(tmp_path, ok, "uses: [two, one]\n")).config.shared
+    shared = load_project(project_catalog(tmp_path, ok), ["two", "one"]).config.shared
     assert shared.postgres is not None
     assert shared.postgres.databases == ["b", "a"]  # selection order: two, then one
     assert shared.postgres.strategy == "dump-restore"
@@ -242,24 +226,18 @@ def test_infra_union_and_conflict(tmp_path: Path) -> None:
         "{databases: [a], strategy: template}", "{databases: [b], strategy: dump-restore}"
     )
     with pytest.raises(WtError, match=r"'one'.*'two'|'two'.*'one'"):
-        load_config(project(tmp_path, bad, "uses: [two, one]\n"))
+        load_project(project_catalog(tmp_path, bad), ["two", "one"])
     with pytest.raises(WtError, match=r"'one'.*'two'|'two'.*'one'"):
-        load_config(project(tmp_path, bad, "uses: [two]\n"))  # one comes in as a dependency
+        load_project(project_catalog(tmp_path, bad), ["two"])  # one comes in as a dependency
 
 
 def test_infra_is_merged_from_the_whole_stack(tmp_path: Path) -> None:
     text = two_infra("{databases: [a]}", "{databases: [b]}")
-    loaded = load_config(project(tmp_path, text, "uses: [two]\n"))
+    loaded = load_project(project_catalog(tmp_path, text), ["two"])
     assert list(loaded.config.services) == ["two", "one"]
     assert loaded.config.shared.postgres is not None
     assert loaded.config.shared.postgres.databases == ["b", "a"]
     assert loaded.uses == ("two",)
-
-
-def test_neither_services_nor_uses(tmp_path: Path) -> None:
-    cfg = project(tmp_path, GOOD, "")
-    with pytest.raises(WtError, match="set exactly one of 'services' or 'uses'"):
-        load_config(cfg)
 
 
 def test_consumes_cycle_message(tmp_path: Path) -> None:
@@ -267,9 +245,9 @@ def test_consumes_cycle_message(tmp_path: Path) -> None:
         "    subdomain: api\n", "    subdomain: api\n    consumes: {front: FRONT_URL}\n"
     ).replace("    consumes:\n", "    remote: https://front.example\n    consumes:\n")
     with pytest.raises(WtError, match="cycle through catalog consumes: front -> back -> front"):
-        load_config(project(tmp_path, text, "uses: [front, back]\n"))
+        load_project(project_catalog(tmp_path, text), ["front", "back"])
     with pytest.raises(WtError, match="cycle through catalog consumes: front -> back -> front"):
-        load_config(project(tmp_path, text, "uses: [front]\n"))
+        load_project(project_catalog(tmp_path, text), ["front"])
 
 
 DIAMOND = """\
@@ -303,7 +281,7 @@ services:
 
 
 def test_diamond_consumes_has_no_duplicates(tmp_path: Path) -> None:
-    cfg = load_config(project(tmp_path, DIAMOND, "uses: [top]\n")).config
+    cfg = load_project(project_catalog(tmp_path, DIAMOND), ["top"]).config
     assert list(cfg.services) == ["top", "left", "right", "base"]
     assert cfg.services["top"].needs == ["left", "right"]
     assert cfg.services["left"].needs == ["base"]
@@ -333,7 +311,7 @@ def test_rows(tmp_path: Path) -> None:
 
 # --- selection: service_order, service_index, with_uses ---
 def test_service_order_follows_the_catalog_not_the_selection(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front", "back"])
     assert loaded.uses == ("front", "back")
     assert loaded.service_order == ("back", "front")  # catalog order
     assert loaded.service_index("back") == 0
@@ -346,7 +324,7 @@ def test_service_order_follows_the_catalog_not_the_selection(tmp_path: Path) -> 
 
 
 def test_with_uses_re_resolves(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front", "back"])
     only = loaded.with_uses(["back"])
     assert only.uses == ("back",)
     assert list(only.config.services) == ["back"]
@@ -356,7 +334,7 @@ def test_with_uses_re_resolves(tmp_path: Path) -> None:
 
 
 def test_with_uses_errors(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front"])
     with pytest.raises(WtError, match="unknown service 'nope'"):
         loaded.with_uses(["nope"])
     with pytest.raises(WtError, match="select at least one service"):
@@ -369,37 +347,9 @@ def test_with_uses_reports_infra_conflicts(tmp_path: Path) -> None:
         "    consumes:\n      back: API_URL\n"
         "    infra:\n      postgres: {databases: [other], base_branch: dev}\n",
     ).replace("postgres: {databases: [notes]}", "postgres: {databases: [notes], base_branch: main}")
-    loaded = load_config(project(tmp_path, text, "uses: [back]\n"))
+    loaded = load_project(project_catalog(tmp_path, text), ["back"])
     with pytest.raises(WtError, match="conflicts"):
         loaded.with_uses(["front"])  # back comes in as a dependency and conflicts
-
-
-def test_services_project_has_no_selection(tmp_path: Path) -> None:
-    path = tmp_path / "worktree.yaml"
-    path.write_text(
-        "project: p\ndomain: p.localhost\nrepos: {a: .}\nservices:\n"
-        "  one: {repo: a, run: x}\n  two: {repo: a, run: y}\n"
-    )
-    loaded = load_config(path)
-    assert loaded.uses is None
-    assert loaded.warnings == ()
-    assert loaded.remotes == {}
-    assert loaded.service_order == ("one", "two")
-    assert loaded.service_index("two") == 1
-    with pytest.raises(WtError, match="catalog"):
-        loaded.with_uses(["one"])
-
-
-def test_more_than_100_services_rejected(tmp_path: Path) -> None:
-    body = "".join(f"  s{i}:\n    repo: r\n    run: x\n" for i in range(101))
-    catalog = f"repos:\n  r: ./r\nservices:\n{body}"
-    with pytest.raises(WtError, match="at most 100 services"):
-        load_config(project(tmp_path, catalog, "uses: [s0]\n"))
-    body = "".join(f"  s{i}:\n    repo: a\n    run: x\n" for i in range(101))
-    path = tmp_path / "w2.yaml"
-    path.write_text(f"project: p\ndomain: p.localhost\nrepos: {{a: .}}\nservices:\n{body}")
-    with pytest.raises(WtError, match="at most 100 services"):
-        load_config(path)
 
 
 # --- the stack is the closure of the selection (SPEC section 20) ---
@@ -474,7 +424,7 @@ def test_expand_uses_cycle(tmp_path: Path) -> None:
 
 
 def test_closure_is_the_stack_and_uses_stays_explicit(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, CHAIN, "uses: [a]\n"))
+    loaded = load_project(project_catalog(tmp_path, CHAIN), ["a"])
     assert list(loaded.config.services) == ["a", "b", "c"]
     assert loaded.uses == ("a",)  # the explicit selection, not the closure
     assert loaded.service_order == ("a", "b", "c", "d")  # catalog position
@@ -486,14 +436,14 @@ def test_closure_is_the_stack_and_uses_stays_explicit(tmp_path: Path) -> None:
 
 
 def test_service_index_ignores_the_closure_order(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, CHAIN, "uses: [d, a]\n"))
+    loaded = load_project(project_catalog(tmp_path, CHAIN), ["d", "a"])
     assert list(loaded.config.services) == ["d", "a", "b", "c"]
     assert loaded.service_index("d") == 3
     assert loaded.service_index("b") == 1
 
 
 def test_with_uses_drops_a_dependency_that_was_not_explicit(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, CHAIN, "uses: [a, d]\n"))
+    loaded = load_project(project_catalog(tmp_path, CHAIN), ["a", "d"])
     assert list(loaded.config.services) == ["a", "d", "b", "c"]
     dropped = loaded.with_uses(["d"])
     assert list(dropped.config.services) == ["d"]
@@ -502,7 +452,7 @@ def test_with_uses_drops_a_dependency_that_was_not_explicit(tmp_path: Path) -> N
 
 
 def test_with_uses_keeps_a_dependency_that_is_explicit(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, CHAIN, "uses: [a, b]\n"))
+    loaded = load_project(project_catalog(tmp_path, CHAIN), ["a", "b"])
     kept = loaded.with_uses(["b"])
     assert list(kept.config.services) == ["b", "c"]
     assert kept.uses == ("b",)
@@ -512,7 +462,7 @@ def test_with_uses_keeps_a_dependency_that_is_explicit(tmp_path: Path) -> None:
 
 
 def test_with_uses_unknown_name_after_the_closure(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, CHAIN, "uses: [a]\n"))
+    loaded = load_project(project_catalog(tmp_path, CHAIN), ["a"])
     with pytest.raises(WtError, match="unknown service 'nope'"):
         loaded.with_uses(["a", "nope"])
 
@@ -520,14 +470,14 @@ def test_with_uses_unknown_name_after_the_closure(tmp_path: Path) -> None:
 def test_consumes_always_sets_the_local_url_template(tmp_path: Path) -> None:
     for remote in ("", "    remote: https://c.example\n"):
         text = CHAIN.replace("    subdomain: c\n", f"    subdomain: c\n{remote}")
-        cfg = load_config(project(tmp_path, text, "uses: [b]\n")).config
+        cfg = load_project(project_catalog(tmp_path, text), ["b"]).config
         assert cfg.services["b"].env == {"C_URL": "{{ services['c'].url }}"}
         assert cfg.services["b"].needs == ["c"]
 
 
 def test_remote_of_a_dependency_warns_once_naming_the_first_consumer(tmp_path: Path) -> None:
     text = DIAMOND
-    loaded = load_config(project(tmp_path, text, "uses: [top]\n"))
+    loaded = load_project(project_catalog(tmp_path, text), ["top"])
     assert loaded.warnings == (
         "remote of 'left' is ignored: 'top' needs it, so it runs locally",
         "remote of 'right' is ignored: 'top' needs it, so it runs locally",
@@ -538,13 +488,13 @@ def test_remote_of_a_dependency_warns_once_naming_the_first_consumer(tmp_path: P
 
 def test_remote_of_a_service_outside_the_stack_is_kept(tmp_path: Path) -> None:
     text = CHAIN.replace("    subdomain: d\n", "    subdomain: d\n    remote: https://d.example\n")
-    loaded = load_config(project(tmp_path, text, "uses: [a]\n"))
+    loaded = load_project(project_catalog(tmp_path, text), ["a"])
     assert loaded.remotes == {"d": "https://d.example"}
     assert loaded.warnings == ()
 
 
 def test_remote_of_an_explicit_dependency_is_not_a_warning(tmp_path: Path) -> None:
-    loaded = load_config(project(tmp_path, GOOD, "uses: [front, back]\n"))
+    loaded = load_project(project_catalog(tmp_path, GOOD), ["front", "back"])
     assert loaded.warnings == ()
 
 
@@ -574,7 +524,7 @@ services:
 
 
 def test_hyphenated_services_render_the_consumer_env_to_the_producer_url(tmp_path: Path) -> None:
-    cfg = load_config(project(tmp_path, HYPHENATED, "uses: [music-front]\n")).config
+    cfg = load_project(project_catalog(tmp_path, HYPHENATED), ["music-front"]).config
     env = cfg.services["music-front"].env
     assert env == {"VITE_API_URL": "{{ services['music-back'].url }}"}
     assert cfg.services["music-front"].needs == ["music-back"]
@@ -582,18 +532,16 @@ def test_hyphenated_services_render_the_consumer_env_to_the_producer_url(tmp_pat
     assert render(env["VITE_API_URL"], context, "env.VITE_API_URL") == "https://api.music.localhost"
 
 
-def test_services_project_with_hyphenated_names_renders_both_forms_of_access(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "worktree.yaml"
-    path.write_text(
+def test_hyphenated_names_written_by_hand_render_both_forms_of_access(tmp_path: Path) -> None:
+    path = write(
+        tmp_path,
         "project: music\ndomain: music.localhost\nrepos: {music: ./music}\nservices:\n"
         "  music-back: {repo: music, run: serve, port: 8000, subdomain: api}\n"
         "  music-front:\n    repo: music\n    run: serve\n    port: 8001\n"
         "    needs: [music-back]\n"
-        "    env: {API: \"{{ services['music-back'].url }}\"}\n"
+        "    env: {API: \"{{ services['music-back'].url }}\"}\n",
     )
-    cfg = load_config(path).config
+    cfg = load_project(path, ["music-front", "music-back"]).config
     context = {"services": {"music-back": {"url": "https://api.music.localhost"}}}
     assert render(cfg.services["music-front"].env["API"], context, "env.API") == (
         "https://api.music.localhost"
@@ -601,13 +549,6 @@ def test_services_project_with_hyphenated_names_renders_both_forms_of_access(
 
 
 # --- the project catalog: project/domain in the catalog, load_project ---
-PROJECT_HEADER = "project: notes\ndomain: notes.localhost\n"
-
-
-def project_catalog(tmp_path: Path, text: str = GOOD, header: str = PROJECT_HEADER) -> Path:
-    return write(tmp_path, header + text)
-
-
 def test_catalog_project_and_domain_are_optional() -> None:
     old = Catalog.model_validate(yaml.safe_load(GOOD))
     assert old.project is None
@@ -624,21 +565,18 @@ def test_catalog_project_and_domain_are_validated_when_set(key: str, value: str)
         Catalog.model_validate({**yaml.safe_load(GOOD), key: value})
 
 
-def test_old_catalog_without_project_still_loads_through_the_old_path(tmp_path: Path) -> None:
+def test_load_catalog_accepts_a_catalog_without_project(tmp_path: Path) -> None:
     assert load_catalog(write(tmp_path, GOOD)).catalog.project is None
-    assert list(load_config(project(tmp_path, GOOD, "uses: [back]\n")).config.services) == ["back"]
 
 
-def test_load_project_matches_a_uses_project(tmp_path: Path) -> None:
+def test_load_project_resolves_the_selection(tmp_path: Path) -> None:
     path = project_catalog(tmp_path)
-    old = load_config(project(tmp_path, PROJECT_HEADER + GOOD, "uses: [front]\n"))
     new = load_project(path, ["front"])
-    assert new.config == old.config
     assert new.path == path == new.catalog
     assert new.uses == ("front",)
     assert new.service_order == ("back", "front")
-    assert new.remotes == old.remotes == {}
-    assert new.warnings == old.warnings == (IGNORED_BACK,)
+    assert new.remotes == {}
+    assert new.warnings == (IGNORED_BACK,)
     assert new.config.repos["notes-back"] == str(tmp_path / "back")
     assert new.config.project == "notes"
     assert new.config.domain == "notes.localhost"

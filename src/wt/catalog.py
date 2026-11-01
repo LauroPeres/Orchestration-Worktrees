@@ -1,4 +1,4 @@
-"""The user catalog: reusable repos and services that a worktree.yaml picks with `uses:`."""
+"""The project catalog (SPEC section 21): its schema, a selection of it, and `wt migrate`."""
 
 import copy
 import os
@@ -11,7 +11,6 @@ import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from wt.config import (
-    CONFIG_NAME,
     DOMAIN,
     MAX_SERVICES,
     NAME,
@@ -29,6 +28,7 @@ from wt.naming import service_ref
 from wt.paths import wt_home
 
 CATALOG_NAME = "catalog.yaml"
+LEGACY_NAME = "worktree.yaml"  # the v0.5.x file `wt migrate` reads
 ENV_VAR = r"^[A-Z_][A-Z0-9_]*$"
 
 
@@ -290,29 +290,6 @@ def _select(loaded: LoadedCatalog, uses: list[str]) -> Resolved:
     )
 
 
-def resolve(raw: dict[str, Any], config_path: Path) -> Resolved:
-    """Turn a worktree.yaml that has `uses:` into the dict of a normal Config.
-
-    The stack is the closure of `uses` through `consumes` (SPEC section 20).
-    """
-    if "services" in raw:
-        raise WtError("set exactly one of 'services' or 'uses', not both")
-    uses = _uses_list(raw)
-    if "shared" in raw:
-        raise WtError("'shared' cannot be set with 'uses'; infra comes from the catalog services")
-    if "repos" in raw:
-        raise WtError("'repos' cannot be set with 'uses'; repos come from the catalog")
-    loaded = load_catalog(catalog_path(raw.get("catalog"), config_path.parent))
-    selected = _select(loaded, uses)
-    out = {k: v for k, v in raw.items() if k not in ("uses", "catalog")}
-    return Resolved(
-        raw={**out, **selected.raw},
-        remotes=selected.remotes,
-        order=selected.order,
-        warnings=selected.warnings,
-    )
-
-
 def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
     """Load the project catalog (SPEC section 21) for a selection of its services.
 
@@ -345,7 +322,6 @@ def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
         uses=tuple(dict.fromkeys(uses)),
         service_order=selected.order,
         warnings=selected.warnings,
-        from_catalog=True,
         worktrees_dir=worktrees_folder(catalog, path),
     )
 
@@ -493,7 +469,7 @@ def merge_legacy(
     existing: dict[str, Any] | None,
     legacy: dict[str, Any],
     legacy_dir: Path,
-    legacy_name: str = CONFIG_NAME,
+    legacy_name: str = LEGACY_NAME,
     catalog_dir: Path | None = None,
 ) -> MergeResult:
     """Fold a v0.5.x worktree.yaml (`legacy`, read from `legacy_dir`) into the raw catalog.

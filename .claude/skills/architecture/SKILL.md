@@ -51,7 +51,7 @@ tests `tests/test_<module>.py` go with their module; e2e owns `tests/integration
 1. `templating → providers` (`ignore_imports`): the "provider arrives in vX" hint reads the registry.
    Target: the core passes the hint in, or drop it (it no longer fires) — needs a `spec-decision`.
 2. Functions over the limits, marked `# noqa: <code>` on the `def` line:
-   `compose.up`, `config.Config._check`, `config.load_config`,
+   `compose.up`, `config.Config._check`,
    `orchestrator.Orchestrator._start_steps`, `._up_run_service`, `._up_compose_group`, `._down_locked`,
    `._drop_services`, `proc.run`, `proc._run_streaming`. Remove the `noqa` when a task splits one.
 3. `orchestrator.py` (1,087 lines) holds every use case in one class (SRP). Target: one module per

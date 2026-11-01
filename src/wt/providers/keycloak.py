@@ -227,14 +227,14 @@ class KeycloakProvider:
     name = "keycloak"
 
     def __init__(self, cfg: Config, log: Callable[[str], None] = lambda message: None) -> None:
-        # No I/O here: providers are built on every render. `cfg` may lack shared.keycloak
+        # No I/O here: providers are built on every render. `cfg` may lack the keycloak section
         # when `down` runs after the section was removed.
         self.cfg: KeycloakConfig | None = cfg.shared.keycloak
         self.log = log
 
     def _cfg(self) -> KeycloakConfig:
         if self.cfg is None:
-            raise WtError("the keycloak provider needs shared.keycloak in worktree.yaml")
+            raise WtError("the keycloak provider needs infra.keycloak in the catalog")
         return self.cfg
 
     def client_id(self, ctx: BranchContext) -> str:

@@ -1,16 +1,14 @@
-"""Load and validate worktree.yaml."""
+"""The resolved project model: services, shared servers and the loaded selection."""
 
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Self
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from wt.errors import WtError
 
-CONFIG_NAME = "worktree.yaml"
 MAX_SERVICES = 100
 
 NAME = r"^[a-z0-9][a-z0-9_-]{0,30}$"
@@ -166,12 +164,11 @@ def find_cycle(edges: dict[str, list[str]]) -> list[str] | None:
 class LoadedConfig:
     config: Config
     path: Path
-    catalog: Path | None = None
+    catalog: Path
+    uses: tuple[str, ...]  # the explicit selection (its closure is in `config.services`)
     remotes: dict[str, str] = field(default_factory=dict)
-    uses: tuple[str, ...] | None = None  # the explicit selection; None for a `services:` project
-    service_order: tuple[str, ...] = ()  # catalog order (or `services:` order): the port index
+    service_order: tuple[str, ...] = ()  # catalog order: the port index
     warnings: tuple[str, ...] = ()  # non-fatal notes from loading, for the caller to show
-    from_catalog: bool = False  # loaded by load_project: re-resolve with it, not load_config
     worktrees_dir: Path | None = None  # the catalog's `worktrees` folder, resolved; None = default
 
     @property
@@ -182,31 +179,19 @@ class LoadedConfig:
         return (self.root / self.config.repos[repo]).resolve()
 
     def service_index(self, name: str) -> int:
-        """Position of a service in the catalog (whatever the selection) or in `services:`."""
+        """Position of a service in the catalog, whatever the selection."""
         try:
             return self.service_order.index(name)
         except ValueError:
             raise WtError(f"unknown service {name!r}") from None
 
     def with_uses(self, uses: list[str]) -> "LoadedConfig":
-        """The same worktree.yaml or project catalog, resolved for another selection."""
-        if self.uses is None:
-            raise WtError("configure needs a catalog project (uses: in worktree.yaml)")
+        """The same project catalog, resolved for another selection."""
         if not uses:
             raise WtError("select at least one service")
-        if self.from_catalog:
-            from wt.catalog import load_project  # catalog imports this module
+        from wt.catalog import load_project  # catalog imports this module
 
-            return load_project(self.path, uses=list(uses))
-        return load_config(self.path, uses=list(uses))
-
-
-def find_config(start: Path) -> Path | None:
-    for folder in [start, *start.parents]:
-        candidate = folder / CONFIG_NAME
-        if candidate.is_file():
-            return candidate
-    return None
+        return load_project(self.path, uses=list(uses))
 
 
 def _format_errors(exc: ValidationError) -> str:
@@ -216,90 +201,3 @@ def _format_errors(exc: ValidationError) -> str:
         msg = err["msg"].removeprefix("Value error, ")
         lines.append(f"  {where}: {msg}")
     return "\n".join(lines)
-
-
-def load_config(path: Path, uses: list[str] | None = None) -> LoadedConfig:  # noqa: C901
-    """`uses` replaces the `uses:` of the file (a per-worktree selection)."""
-    path = path.resolve()
-    try:
-        raw = yaml.safe_load(path.read_text())
-    except FileNotFoundError as exc:
-        raise WtError(f"config not found: {path}") from exc
-    except yaml.YAMLError as exc:
-        raise WtError(f"{path} is not valid YAML:\n{exc}") from exc
-    if not isinstance(raw, dict):
-        raise WtError(f"{path} must contain a YAML mapping")
-    catalog: Path | None = None
-    remotes: dict[str, str] = {}
-    warnings: tuple[str, ...] = ()
-    selection: tuple[str, ...] | None = None
-    order: tuple[str, ...] = ()
-    if ("services" in raw) == ("uses" in raw):
-        raise WtError(f"invalid {path.name}: set exactly one of 'services' or 'uses'")
-    if uses is not None and "uses" not in raw:
-        raise WtError(f"{path.name} has no 'uses:'; a selection needs a catalog project")
-    if "uses" in raw:
-        from wt.catalog import catalog_path, resolve  # catalog imports this module
-
-        if uses is not None:
-            raw = {**raw, "uses": uses}
-        catalog = catalog_path(raw.get("catalog"), path.parent)
-        selected = raw["uses"]
-        resolved = resolve(raw, path)
-        raw, remotes, order, warnings = (
-            resolved.raw,
-            resolved.remotes,
-            resolved.order,
-            resolved.warnings,
-        )
-        selection = tuple(dict.fromkeys(selected))
-    try:
-        config = Config.model_validate(raw)
-    except ValidationError as exc:
-        raise WtError(f"invalid {path.name}:\n{_format_errors(exc)}") from exc
-    if catalog is None:
-        order = tuple(config.services)
-        if len(order) > MAX_SERVICES:
-            raise WtError(f"{path.name} has {len(order)} services; at most 100 services")
-    return LoadedConfig(
-        config=config,
-        path=path,
-        catalog=catalog,
-        remotes=remotes,
-        uses=selection,
-        service_order=order,
-        warnings=warnings,
-    )
-
-
-STARTER = """\
-# worktree.yaml - describe your stack once; `wt up <branch>` runs a copy of it per branch.
-project: {project}
-domain: {project}.localhost      # *.localhost resolves to 127.0.0.1 in browsers
-
-repos:                           # one or many repos; each gets a git worktree per branch
-  app: .
-
-services:
-  app:
-    repo: app
-    compose: docker-compose.yml  # compose file inside the repo
-    port: 8000                   # port the container listens on (routed by Traefik)
-    subdomain: ""                # "" = https://<branch>.{project}.localhost
-    health: /                    # path probed after `up`
-    env:
-      PUBLIC_URL: "{{{{ url }}}}"
-# --- examples: uncomment to try (host process and shared Postgres) ---
-#   web:
-#     repo: app
-#     run: npm run dev -- --host 0.0.0.0 --port {{{{ port }}}}  # 0.0.0.0 so Traefik reaches it
-#     port: auto                  # a free port per branch, kept for that branch
-#     env:
-#       DATABASE_URL: "{{{{ postgres.url('app') }}}}"
-# shared:
-#   postgres:
-#     databases: [app]
-#     strategy: template          # template | dump-restore
-#     verify: true                # compare row counts after clone
-#     base_branch: main
-"""

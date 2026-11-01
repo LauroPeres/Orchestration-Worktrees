@@ -16,6 +16,7 @@ from rich.table import Table
 
 from wt import __version__, doctor
 from wt.catalog import (
+    LEGACY_NAME,
     Catalog,
     MergeResult,
     catalog_path,
@@ -25,7 +26,7 @@ from wt.catalog import (
     read_legacy,
     rows,
 )
-from wt.config import CONFIG_NAME, LoadedConfig
+from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.naming import slugify
 from wt.orchestrator import BranchStatus, Choice, Orchestrator, ServiceReport
@@ -344,7 +345,7 @@ def _service_picks(answer: str, choices: list[Choice]) -> list[str]:
 
 def _ask_services(orch: Orchestrator) -> list[str]:
     """Show the catalog as a numbered list and read the picks; an empty answer cancels."""
-    choices = orch.catalog_choices(None) or []
+    choices = orch.catalog_choices(None)
     for number, choice in enumerate(choices, start=1):
         console.print(f"  {number}. {escape(choice.service)} [dim]({escape(choice.repo)})[/]")
     answer = typer.prompt(
@@ -599,7 +600,7 @@ def doctor_(
 
 def _legacy_file(path: Path, project: str) -> bool:
     """True when `path` is a worktree.yaml, not the catalog of `project` (SPEC §21)."""
-    if path.name == CONFIG_NAME:
+    if path.name == LEGACY_NAME:
         return True
     try:
         raw = yaml.safe_load(path.read_text())

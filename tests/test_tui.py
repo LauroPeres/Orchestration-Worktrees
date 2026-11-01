@@ -46,13 +46,13 @@ class FakeOrch:
         ]
         self.service_calls: list[str] = []
         self.services_error: Exception | None = None
-        self.choices: list[Choice] | None = [
+        self.choices: list[Choice] = [
             Choice("front", "web", True),
             Choice("back", "api", True),
             Choice("db", "api", False),
         ]
         # what `catalog_choices(None)` answers: nothing selected, back is a dependency of front
-        self.new_choices: list[Choice] | None = [
+        self.new_choices: list[Choice] = [
             Choice("front", "web", False),
             Choice("back", "api", False, required_by=("front",)),
             Choice("db", "api", False),
@@ -92,7 +92,7 @@ class FakeOrch:
             raise self.services_error
         return self.service_rows
 
-    def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
+    def catalog_choices(self, branch: str | None = None) -> list[Choice]:
         if self.choices_error is not None:
             raise self.choices_error
         return self.new_choices if branch is None else self.choices
@@ -430,7 +430,7 @@ def test_add_says_so_when_the_catalog_cannot_be_read() -> None:
 def test_add_without_catalog_services_says_so() -> None:
     async def scenario() -> None:
         orch = FakeOrch()
-        orch.new_choices = None
+        orch.new_choices = []
         app = WtApp(orch)
         async with app.run_test() as pilot:
             await settle(pilot)
@@ -841,25 +841,6 @@ def test_configure_cancel_does_not_call() -> None:
             await settle(pilot)
             assert orch.calls == []
             assert app.screen.query("#services")
-
-    asyncio.run(scenario())
-
-
-def test_configure_on_services_project_shows_note() -> None:
-    async def scenario() -> None:
-        orch = FakeOrch()
-        orch.choices = None
-        app = WtApp(orch)
-        async with app.run_test() as pilot:
-            await settle(pilot)
-            await pilot.press("enter")
-            await settle(pilot)
-            await pilot.press("c")
-            await pilot.pause()
-            assert str(app.screen.query_one("#message", Static).render()) == (
-                "no catalog for this project. Run wt init or wt migrate"
-            )
-            assert not app.screen.query("#choices")
 
     asyncio.run(scenario())
 

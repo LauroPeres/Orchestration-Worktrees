@@ -1,12 +1,12 @@
 import copy
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import pytest
 
 from tests.conftest import SHOP_CATALOG, write_global_catalog
 from wt import compose, doctor, host, proc, router
-from wt.config import STARTER, LoadedConfig, load_config
+from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
@@ -440,17 +440,24 @@ def test_keycloak_fix_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> No
     assert check.detail == "compose failed"
 
 
-def _loaded(make_repo, with_postgres: bool) -> LoadedConfig:
-    shared = "shared:\n  postgres:\n    databases: [shop]\n" if with_postgres else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    return load_config(repo / "worktree.yaml")
+def _loaded(make_repo, infra: Mapping[str, object] | None) -> LoadedConfig:
+    """A one-service catalog (repo `app`) whose service needs `infra`."""
+    repo = make_repo("app", {"docker-compose.yml": "services: {app: {image: x}}\n"})
+    service = {"repo": "app", "compose": "docker-compose.yml", "port": 8000, "subdomain": ""}
+    catalog = {
+        "project": "app",
+        "domain": "app.localhost",
+        "repos": {"app": "./app"},
+        "services": {"app": {**service, **({"infra": infra} if infra else {})}},
+    }
+    return write_global_catalog(repo.parent, catalog)
 
 
 @pytest.mark.parametrize("with_postgres", [False, True])
 def test_run_checks_only_checks_postgres_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_postgres: bool
 ) -> None:
-    loaded = _loaded(make_repo, with_postgres)
+    loaded = _loaded(make_repo, {"postgres": {"databases": ["shop"]}} if with_postgres else None)
     calls: list[list[str]] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -472,9 +479,7 @@ def test_run_checks_only_checks_postgres_when_configured(
 def test_run_checks_only_checks_redis_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_redis: bool
 ) -> None:
-    shared = "shared:\n  redis:\n    prefix: true\n" if with_redis else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    loaded = _loaded(make_repo, {"redis": {"prefix": True}} if with_redis else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -496,9 +501,7 @@ def test_run_checks_only_checks_redis_when_configured(
 def test_run_checks_only_checks_kafka_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_kafka: bool
 ) -> None:
-    shared = "shared:\n  kafka:\n    groups: [worker]\n" if with_kafka else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    loaded = _loaded(make_repo, {"kafka": {"groups": ["worker"]}} if with_kafka else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
@@ -520,9 +523,8 @@ def test_run_checks_only_checks_kafka_when_configured(
 def test_run_checks_only_checks_keycloak_when_configured(
     monkeypatch: pytest.MonkeyPatch, make_repo, with_keycloak: bool
 ) -> None:
-    shared = "shared:\n  keycloak:\n    realm: shop\n    client: web\n" if with_keycloak else ""
-    repo = make_repo("app", {"worktree.yaml": STARTER.format(project="app") + shared})
-    loaded = load_config(repo / "worktree.yaml")
+    keycloak = {"keycloak": {"realm": "shop", "client": "web"}}
+    loaded = _loaded(make_repo, keycloak if with_keycloak else None)
     calls: list[bool] = []
     monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
     monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
