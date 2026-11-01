@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-import click
 import typer
 import yaml
 from rich.console import Console, ConsoleDimensions
@@ -132,13 +131,13 @@ services:
 """
 
 
-def _catalog_file(ctx: click.Context) -> Path:
+def _catalog_file(ctx: typer.Context) -> Path:
     """The catalog: `--catalog` / WT_CATALOG, else $WT_HOME/catalog.yaml. Never the cwd."""
     explicit: Path | None = ctx.obj
     return explicit if explicit else catalog_path(None, None)
 
 
-def _load(ctx: click.Context) -> LoadedConfig:
+def _load(ctx: typer.Context) -> LoadedConfig:
     return load_project(_catalog_file(ctx))
 
 
@@ -380,7 +379,8 @@ def _print_up(branch: str, reports: list[ServiceReport]) -> None:
 
 
 @app.command()
-def up(
+def up(  # noqa: PLR0913  (six CLI options; typer needs them as parameters)
+    ctx: typer.Context,
     branch: Annotated[str, typer.Argument(help="Git branch, e.g. feat/cart.")],
     uses: UsesOption = None,
     build: Annotated[bool, typer.Option("--build", help="Rebuild images.")] = False,
@@ -388,7 +388,6 @@ def up(
     json_output: JsonOption = False,
 ) -> None:
     """Create worktrees, start services and routes for BRANCH, then verify them."""
-    ctx = click.get_current_context()  # not a parameter: the lint limit is 5 per function
     with _json_errors(json_output):
         loaded = _load(ctx)
         orch = Orchestrator(loaded, log=_progress(json_output))
