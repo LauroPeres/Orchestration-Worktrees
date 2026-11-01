@@ -50,5 +50,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked
+      # REPORT ONLY: `fcntl` does not exist on Windows (wt cannot even be imported), so a no-op stub
+      # lets the rest of the suite run and shows what else fails. Real file locks are not covered.
       - run: uv run pytest -q -m "not docker" -rfE --tb=line -p no:cacheprovider
+        env:
+          PYTHONPATH: .github/windows-stubs
 
