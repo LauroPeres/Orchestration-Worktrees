@@ -22,7 +22,9 @@ from tests.conftest import (
     SHOP_CATALOG,
     WINDOW_TRIES,
     FakeDocker,
+    FakePluginFactory,
     FakeProvider,
+    InstallPlugins,
     _pick_free_window,
     _window_is_free,
     selection,
@@ -1011,6 +1013,124 @@ def test_down_lists_resources_of_unavailable_provider(orch, docker: FakeDocker) 
     o.log = logs.append
     o.down("feat/x")
     assert any("'gone'" in line and "db__feat_x" in line for line in logs)
+
+
+# ---- plugin providers (§23) ---------------------------------------------------------------
+
+ECHO: dict[str, object] = {"echo": {}}
+
+
+def echo_plugin(events: list[str]) -> tuple[FakeProvider, dict[str, FakePluginFactory]]:
+    provider = FakeProvider(events, name="echo")
+    return provider, {"echo": FakePluginFactory(provider)}
+
+
+def test_an_unknown_infra_key_fails_when_the_orchestrator_is_built(
+    orch, install_plugins: InstallPlugins
+) -> None:
+    install_plugins()
+    with pytest.raises(WtError, match="unknown infra 'echo'"):
+        orch(shared=ECHO)
+
+
+def test_a_broken_plugin_fails_every_command_of_a_catalog_that_uses_it(
+    orch, install_plugins: InstallPlugins
+) -> None:
+    install_plugins(problems={"echo": "provider plugin 'echo' failed to load: boom"})
+    with pytest.raises(WtError, match="failed to load: boom"):
+        orch(shared=ECHO)
+
+
+def test_a_plugin_section_that_its_config_model_rejects_fails_early(
+    orch, install_plugins: InstallPlugins
+) -> None:
+    install_plugins(echo_plugin([])[1])
+    with pytest.raises(WtError, match=r"infra echo: .*nope"):
+        orch(shared={"echo": {"nope": 1}})
+
+
+def test_a_catalog_without_plugin_keys_never_loads_plugins(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden() -> None:
+        raise AssertionError("plugins were loaded")
+
+    monkeypatch.setattr("wt.providers.load_plugins", forbidden)
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.down("feat/cart")
+    assert o.store.load().branches == {}
+
+
+def test_a_plugin_provider_is_created_verified_and_destroyed_with_the_branch(
+    orch, docker: FakeDocker, install_plugins: InstallPlugins
+) -> None:
+    events: list[str] = []
+    provider, factories = echo_plugin(events)
+    install_plugins(factories)
+    logs: list[str] = []
+    o = orch(shared=ECHO)
+    o.log = logs.append
+    o.up("feat/cart", uses=selection(o))
+    assert events == ["ensure", "create", "verify"]
+    assert o.store.load().branches["feat/cart"].providers == {"echo": ["db_feat_cart"]}
+    assert not any("not available" in m for m in logs)
+
+    o.down("feat/cart")
+    assert events[3:] == ["ensure", "destroy"]
+    assert provider.recorded_at_destroy == [["db_feat_cart"]]
+    assert o.store.load().branches == {}
+
+
+def test_down_destroys_a_plugin_slice_after_its_key_left_the_catalog(
+    orch, docker: FakeDocker, install_plugins: InstallPlugins
+) -> None:
+    events: list[str] = []
+    install_plugins(echo_plugin(events)[1])
+    first = orch(shared=ECHO)
+    first.up("feat/cart", uses=selection(first))
+
+    later = orch()  # the same project, `infra: echo` removed
+    later.down("feat/cart")
+    assert events[-1] == "destroy"
+    assert later.store.load().branches == {}
+
+
+def test_down_with_a_broken_plugin_names_it_and_keeps_the_branch_removing(
+    orch, docker: FakeDocker, install_plugins: InstallPlugins
+) -> None:
+    events: list[str] = []
+    install_plugins(echo_plugin(events)[1])
+    first = orch(shared=ECHO)
+    first.up("feat/cart", uses=selection(first))
+
+    install_plugins(problems={"echo": "provider plugin 'echo' failed to load: boom"})
+    later = orch()
+    with pytest.raises(WtError, match=r"echo: could not clean branch feat/cart .*boom.*wt down"):
+        later.down("feat/cart")
+    bs = later.store.load().branches["feat/cart"]
+    assert bs.status == "removing" and bs.providers == {"echo": ["db_feat_cart"]}
+    assert "destroy" not in events
+
+    install_plugins(echo_plugin(events)[1])  # fixed: the same command now finishes
+    later.down("feat/cart")
+    assert events[-1] == "destroy"
+    assert later.store.load().branches == {}
+
+
+def test_down_warns_when_the_plugin_that_made_a_slice_is_not_installed(
+    orch, docker: FakeDocker, install_plugins: InstallPlugins
+) -> None:
+    install_plugins(echo_plugin([])[1])
+    first = orch(shared=ECHO)
+    first.up("feat/cart", uses=selection(first))
+
+    install_plugins()
+    logs: list[str] = []
+    later = orch()
+    later.log = logs.append
+    later.down("feat/cart")
+    assert any("'echo'" in m and "db_feat_cart" in m for m in logs)
 
 
 # ---- host processes (run: services) ------------------------------------------------------

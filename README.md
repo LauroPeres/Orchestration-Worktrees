@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.6.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.7.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -345,9 +345,34 @@ The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-impleme
 and [§21](docs/SPEC.md#21-v060-one-global-catalog-wt-from-anywhere-json-output).
 A working example is in [examples/notes](examples/notes/README.md).
 
+## Editing the catalog from the command line
+
+`wt init --with postgres,redis,kafka,keycloak` writes a starter catalog with those `infra` sections
+enabled. After that, agents and scripts can change it without opening the YAML (comments and key
+order stay, and the result is validated before it is written; every command takes `--json`):
+
+```bash
+wt catalog add-repo music-back ~/code/music-back
+wt catalog add-service api --repo music-back --run "uvicorn app:app --port {{ port }}" \
+    --port auto --subdomain api --health /docs --infra postgres:app --setup "uv sync"
+wt catalog remove-service api      # refused while another service consumes it
+wt catalog remove-repo music-back  # refused while a service uses it
+```
+
+## Writing a provider plugin
+
+Postgres, Redis, Kafka and Keycloak are built in. Another package can add an `infra` key through
+the `wt.providers` entry-point group: the entry-point name is the key, the value is a class that
+implements the `Provider` protocol (`wt/providers/base.py`) and has a pydantic `config_model` for
+the key's mapping. `examples/provider-echo/` is a complete 60-line example with a README. An
+`infra` key that is neither built in nor installed fails every command with `unknown infra 'x'
+(installed providers: …)`; a plugin that cannot be imported is reported by `wt doctor` (`plugin
+x`) and does not break commands that do not use it. A plugin cannot take a built-in name.
+
 ## Terminal UI (`wt tui`)
 
-`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit.
+`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit. In the
+services view `c` configures and `l` follows the log of a service.
 `wt tui` shows one compact table with one row per worktree of the catalog's project
 (`wt tui --all` lists every project wt knows). `a` asks "Enter name", then which catalog services
 that worktree runs. Columns: `NAME` and `STATUS`. Below the table is the action line and a message
@@ -584,7 +609,8 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.5 | Keycloak provider ✔ (shared realm, one client per branch; the shop has a Sign in link) |
 | v0.5.1 ✔ | Stabilise, dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ | One global `catalog.yaml`, `wt add/up --uses` from any folder, `wt migrate`, `--json` |
-| v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from hands-on tests |
+| v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from tests |
+| v0.7.0 ✔ | Provider plugins, shared provider helpers, `wt init --with`, TUI log pane, catalog edit commands |
 | later | plugin entry points (v0.7), shared dependency caches (v0.8), native Windows (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

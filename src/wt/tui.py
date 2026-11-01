@@ -1,5 +1,6 @@
 """Terminal UI: a bordered table of worktrees and one page per action (SPEC §16, §21)."""
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +17,13 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import Screen
 from textual.strip import Strip
-from textual.widgets import DataTable, Input, Label, SelectionList, Static
+from textual.widgets import DataTable, Input, Label, Log, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 from wt.config import Config
 from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
+from wt.naming import Names
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 
 REFRESH_SECONDS = 2.0
@@ -72,6 +74,10 @@ class OrchestratorLike(Protocol):
 
     def configure(self, branch: str, uses: list[str]) -> None: ...
 
+    def names(self, branch: str) -> Names: ...
+
+    def log_path(self, names: Names, service: str) -> Path: ...
+
 
 @dataclass(frozen=True)
 class ProjectEntry:
@@ -99,7 +105,13 @@ class Row:
         return f"{self.project}\0{self.status.branch if self.status else ''}"
 
 
-SERVICES_ACTIONS = "c: configure  esc: back  q: quit"
+SERVICES_ACTIONS = "c: configure  l: logs  esc: back  q: quit"
+LOG_HINTS = "esc: back"
+LOG_TITLE = "{branch} \u00b7 {service}"
+NO_LOG_YET = "no log yet"
+LOG_LINES = 200
+LOG_TAIL_BYTES = 256 * 1024  # enough for LOG_LINES lines; a log can be much bigger
+LOG_REFRESH_SECONDS = 1.0
 CONFIGURE_HINTS = "space: toggle  enter: confirm  esc: cancel"
 NOTHING_CHECKED = "check at least one service"
 NO_CATALOG = "no catalog at {path}. Run wt init or wt migrate"
@@ -158,6 +170,37 @@ def required_note(service: str, holders: tuple[str, ...]) -> str:
     return f"{service} is required by {', '.join(holders)}"
 
 
+def tail_lines(path: Path, count: int = LOG_LINES) -> list[str] | None:
+    """The last `count` lines of the file at `path`; None while the file does not exist."""
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - LOG_TAIL_BYTES))
+            chunk = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise WtError(f"cannot read {path}: {exc.strerror}") from exc
+    lines = chunk.decode(errors="replace").splitlines()
+    if size > LOG_TAIL_BYTES:
+        lines = lines[1:]  # the first line of the chunk is cut in the middle
+    return lines[-count:]
+
+
+def log_target(orch: OrchestratorLike, branch: str, repo: str) -> tuple[str, Path]:
+    """The service of `repo` whose log to follow and its file.
+
+    A repo can hold several services; the first one that already has a log file wins.
+    """
+    services = [c.service for c in orch.catalog_choices(branch) if c.repo == repo and c.selected]
+    if not services:
+        raise WtError(f"{repo} has no service in {branch}")
+    names = orch.names(branch)
+    paths = {service: orch.log_path(names, service) for service in services}
+    service = next((s for s, path in paths.items() if path.is_file()), services[0])
+    return service, paths[service]
+
+
 class ServicesScreen(Screen[None]):
     """Repos of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
 
@@ -165,6 +208,7 @@ class ServicesScreen(Screen[None]):
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
         Binding("c", "configure", "Configure", show=False),
+        Binding("l", "logs", "Logs", show=False),
     ]
 
     def __init__(self, orch: Callable[[], OrchestratorLike], branch: str) -> None:
@@ -173,6 +217,7 @@ class ServicesScreen(Screen[None]):
         self.branch = branch
         self._loading = False
         self._failed_shown = False
+        self._repos: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="services", cursor_type="row")
@@ -206,6 +251,18 @@ class ServicesScreen(Screen[None]):
 
         app.push_screen(ConfigureScreen(choices), chosen)
 
+    def action_logs(self) -> None:
+        table = self.query_one("#services", DataTable)
+        if not table.row_count or table.cursor_row >= len(self._repos):
+            self.say("nothing selected")
+            return
+        try:
+            service, path = log_target(self._orch(), self.branch, self._repos[table.cursor_row])
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            self.say(error_text(exc))
+            return
+        self.app.push_screen(LogScreen(LOG_TITLE.format(branch=self.branch, service=service), path))
+
     def refresh_rows(self) -> None:
         if not self._loading:
             self._loading = True
@@ -233,6 +290,7 @@ class ServicesScreen(Screen[None]):
             table = self.query_one("#services", DataTable)
             cursor = table.cursor_row
             table.clear()
+            self._repos = [r.name for r in rows]
             for r in rows:
                 port = Text(str(r.port) if r.port is not None else "-")
                 table.add_row(Text(r.name), status_cell(r.status), port, Text(r.url or "-"))
@@ -263,6 +321,41 @@ class PageScreen(Screen[PageResult]):
 
     def compose_page(self) -> ComposeResult:
         raise NotImplementedError
+
+
+class LogScreen(PageScreen[None]):
+    """The tail of one service's log file, refreshed every second and scrolled to the end."""
+
+    CSS = """
+    #log { height: 1fr; }
+    """
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "app.pop_screen", "Back")]
+
+    def __init__(self, heading: str, path: Path) -> None:
+        super().__init__(heading)
+        self._path = path
+        self._shown: list[str] | None = None  # None until the first read
+
+    def compose_page(self) -> ComposeResult:
+        yield Log(id="log", auto_scroll=True)
+        yield Static(keys_text(LOG_HINTS), id="hints")
+
+    def on_mount(self) -> None:
+        self.set_interval(LOG_REFRESH_SECONDS, self.refresh_log)
+        self.refresh_log()
+
+    def refresh_log(self) -> None:
+        try:
+            tail = tail_lines(self._path)
+            lines = [NO_LOG_YET] if tail is None else tail
+        except WtError as exc:
+            lines = [str(exc)]
+        if lines == self._shown:
+            return  # nothing new: do not move the view
+        self._shown = lines
+        log = self.query_one("#log", Log)
+        log.clear()
+        log.write_lines(lines)
 
 
 class ConfirmScreen(PageScreen[bool]):

@@ -98,7 +98,7 @@ def test_bad_yaml_and_not_mapping(tmp_path: Path) -> None:
         ("    compose: docker-compose.yml\n", "", "exactly one of 'compose' or 'run'"),
         ("    port: 8000\n", "", "needs a 'port'"),
         ("    port: 8000\n", "    port: 8000\n    colour: red\n", "colour"),
-        ("postgres:", "mysql:", "mysql"),
+        ("databases: [notes]", "databases: [notes], colour: red", "colour"),
         ("notes-back: ./back", 'notes-back: " "', "empty path"),
     ],
 )
@@ -107,6 +107,11 @@ def test_validation_errors(tmp_path: Path, old: str, new: str, message: str) -> 
     with pytest.raises(WtError, match=message) as err:
         load_catalog(write(tmp_path, GOOD.replace(old, new, 1)))
     assert "invalid catalog.yaml:" in str(err.value)
+
+
+def test_an_unknown_infra_key_is_left_to_the_provider_registry(tmp_path: Path) -> None:
+    loaded = load_catalog(write(tmp_path, GOOD.replace("postgres:", "mysql:")))
+    assert loaded.catalog.services["back"].infra.extra == {"mysql": {"databases": ["notes"]}}
 
 
 def test_extra_top_level_key(tmp_path: Path) -> None:
@@ -1172,3 +1177,63 @@ def test_render_check_covers_the_env_of_compose_services(tmp_path: Path) -> None
         "    subdomain: api\n", "    subdomain: api\n    env: {X: '{{ nope }}'}\n", 1
     )
     assert list(check(tmp_path, text)) == ["back"]
+
+
+# --- plugin infra keys (SPEC section 23) ---
+
+
+def plugin_infra(a: str, b: str) -> str:
+    return (
+        two_infra("{databases: [a]}", "{databases: [b]}")
+        .replace("postgres: {databases: [a]}", f"postgres: {{databases: [a]}}\n      echo: {a}")
+        .replace("postgres: {databases: [b]}", f"postgres: {{databases: [b]}}\n      echo: {b}")
+    )
+
+
+def test_plugin_infra_lists_are_unioned_and_a_key_set_once_is_copied(tmp_path: Path) -> None:
+    text = plugin_infra("{events: [x], file: /tmp/e.log}", "{events: [y, x]}")
+    shared = load_project(project_catalog(tmp_path, text), ["two", "one"]).config.shared
+    assert shared.extra == {"echo": {"events": ["y", "x"], "file": "/tmp/e.log"}}
+    assert shared.configured() == ["postgres", "echo"]
+
+
+def test_plugin_infra_scalar_conflict_names_both_services(tmp_path: Path) -> None:
+    text = plugin_infra("{file: /tmp/a.log}", "{file: /tmp/b.log}")
+    with pytest.raises(WtError, match=r"infra echo\.file conflicts.*'(one|two)'.*'(one|two)'"):
+        load_project(project_catalog(tmp_path, text), ["two", "one"])
+
+
+def test_plugin_infra_equal_scalars_do_not_conflict(tmp_path: Path) -> None:
+    text = plugin_infra("{file: /tmp/a.log}", "{file: /tmp/a.log}")
+    shared = load_project(project_catalog(tmp_path, text), ["two", "one"]).config.shared
+    assert shared.extra == {"echo": {"file": "/tmp/a.log"}}
+
+
+def test_plugin_infra_must_be_a_mapping_in_the_catalog(tmp_path: Path) -> None:
+    text = two_infra("{databases: [a]}", "{databases: [b]}").replace(
+        "postgres: {databases: [b]}", "echo: [x]"
+    )
+    with pytest.raises(WtError, match=r"infra\.echo: must be a mapping"):
+        load_catalog(write(tmp_path, text))
+
+
+def test_rows_list_plugin_infra_after_the_built_ins(tmp_path: Path) -> None:
+    from wt.catalog import rows
+
+    text = GOOD.replace("infra:\n      postgres:", "infra:\n      echo: {}\n      postgres:")
+    result = rows(load_catalog(write(tmp_path, text)).catalog)
+    assert result[0].infra == ["postgres", "echo"]
+
+
+def test_render_check_accepts_a_plugin_provider_in_a_template(tmp_path: Path) -> None:
+    text = GOOD.replace("infra:\n      postgres:", "infra:\n      echo: {}\n      postgres:")
+    text = text.replace("port: 8000\n", "port: 8000\n    env: {E: '{{ echo.value }}'}\n", 1)
+    assert render_check(load_catalog(write(tmp_path, text))) == {}
+
+
+def test_merge_uses_style_keeps_plugin_infra_beside_the_built_ins(tmp_path: Path) -> None:
+    text = GOOD.replace("infra:\n      postgres:", "infra:\n      echo: {file: f}\n      postgres:")
+    (tmp_path / "catalog.yaml").write_text(text)
+    legacy = {**USES_LEGACY, "catalog": "./catalog.yaml"}
+    infra = merge_legacy(None, legacy, tmp_path).catalog["services"]["back"]["infra"]
+    assert infra == {"postgres": {"databases": ["notes"]}, "echo": {"file": "f"}}

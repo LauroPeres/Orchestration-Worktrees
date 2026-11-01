@@ -5,13 +5,13 @@ import re
 import socket
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from wt import compose, host, proc, router, tls
 from wt.catalog import load_catalog
-from wt.config import LoadedConfig, Postgres, Shared
+from wt.config import BUILTIN_INFRA, LoadedConfig, Postgres, Shared
 from wt.errors import WtError
-from wt.providers import kafka, keycloak, postgres, redis
+from wt.providers import kafka, keycloak, plugin_problems, postgres, redis
 from wt.state import StateStore, file_lock
 
 Level = Literal["ok", "info", "warn", "fail"]
@@ -398,16 +398,19 @@ def check_ports(project: str) -> list[Check]:
 def _union_shared(shared_list: list[Shared]) -> Shared:
     """Which providers any of `shared_list` configures; the first config wins, databases merge."""
     merged: dict[str, object] = {}
+    extra: dict[str, dict[str, Any]] = {}
     for shared in shared_list:
-        for name in shared.configured():
+        for name, section in shared.extra.items():
+            extra.setdefault(name, section)
+        for name in BUILTIN_INFRA:
             conf = getattr(shared, name)
+            if conf is None:
+                continue
             current = merged.setdefault(name, conf)
             if isinstance(current, Postgres) and isinstance(conf, Postgres):
-                extra = [db for db in conf.databases if db not in current.databases]
-                merged[name] = current.model_copy(
-                    update={"databases": [*current.databases, *extra]}
-                )
-    return Shared.model_validate(merged)
+                more = [db for db in conf.databases if db not in current.databases]
+                merged[name] = current.model_copy(update={"databases": [*current.databases, *more]})
+    return Shared.model_validate({**merged, "extra": extra})
 
 
 def _checked_infra(loaded: LoadedConfig) -> Shared:
@@ -433,12 +436,21 @@ def _check_shared(loaded: LoadedConfig, fix: bool) -> list[Check]:
     return checks
 
 
+def check_plugins() -> list[Check]:
+    """One failed check per installed provider plugin that cannot load (loaded ones need none)."""
+    return [
+        Check(f"plugin {name}", "fail", reason, "fix or uninstall the package")
+        for name, reason in sorted(plugin_problems().items())
+    ]
+
+
 def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bool) -> list[Check]:
     checks = [check_git()]
     docker = check_docker()
     checks += docker
     docker_ok = all(c.level == "ok" for c in docker)
     checks.append(check_tls(fix))
+    checks += check_plugins()
     if docker_ok:
         checks += check_routing(fix)
     if config_error:

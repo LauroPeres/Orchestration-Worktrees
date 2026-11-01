@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -108,9 +108,35 @@ class Shared(Strict):
     kafka: Kafka | None = None
     redis: Redis | None = None
     keycloak: Keycloak | None = None
+    extra: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="sections of infra keys that are not built in (plugin providers), by key",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _collect_extra(cls, data: object) -> object:
+        """Move every key that is not a built-in section into `extra`."""
+        if not isinstance(data, dict) or not isinstance(data.get("extra", {}), dict):
+            return data  # not a mapping: pydantic reports the type
+        kept = {key: value for key, value in data.items() if key in BUILTIN_INFRA}
+        collected = dict(data.get("extra", {}))
+        for key, value in data.items():  # input order, so the result is deterministic
+            if key in BUILTIN_INFRA or key == "extra":
+                continue
+            if not isinstance(value, dict):
+                raise ValueError(f"infra.{key}: must be a mapping")
+            collected[key] = value
+        return {**kept, "extra": collected} if collected else kept
 
     def configured(self) -> list[str]:
-        return [name for name in type(self).model_fields if getattr(self, name) is not None]
+        """Built-in sections that are set, then the extra keys, sorted."""
+        builtin = [name for name in BUILTIN_INFRA if getattr(self, name) is not None]
+        return [*builtin, *sorted(self.extra)]
+
+
+# The built-in sections, in field order: every other infra key is a plugin's.
+BUILTIN_INFRA = tuple(name for name in Shared.model_fields if name != "extra")
 
 
 class Config(Strict):

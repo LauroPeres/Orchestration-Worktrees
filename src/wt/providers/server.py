@@ -1,12 +1,14 @@
 """Start a shared server (one compose project) used by several branches (docs/SPEC.md §14, §18)."""
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from wt import compose, proc
+from wt.errors import WtError
 from wt.state import atomic_write
 
 MIN_READY_SECONDS = 1.0  # a readiness probe always gets one real try
@@ -70,3 +72,32 @@ def up(name: str, folder: Path, doc: dict[str, Any], timeout: int) -> float:
     for container, host_ports in expected_ports(name, doc).items():
         compose.ensure_published(container, host_ports, recreate)
     return left()
+
+
+def wait_until(
+    is_ready: Callable[[], bool],
+    timeout: float,
+    total: float | None,
+    failure: Callable[[float], str],
+) -> None:
+    """Poll `is_ready` every second for `timeout` seconds, then raise `WtError(failure(waited))`.
+
+    `total` is the provider's whole deadline when part of it went to `up`; the message names
+    that, not the leftover this loop was given, so the user reads the budget they know.
+    """
+    deadline = time.monotonic() + timeout
+    while not is_ready():
+        if time.monotonic() >= deadline:
+            raise WtError(failure(total or timeout))
+        time.sleep(1)
+
+
+def start(
+    name: str,
+    folder: Path,
+    doc: dict[str, Any],
+    timeout: int,
+    wait_ready: Callable[[float, float], None],
+) -> None:
+    """`up`, then the provider's readiness wait with what is left of the one `timeout` deadline."""
+    wait_ready(up(name, folder, doc, timeout), timeout)

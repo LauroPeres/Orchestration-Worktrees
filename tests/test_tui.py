@@ -5,16 +5,18 @@ from types import SimpleNamespace
 from typing import Any
 
 from rich.style import Style
-from textual.widgets import DataTable, Label, SelectionList, Static
+from textual.widgets import DataTable, Label, Log, SelectionList, Static
 
 from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
+from wt.naming import Names
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 from wt.tui import (
     CONFIRM_DOWN,
     ConfigureScreen,
     ConfirmScreen,
     InputScreen,
+    LogScreen,
     ProjectEntry,
     WtApp,
     status_style,
@@ -60,6 +62,13 @@ class FakeOrch:
             Choice("db", "api", False),
         ]
         self.choices_error: Exception | None = None
+        self.logs_dir = Path("logs-not-set")
+
+    def names(self, branch: str) -> Names:
+        return Names(self.cfg.project, branch, f"{self.cfg.project}.localhost")
+
+    def log_path(self, names: Names, service: str) -> Path:
+        return self.logs_dir / names.slug / f"{service}.log"
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         self.ls_count += 1
@@ -873,8 +882,8 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
                 "green", None, None,
             ]  # healthy, starting, stopped  # fmt: skip
             actions: Any = app.screen.query_one("#actions", Static).render()
-            assert actions.plain == "c: configure  esc: back  q: quit"
-            assert green_keys(actions) == ["c", "esc", "q"]
+            assert actions.plain == "c: configure  l: logs  esc: back  q: quit"
+            assert green_keys(actions) == ["c", "l", "esc", "q"]
             await pilot.press("escape")
             await settle(pilot)
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
@@ -939,6 +948,109 @@ def test_services_in_all_projects_uses_selected_project() -> None:
             await pilot.press("down", "enter")  # notes/main, shop/feat-a, ...
             await settle(pilot)
             assert shop.service_calls == ["feat-a"] and notes.service_calls == []
+
+    asyncio.run(scenario())
+
+
+def log_orch(tmp_path: Path) -> FakeOrch:
+    """An orchestrator whose services view lists repo `web` (service `front`) of `feat-a`."""
+    orch = FakeOrch()
+    orch.logs_dir = tmp_path
+    orch.service_rows = [RepoRow("web", "healthy", 10001, None)]
+    return orch
+
+
+def write_log(orch: FakeOrch, text: str, branch: str = "feat-a") -> Path:
+    path = orch.log_path(orch.names(branch), "front")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def log_lines(app: WtApp) -> list[str]:
+    return list(app.screen.query_one("#log", Log).lines)
+
+
+async def open_log(pilot: Any) -> None:
+    await settle(pilot)
+    await pilot.press("enter")
+    await settle(pilot)
+    await pilot.press("l")
+    await settle(pilot)
+
+
+def test_l_opens_a_page_with_the_log_of_the_selected_service(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        orch = log_orch(tmp_path)
+        write_log(orch, "booting\nready\n")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_log(pilot)
+            assert isinstance(app.screen, LogScreen)
+            assert str(app.screen.query_one("#title", Label).render()) == "feat-a \u00b7 front"
+            hints: Any = app.screen.query_one("#hints", Static).render()
+            assert hints.plain == "esc: back"
+            assert green_keys(hints) == ["esc"]
+            assert log_lines(app) == ["booting", "ready"]
+            await pilot.press("escape")
+            await settle(pilot)
+            assert app.screen.query("#services")  # back on the services view
+
+    asyncio.run(scenario())
+
+
+def test_the_log_page_shows_the_last_200_lines_scrolled_to_the_end(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        orch = log_orch(tmp_path)
+        write_log(orch, "".join(f"line {n}\n" for n in range(1, 251)))
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_log(pilot)
+            lines = log_lines(app)
+            assert (len(lines), lines[0], lines[-1]) == (200, "line 51", "line 250")
+            log = app.screen.query_one("#log", Log)
+            assert log.scroll_y == log.max_scroll_y
+
+    asyncio.run(scenario())
+
+
+def test_the_log_page_says_so_when_there_is_no_log_yet(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        app = WtApp(log_orch(tmp_path))
+        async with app.run_test() as pilot:
+            await open_log(pilot)
+            assert log_lines(app) == ["no log yet"]
+
+    asyncio.run(scenario())
+
+
+def test_the_log_page_follows_the_file_every_second(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        orch = log_orch(tmp_path)
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_log(pilot)
+            assert log_lines(app) == ["no log yet"]
+            path = write_log(orch, "first\n")
+            await pilot.pause(1.3)
+            assert log_lines(app) == ["first"]
+            with path.open("a") as handle:
+                handle.write("second\n")
+            await pilot.pause(1.3)
+            assert log_lines(app) == ["first", "second"]
+
+    asyncio.run(scenario())
+
+
+def test_the_table_keys_do_nothing_on_the_log_page(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        orch = log_orch(tmp_path)
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_log(pilot)
+            await pilot.press("u", "x", "r")
+            await settle(pilot)
+            assert orch.calls == [] and isinstance(app.screen, LogScreen)
 
     asyncio.run(scenario())
 

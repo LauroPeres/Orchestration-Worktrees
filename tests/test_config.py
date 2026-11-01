@@ -6,7 +6,7 @@ import yaml
 
 from tests.conftest import write_global_catalog
 from wt.catalog import load_project
-from wt.config import Config, LoadedConfig
+from wt.config import Config, LoadedConfig, Shared
 from wt.errors import WtError
 
 SHARED = {"postgres": {"databases": ["shop"]}, "kafka": {"groups": ["orders"]}}
@@ -228,3 +228,62 @@ def test_setup_flows_into_the_resolved_service(tmp_path: Path) -> None:
 def test_setup_timeout_lower_bound(tmp_path: Path) -> None:
     web = load(tmp_path, with_run_service(setup="x", setup_timeout=1)).config.services["web"]
     assert web.setup_timeout == 1
+
+
+# --- plugin infra keys: everything that is not a built-in section lands in Shared.extra ---
+
+
+def test_a_plugin_key_lands_in_extra() -> None:
+    shared = Shared.model_validate({"redis": {}, "echo": {"file": "/tmp/e.log"}})
+    assert shared.extra == {"echo": {"file": "/tmp/e.log"}}
+    assert shared.redis is not None
+
+
+def test_no_plugin_key_leaves_extra_empty() -> None:
+    assert Shared.model_validate({"redis": {}}).extra == {}
+    assert Shared().extra == {}
+
+
+def test_a_plugin_key_must_be_a_mapping() -> None:
+    with pytest.raises(ValueError, match=r"infra\.echo: must be a mapping"):
+        Shared.model_validate({"echo": ["a"]})
+    with pytest.raises(ValueError, match=r"infra\.echo: must be a mapping"):
+        Shared.model_validate({"echo": None})
+
+
+def test_extra_given_explicitly_is_kept_and_merged_with_loose_keys() -> None:
+    shared = Shared.model_validate({"extra": {"a": {"x": 1}}, "b": {"y": 2}})
+    assert shared.extra == {"a": {"x": 1}, "b": {"y": 2}}
+
+
+def test_extra_must_be_a_mapping_of_mappings() -> None:
+    with pytest.raises(ValueError, match="extra"):
+        Shared.model_validate({"extra": ["a"]})
+
+
+def test_built_in_sections_keep_their_validation() -> None:
+    with pytest.raises(ValueError, match="databases"):
+        Shared.model_validate({"postgres": {"databases": "not-a-list"}})
+
+
+def test_configured_lists_built_ins_then_sorted_extra_keys() -> None:
+    shared = Shared.model_validate(
+        {"zeta": {}, "keycloak": {"realm": "r", "client": "c"}, "alpha": {}, "redis": {}}
+    )
+    assert shared.configured() == ["redis", "keycloak", "alpha", "zeta"]
+
+
+def test_extra_round_trips_through_model_dump() -> None:
+    shared = Shared.model_validate({"redis": {}, "echo": {"file": "f"}, "other": {}})
+    assert Shared.model_validate(shared.model_dump()) == shared
+
+
+def test_a_plugin_key_survives_load_project(tmp_path: Path) -> None:
+    cfg = load(tmp_path, with_infra({**SHARED, "echo": {"file": "/tmp/e.log"}})).config
+    assert cfg.shared.extra == {"echo": {"file": "/tmp/e.log"}}
+    assert cfg.shared.configured() == ["postgres", "kafka", "echo"]
+
+
+def test_a_non_mapping_plugin_key_is_a_load_error(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match=r"infra\.echo: must be a mapping"):
+        load(tmp_path, with_infra({"echo": "yes"}))

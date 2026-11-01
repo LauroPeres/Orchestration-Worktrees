@@ -12,8 +12,8 @@ from wt.config import Config
 from wt.errors import WtError
 from wt.naming import Names
 from wt.providers import kafka, keycloak, postgres, redis, server
-from wt.providers.base import BranchContext, Check, Resources
-from wt.state import StateStore
+from wt.providers.base import BranchContext, Check, Resources, branch_scope, recorded_names
+from wt.state import BranchState, StateStore
 
 
 class Dummy:
@@ -212,3 +212,39 @@ def test_a_server_that_runs_without_its_ports_is_recreated_once_then_reported(
         shared.start()
     starts = [c for c in compose_calls if list(c[:2]) == ["docker", "compose"]]
     assert ["--force-recreate" in c for c in starts] == [False, True]
+
+
+def test_provider_names_lists_the_registry_sorted() -> None:
+    assert providers.provider_names() == ["kafka", "keycloak", "postgres", "redis"]
+
+
+def test_provider_names_follows_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(providers.REGISTRY, "echo", lambda c, log: Dummy())
+    assert providers.provider_names() == ["echo", "kafka", "keycloak", "postgres", "redis"]
+
+
+def test_branch_scope_joins_project_and_slug_with_the_separator(isolated_home: Path) -> None:
+    names = Names("shop", "feat/cart", "shop.localhost")
+    ctx = BranchContext(names, "feat/cart", "main", StateStore("shop"))
+    assert branch_scope(ctx, ".") == "shop.feat-cart"
+    assert branch_scope(ctx, ":") == "shop:feat-cart"
+
+
+def test_recorded_names_are_empty_for_a_branch_state_never_saw(isolated_home: Path) -> None:
+    names = Names("shop", "feat/cart", "shop.localhost")
+    ctx = BranchContext(names, "feat/cart", "main", StateStore("shop"))
+    assert recorded_names(ctx, "redis") == []
+
+
+def test_recorded_names_return_only_the_asked_providers_names(isolated_home: Path) -> None:
+    names = Names("shop", "feat/cart", "shop.localhost")
+    store = StateStore("shop")
+    ctx = BranchContext(names, "feat/cart", "main", store)
+    with store.edit() as state:
+        state.branches["feat/cart"] = BranchState(
+            branch="feat/cart",
+            slug="feat-cart",
+            providers={"redis": ["shop:feat-cart:"], "kafka": ["k."]},
+        )
+    assert recorded_names(ctx, "redis") == ["shop:feat-cart:"]
+    assert recorded_names(ctx, "keycloak") == []

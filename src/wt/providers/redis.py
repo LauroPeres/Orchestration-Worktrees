@@ -2,7 +2,6 @@
 
 import os
 import re
-import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -10,10 +9,17 @@ from typing import Any
 from wt import compose, proc
 from wt.config import Config
 from wt.config import Redis as RedisConfig
-from wt.errors import WtError
 from wt.paths import env_port, instance, wt_home
 from wt.providers import server
-from wt.providers.base import BranchContext, Check, Kind, Resources, keeps_one_segment_prefix
+from wt.providers.base import (
+    BranchContext,
+    Check,
+    Kind,
+    Resources,
+    branch_scope,
+    keeps_one_segment_prefix,
+    recorded_names,
+)
 
 DEFAULT_IMAGE = "redis:7-alpine"
 DEFAULT_PORT = 56379
@@ -77,20 +83,16 @@ def cli(*args: str, check: bool = True) -> proc.Result:
 
 
 def wait_ready(timeout: float = 60.0, total: float | None = None) -> None:
-    deadline = time.monotonic() + timeout
-    while True:
-        if cli("ping", check=False).ok:
-            return
-        if time.monotonic() >= deadline:
-            raise WtError(
-                f"Redis did not become ready in {(total or timeout):.0f}s ({container()})"
-            )
-        time.sleep(1)
+    server.wait_until(
+        lambda: cli("ping", check=False).ok,
+        timeout,
+        total,
+        lambda waited: f"Redis did not become ready in {waited:.0f}s ({container()})",
+    )
 
 
 def ensure_server(timeout: int = 60) -> None:
-    left = server.up(container(), server_dir(), compose_doc(), timeout)
-    wait_ready(left, total=timeout)
+    server.start(container(), server_dir(), compose_doc(), timeout, wait_ready)
 
 
 class RedisProvider:
@@ -106,7 +108,7 @@ class RedisProvider:
         """`feat/cart` in project `shop` -> `shop:feat-cart:`; empty when `prefix: false`."""
         if self.cfg is not None and not self.cfg.prefix:
             return ""
-        return f"{ctx.names.project}:{ctx.names.slug}:"
+        return f"{branch_scope(ctx, SEPARATOR)}{SEPARATOR}"
 
     def ensure_server(self) -> None:
         ensure_server()
@@ -135,10 +137,7 @@ class RedisProvider:
         return Check(True, f"Redis answers; keys under {prefix} work")
 
     def destroy(self, ctx: BranchContext) -> None:
-        wanted: list[str] = []
-        bs = ctx.state.load().branches.get(ctx.branch)
-        if bs is not None:
-            wanted.extend(bs.providers.get(self.name, []))
+        wanted = recorded_names(ctx, self.name)
         current = self.prefix(ctx)
         if current:
             wanted.append(current)

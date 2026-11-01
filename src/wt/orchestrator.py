@@ -155,6 +155,7 @@ class Orchestrator:
     def __init__(
         self, loaded: LoadedConfig, log: Log = print, out: Callable[[str], None] | None = None
     ) -> None:
+        registry.validate_infra(loaded.config)  # an unknown or broken plugin key fails early
         self.loaded = loaded
         self.cfg = loaded.config
         self.store = StateStore(self.cfg.project)
@@ -271,6 +272,14 @@ class Orchestrator:
     def providers(self) -> list[Provider]:
         return registry.active(self.cfg, self.log)
 
+    def _note_unavailable_providers(self) -> None:
+        """Note configured providers wt cannot build; installed plugins are never among them."""
+        unregistered = [n for n in self.cfg.shared.configured() if n not in registry.REGISTRY]
+        if ignored := ", ".join(n for n in unregistered if n not in registry.provider_names()):
+            self.log(
+                f"[yellow]note:[/] shared providers ({ignored}) are not available yet; ignored"
+            )
+
     def provider_context(self, names: Names) -> BranchContext:
         pg = self.cfg.shared.postgres
         base = pg.base_branch if pg is not None else "main"
@@ -358,13 +367,7 @@ class Orchestrator:
             envs, commands, setups, ports = self._reserve(branch, names)
 
             try:
-                if ignored := ", ".join(
-                    n for n in self.cfg.shared.configured() if n not in registry.REGISTRY
-                ):
-                    self.log(
-                        f"[yellow]note:[/] shared providers ({ignored}) are not available "
-                        "yet; ignored"
-                    )
+                self._note_unavailable_providers()
 
                 with file_lock("traefik"):
                     if not router.is_running():
@@ -1167,20 +1170,37 @@ class Orchestrator:
             return
         ctx = self.provider_context(names)
         for name in list(bs.providers):
-            factory = registry.REGISTRY.get(name)
-            if factory is None:
+            provider = self._recorded_provider(branch, name)
+            if provider is None:
                 leftover = ", ".join(bs.providers[name]) or "none recorded"
                 self.log(
                     f"[yellow]warning:[/] provider {name!r} is not available; remove its "
                     f"resources by hand: {leftover}"
                 )
                 continue
-            self._destroy_provider(branch, name, factory(self.cfg, self.log), ctx)
+            self._destroy_provider(branch, name, provider, ctx)
 
             def cleared(b: BranchState, n: str = name) -> None:
                 b.providers.pop(n, None)
 
             self._record(branch, cleared)
+
+    def _recorded_provider(self, branch: str, name: str) -> Provider | None:
+        """The provider that made a recorded slice; None when nothing installed offers it.
+
+        Built-in or plugin, whether or not the catalog still configures it. A plugin that is
+        installed but cannot load is an error: its slices exist and could not be removed.
+        """
+        factory = registry.REGISTRY.get(name)
+        if factory is None:
+            plugins = registry.load_plugins()
+            if name in plugins.problems:
+                raise WtError(
+                    f"{name}: could not clean branch {branch} ({plugins.problems[name]}). "
+                    f"Fix or reinstall the plugin, then `wt down {branch}` again."
+                )
+            factory = plugins.factories.get(name)
+        return None if factory is None else factory(self.cfg, self.log)
 
     def _destroy_provider(
         self, branch: str, name: str, provider: Provider, ctx: BranchContext

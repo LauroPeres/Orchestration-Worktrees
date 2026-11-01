@@ -1,0 +1,16 @@
+[project]
+name = "wt-provider-echo"
+version = "0.1.0"
+description = "A minimal wt provider plugin: appends create/destroy events to a file"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2"]
+
+[project.entry-points."wt.providers"]
+echo = "wt_provider_echo:EchoProvider"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wt_provider_echo"]

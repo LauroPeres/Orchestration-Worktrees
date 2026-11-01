@@ -9,13 +9,15 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import BaseModel, ConfigDict
 
 from wt import compose, health, host, naming, providers, router, tls
 from wt.catalog import load_project
-from wt.config import LoadedConfig
+from wt.config import Config, LoadedConfig
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator
-from wt.providers.base import BranchContext, Check, Resources
+from wt.providers.base import BranchContext, Check, Log, Provider, Resources
+from wt.providers.plugins import Plugins
 from wt.state import ProcessState
 
 GIT_ENV = {
@@ -329,6 +331,41 @@ class FakeProvider:
 
 
 SHARED = {"postgres": {"databases": ["shop"]}}
+
+
+class EchoSettings(BaseModel):
+    """The `config_model` of the fake `echo` plugin: one optional field, nothing else allowed."""
+
+    model_config = ConfigDict(extra="forbid")
+    prefix: str = "e"
+
+
+@dataclass
+class FakePluginFactory:
+    """A `wt.providers` entry point that builds `provider`; satisfies `PluginFactory`."""
+
+    provider: FakeProvider
+    config_model: type[BaseModel] = EchoSettings
+
+    def __call__(self, cfg: Config, log: Log, /) -> Provider:
+        return self.provider
+
+
+InstallPlugins = Callable[..., None]
+
+
+@pytest.fixture
+def install_plugins(monkeypatch: pytest.MonkeyPatch) -> InstallPlugins:
+    """Replaces the entry-point scan: `install(factories, problems)` is what is installed."""
+
+    def install(
+        factories: Mapping[str, FakePluginFactory] | None = None,
+        problems: Mapping[str, str] | None = None,
+    ) -> None:
+        found = Plugins(dict(factories or {}), dict(problems or {}))
+        monkeypatch.setattr(providers, "load_plugins", lambda: found)
+
+    return install
 
 
 @pytest.fixture
