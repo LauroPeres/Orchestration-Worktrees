@@ -19,6 +19,9 @@ from wt.orchestrator import BranchStatus, Orchestrator, ServiceReport
 from wt.state import BranchState, StateStore
 
 runner = CliRunner()
+NO_SERVICES_YET = (
+    "branch feat/cart has no services yet; run wt add feat/cart --uses back (services: back, front)"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -202,9 +205,7 @@ def test_up_without_a_selection_says_how_to_choose(shop) -> None:
     shop()
     result = runner.invoke(app, ["up", "feat/cart"])
     assert isinstance(result.exception, WtError)
-    assert str(result.exception) == (
-        "branch feat/cart has no services yet; run wt add feat/cart --uses a,b"
-    )
+    assert str(result.exception) == (NO_SERVICES_YET)
 
 
 def test_uses_takes_comma_separated_names_and_ignores_blanks(shop) -> None:
@@ -510,6 +511,17 @@ def _check_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str) -
     return runner.invoke(app, ["catalog", "--check"])
 
 
+def test_catalog_check_reports_every_service_whose_templates_do_not_render(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = CATALOG.replace("--port {{ port }}", "--port {{ nope }}")
+    result = _check_catalog(tmp_path, monkeypatch, text)
+    assert result.exit_code == 1, result.output
+    assert "catalog invalid: service 'front': " in result.output
+    assert "nope" in result.output
+    assert "service 'back'" not in result.output and "catalog ok" not in result.output
+
+
 def test_catalog_check_reports_a_dependency_without_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -728,9 +740,7 @@ def test_add_without_uses_off_a_terminal_prints_the_core_error(shop) -> None:
     shop()
     result = runner.invoke(app, ["add", "feat/cart"], input="1\n")  # nobody reads this
     assert isinstance(result.exception, WtError)
-    assert str(result.exception) == (
-        "branch feat/cart has no services yet; run wt add feat/cart --uses a,b"
-    )
+    assert str(result.exception) == (NO_SERVICES_YET)
     assert "Services" not in result.output
 
 
@@ -1166,7 +1176,7 @@ def test_catalog_check_needs_a_project_and_a_domain(
 BACK_URL = "https://back.feat-cart.shop.localhost"
 FRONT_URL = "https://front.feat-cart.shop.localhost"
 SERVICE_KEYS = {"name", "kind", "status", "health", "url", "port"}
-ACTION_KEYS = ["schema", "branch", "action", "status", "urls", "warnings"]
+ACTION_KEYS = ["schema", "branch", "action", "changed", "status", "urls", "warnings"]
 NO_CATALOG_COMMANDS = [
     ["ls"],
     ["catalog"],
@@ -1202,13 +1212,15 @@ def test_ls_json_of_a_running_branch(shop, docker: FakeDocker) -> None:
     services = {svc["name"]: svc for svc in branch["services"]}
     assert set(services) == {"back", "front"}  # the dependency came along
     assert all(set(svc) == SERVICE_KEYS for svc in services.values())
-    assert services["back"] == {
+    back = services["back"]
+    assert isinstance(back["port"], int)  # the host port reserved for the service
+    assert back == {
         "name": "back",
         "kind": "compose",
         "status": "up",
         "health": "ok",
         "url": BACK_URL,
-        "port": None,
+        "port": back["port"],
     }
     assert services["front"]["url"] == FRONT_URL
 
@@ -1272,6 +1284,78 @@ def test_ls_document_maps_probe_outcomes_and_sorts_branches() -> None:
     unprobed = cli.ls_document("shop", statuses, probed=False)
     healths = [s["health"] for b in unprobed["branches"] for s in b["services"]]
     assert healths == [None, None, None]
+
+
+def test_ls_document_fills_the_port_from_the_report() -> None:
+    statuses = [
+        BranchStatus(
+            "feat/a",
+            "up",
+            1,
+            2,
+            services=[
+                ServiceReport("web", "ok", "HTTP 200", None, "run", port=10001),
+                ServiceReport("api", "ok", "HTTP 200"),
+            ],
+        )
+    ]
+    [branch] = cli.ls_document("shop", statuses, probed=True)["branches"]
+    assert [(s["name"], s["port"]) for s in branch["services"]] == [("web", 10001), ("api", None)]
+
+
+def _two_projects(shop, tmp_path: Path) -> None:
+    """`shop` has a stopped branch; `gone` is in state but its catalog file is missing."""
+    shop()
+    assert runner.invoke(app, ["add", "feat/cart", "--uses", "front"]).exit_code == 0
+    _record_project("gone", tmp_path / "nope.yaml")
+
+
+def test_ls_all_json_lists_every_known_project(shop, tmp_path: Path, docker: FakeDocker) -> None:
+    _two_projects(shop, tmp_path)
+    result = runner.invoke(app, ["ls", "--all", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document) == ["schema", "projects"] and document["schema"] == 1
+    gone, shop_project = document["projects"]  # sorted by name
+    assert list(shop_project) == ["project", "branches", "error"]
+    assert shop_project["project"] == "shop" and shop_project["error"] is None
+    assert [b["branch"] for b in shop_project["branches"]] == ["feat/cart"]
+    assert gone == {
+        "project": "gone",
+        "branches": [],
+        "error": f"config not found: {tmp_path / 'nope.yaml'}",
+    }
+
+
+def test_ls_all_table_has_a_project_column_and_the_error_in_place_of_branches(
+    shop, tmp_path: Path, docker: FakeDocker
+) -> None:
+    _two_projects(shop, tmp_path)
+    result = runner.invoke(app, ["ls", "--all", "--no-probe"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split()[:3] == ["PROJECT", "BRANCH", "STATUS"]
+    assert next(line for line in lines if line.startswith("shop")).split()[:3] == [
+        "shop",
+        "feat/cart",
+        "stopped",
+    ]
+    gone_line = next(line for line in lines if line.startswith("gone"))
+    assert f"config not found: {tmp_path / 'nope.yaml'}" in gone_line
+
+
+def test_ls_all_ignores_the_catalog_and_works_without_one(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["ls", "--all"])
+    assert result.exit_code == 0, result.output
+    assert "no projects are known" in result.output
+    as_json = runner.invoke(app, ["ls", "--all", "--json"])
+    assert _document(as_json) == {"schema": 1, "projects": []}
+
+
+def test_ls_without_all_still_needs_and_shows_one_project(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["ls", "--json"])
+    assert list(_document(result)) == ["schema", "project", "branches"]
 
 
 def test_doctor_json_lists_checks_and_fails_the_exit_code(
@@ -1374,6 +1458,7 @@ def test_up_json_reports_status_urls_and_warnings(shop, docker: FakeDocker) -> N
         "up",
         "up",
     )
+    assert document["changed"] is True
     assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
     assert document["warnings"] == []
     assert docker.ups == ["wt-shop-feat-cart-api"]
@@ -1404,16 +1489,22 @@ def test_add_json(shop, docker: FakeDocker) -> None:
         "add",
         "stopped",
     )
-    assert document["urls"] == {} and document["warnings"] == []
+    assert document["changed"] is True
+    assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
+    assert document["warnings"] == []
     assert docker.ups == []
 
 
-def test_add_json_of_a_known_branch_has_no_status(shop, docker: FakeDocker) -> None:
+def test_add_json_of_a_known_branch_is_unchanged_and_reports_its_status(
+    shop, docker: FakeDocker
+) -> None:
     shop()
     runner.invoke(app, ["add", "feat/cart", "--uses", "back"])
     result = runner.invoke(app, ["add", "feat/cart", "--uses", "front", "--json"])
     assert result.exit_code == 0, result.output
-    assert _document(result)["status"] is None
+    document = _document(result)
+    assert (document["changed"], document["status"]) == (False, "stopped")
+    assert document["urls"] == {"back": BACK_URL}
     assert StateStore("shop").load().branches["feat/cart"].uses == ["back"]
 
 
@@ -1423,7 +1514,7 @@ def test_add_json_never_prompts_on_a_terminal(shop, on_a_terminal) -> None:
     assert result.exit_code == 1, result.output
     assert _document(result) == {
         "schema": 1,
-        "error": "branch feat/cart has no services yet; run wt add feat/cart --uses a,b",
+        "error": NO_SERVICES_YET,
     }
     assert "Services" not in result.stdout
     assert "feat/cart" not in StateStore("shop").load().branches
@@ -1436,8 +1527,13 @@ def test_stop_json(shop, docker: FakeDocker) -> None:
     assert result.exit_code == 0, result.output
     document = _document(result)
     assert list(document) == ACTION_KEYS
-    assert (document["action"], document["status"]) == ("stop", "stopped")
-    assert document["urls"] == {} and document["warnings"] == []
+    assert (document["action"], document["changed"], document["status"]) == (
+        "stop",
+        True,
+        "stopped",
+    )
+    assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
+    assert document["warnings"] == []
     assert docker.kept_downs == ["wt-shop-feat-cart-api"]
 
 
@@ -1453,6 +1549,7 @@ def test_down_json(shop, docker: FakeDocker) -> None:
         "down",
         None,
     )
+    assert document["changed"] is True and document["urls"] == {}
     assert docker.downs == ["wt-shop-feat-cart-api"]
 
 
@@ -1460,7 +1557,8 @@ def test_down_json_of_an_unknown_branch_still_prints_the_document(shop, docker: 
     shop()
     result = runner.invoke(app, ["down", "feat/nope", "--json"])
     assert result.exit_code == 0, result.output
-    assert _document(result)["action"] == "down"
+    document = _document(result)
+    assert (document["action"], document["changed"]) == ("down", False)
 
 
 def test_remove_json_with_yes(shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1470,7 +1568,8 @@ def test_remove_json_with_yes(shop, docker: FakeDocker, monkeypatch: pytest.Monk
     assert result.exit_code == 0, result.output
     document = _document(result)
     assert list(document) == ACTION_KEYS
-    assert (document["action"], document["status"]) == ("remove", None)
+    assert (document["action"], document["changed"], document["status"]) == ("remove", True, None)
+    assert document["urls"] == {}
     assert calls == [("feat/cart", True)]
 
 
@@ -1493,7 +1592,7 @@ def test_json_error_replaces_the_traceback_free_message(shop) -> None:
     assert result.exit_code == 1, result.output
     assert _document(result) == {
         "schema": 1,
-        "error": "branch feat/cart has no services yet; run wt add feat/cart --uses a,b",
+        "error": NO_SERVICES_YET,
     }
 
 
@@ -1527,11 +1626,22 @@ def test_without_json_progress_stays_on_stdout(shop, monkeypatch: pytest.MonkeyP
 
 
 def test_action_document_defaults() -> None:
-    assert cli.action_document("feat/x", "down", None) == {
+    assert cli.action_document("feat/x", "down") == {
         "schema": 1,
         "branch": "feat/x",
         "action": "down",
+        "changed": True,
         "status": None,
         "urls": {},
         "warnings": [],
     }
+
+
+def test_action_document_carries_the_outcome() -> None:
+    outcome = cli.ActionOutcome(
+        changed=False, status="up", urls={"front": FRONT_URL}, warnings=("careful",)
+    )
+    document = cli.action_document("feat/x", "add", outcome)
+    assert list(document) == ACTION_KEYS
+    assert (document["changed"], document["status"]) == (False, "up")
+    assert document["urls"] == {"front": FRONT_URL} and document["warnings"] == ["careful"]

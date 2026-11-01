@@ -79,3 +79,60 @@ def test_streaming_timeout_kills_grandchildren_holding_the_pipe() -> None:
     with pytest.raises(WtError):
         proc.run(["sh", "-c", "sleep 30 & sleep 30"], capture=False, timeout=1, on_line=print)
     assert time.monotonic() - start < 10
+
+
+SECRET = "postgres://user:s3cret-pw@db/app"
+PRINT_ENV_AND_ARGV = 'printf "%s\\n" "$WT_TEST_SECRET"; ps -o args= -p $$'
+
+
+def run_with_env(script: str, env: dict[str, str], *, streaming: bool) -> proc.Result:
+    if streaming:
+        return proc.run(["sh", "-c", script], env=env, capture=False, on_line=lambda _: None)
+    return proc.run(["sh", "-c", script], env=env)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_env_reaches_the_child_but_not_its_argv(streaming: bool) -> None:
+    result = run_with_env(PRINT_ENV_AND_ARGV, {"WT_TEST_SECRET": SECRET}, streaming=streaming)
+    env_line, *argv_lines = result.stdout.splitlines()
+    assert env_line == SECRET
+    assert SECRET not in "\n".join(argv_lines)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_env_is_added_to_the_inherited_environment(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    monkeypatch.setenv("WT_TEST_INHERITED", "kept")
+    result = run_with_env(
+        'echo "$WT_TEST_INHERITED $WT_TEST_NEW"', {"WT_TEST_NEW": "added"}, streaming=streaming
+    )
+    assert result.stdout.strip() == "kept added"
+
+
+def test_without_env_the_child_inherits_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake(args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    proc.run(["x"])
+    assert seen["env"] is None
+
+
+def test_timeout_raises_command_timeout() -> None:
+    with pytest.raises(proc.CommandTimeout, match=r"command timed out after 0\.2s: sleep 5"):
+        proc.run(["sleep", "5"], timeout=0.2)
+
+
+def test_streaming_timeout_raises_command_timeout() -> None:
+    with pytest.raises(proc.CommandTimeout, match=r"command timed out after 0\.3s"):
+        proc.run(
+            ["sh", "-c", "echo x; sleep 5"], capture=False, timeout=0.3, on_line=lambda _: None
+        )
+
+
+def test_command_timeout_is_a_wt_error() -> None:
+    assert issubclass(proc.CommandTimeout, WtError)

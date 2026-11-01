@@ -102,3 +102,27 @@ def test_remove_cert_deletes_files_and_ignores_missing(tmp_path: Path) -> None:
     tls.remove_cert([present, tmp_path / "missing.pem"])
     assert not present.exists()
     assert not sidecar.exists()
+
+
+def _fake_caroot(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    monkeypatch.setattr(proc, "which", lambda name: "/usr/bin/mkcert")
+    monkeypatch.setattr(proc, "run", lambda args, **kwargs: proc.Result(0, f"{root}\n", ""))
+
+
+def test_caroot_returns_the_mkcert_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _fake_caroot(monkeypatch, tmp_path)
+    assert tls.caroot() == tmp_path
+
+
+def test_caroot_is_none_without_mkcert(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proc, "which", lambda name: None)
+    assert tls.caroot() is None
+
+
+def test_ca_ready_needs_the_root_certificate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_caroot(monkeypatch, tmp_path)
+    assert tls.ca_ready() is False
+    (tmp_path / "rootCA.pem").write_text("pem")
+    assert tls.ca_ready() is True

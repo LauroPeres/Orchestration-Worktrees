@@ -56,6 +56,8 @@ class BranchState(BaseModel):
     provider_base: dict[str, str] = Field(default_factory=dict)  # provider -> base branch at create
     index: int | None = None  # worktree index, unique across projects (see allocate_index)
     uses: list[str] | None = None  # selected catalog services; None = the `uses:` of the yaml
+    # service -> sha256 hex of the rendered setup command; ran once per worktree, SPEC §22
+    setup_done: dict[str, str] = Field(default_factory=dict)
 
 
 STATE_VERSION = 1

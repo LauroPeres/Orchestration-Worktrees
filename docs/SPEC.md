@@ -163,7 +163,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
-| v0.6.1 (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
+| v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
 | v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |
@@ -999,7 +999,7 @@ ls:      {"schema":1,"project":"notes","branches":[{"branch":"feat/x","status":"
 doctor:  {"schema":1,"ok":true,"checks":[{"name":"docker","ok":true,"detail":"…","fixable":false}]}
 catalog: {"schema":1,"project":"notes","domain":"notes.localhost","services":[{"name":"back","repo":"notes-back",
           "kind":"compose","infra":["postgres"],"consumes":{"back":"API_URL"},"consumed_by":["front"],"remote":null}]}
-actions: {"schema":1,"branch":"feat/x","action":"up","status":"up","urls":{"front":"https://…"},"warnings":[]}
+actions: {"schema":1,"branch":"feat/x","action":"up","changed":true,"status":"up","urls":{"front":"https://…"},"warnings":[]}
 error:   {"schema":1,"error":"<the text the CLI prints>"}      (stdout, exit code 1)
 ```
 `health` is `ok`, `fail` or `null` (not probed). `kind` is `compose` or `run`. The TUI snapshot for agents is `wt ls --json`.
@@ -1022,7 +1022,7 @@ use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for
   `down`/`remove` delete only the worktree folders wt recorded, and the `<slug>` folder only when empty.
 - **TUI look (replaces the first wording).** A little color, a real table, one screen per action.
   - Main screen: a bordered table (one row per worktree, columns `NAME` and `STATUS`) whose column
-    names are green, the action line (`enter: services  u: up  d: down  a: add  r: remove  q: quit`) with the key
+    names are green, the action line (`enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit`, §22) with the key
     letters in green, and the message line. The selected row (main table, services table, services
     checklist) is a green bar (black text on green). The STATUS and HEALTH cells are colored by value:
     `up`, `healthy`, `ok` green; `degraded`, `creating`, `removing` yellow; `failed`, `fail`, `unhealthy`
@@ -1089,3 +1089,6 @@ one) and fill `urls` for `add`, `stop` and `up` from the branch's recorded route
   order), so a consumer never talks to a stopped dependency while shutting down.
 - **Hints name real services.** `branch <b> has no services yet; run wt add <b> --uses <service>[,<service>…]
   (services: a, b, c)` lists the catalog's service names (at most 10, then `…`).
+- **`ls --all --json`** is `{"schema":1,"projects":[{"project":"dev","branches":[…],"error":null}]}`; a project
+  that fails to load has `"branches": []` and `"error": "<text>"`. The table form adds a PROJECT column.
+- **Action documents** have the keys `schema, branch, action, changed, status, urls, warnings` in that order.

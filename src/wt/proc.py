@@ -5,7 +5,7 @@ import shutil
 import signal
 import subprocess
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +31,18 @@ class CommandError(WtError):
         super().__init__(f"command failed ({result.returncode}): {' '.join(args)}\n{tail}")
 
 
+class CommandTimeout(WtError):
+    """The command ran past its timeout and was killed."""
+
+    def __init__(self, args: Sequence[str], timeout: float | None) -> None:
+        super().__init__(f"command timed out after {timeout}s: {' '.join(args)}")
+
+
+def _child_env(env: Mapping[str, str] | None) -> dict[str, str] | None:
+    """The extra variables go through the environment, never argv, which any user can read in ps."""
+    return None if env is None else {**os.environ, **env}
+
+
 def run(  # noqa: PLR0913
     args: Sequence[str],
     *,
@@ -39,18 +51,25 @@ def run(  # noqa: PLR0913
     capture: bool = True,
     timeout: float | None = None,
     on_line: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> Result:
     """Run a command. With capture=False the output goes straight to the terminal.
+
+    `env` is added to the inherited environment for the child (secrets belong here, not in args).
 
     With capture=False and `on_line`, stdout and stderr are merged and each line is passed to
     `on_line` (without the newline) instead of the terminal; `Result.stdout` holds the output.
     """
     if on_line is not None and not capture:
-        return _run_streaming(args, cwd=cwd, check=check, timeout=timeout, on_line=on_line)
+        streamed = _run_streaming(
+            args, cwd=cwd, timeout=timeout, on_line=on_line, env=_child_env(env)
+        )
+        return _checked(args, streamed, check)
     try:
         proc = subprocess.run(
             list(args),
             cwd=cwd,
+            env=_child_env(env),
             capture_output=capture,
             encoding="utf-8",
             errors="replace",
@@ -64,10 +83,13 @@ def run(  # noqa: PLR0913
             raise WtError(f"'{args[0]}' was not found on PATH") from exc
         raise WtError(f"could not run {' '.join(args)}: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
-        raise WtError(f"command timed out after {timeout}s: {' '.join(args)}") from exc
+        raise CommandTimeout(args, timeout) from exc
     except OSError as exc:
         raise WtError(f"could not run {' '.join(args)}: {exc}") from exc
-    result = Result(proc.returncode, proc.stdout or "", proc.stderr or "")
+    return _checked(args, Result(proc.returncode, proc.stdout or "", proc.stderr or ""), check)
+
+
+def _checked(args: Sequence[str], result: Result, check: bool) -> Result:
     if check and not result.ok:
         raise CommandError(args, result)
     return result
@@ -77,14 +99,15 @@ def _run_streaming(  # noqa: C901
     args: Sequence[str],
     *,
     cwd: Path | None,
-    check: bool,
     timeout: float | None,
     on_line: Callable[[str], None],
+    env: dict[str, str] | None,
 ) -> Result:
     try:
         child = subprocess.Popen(
             list(args),
             cwd=cwd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8",
@@ -127,11 +150,8 @@ def _run_streaming(  # noqa: C901
             child.kill()
             child.wait()
     if timed_out.is_set():
-        raise WtError(f"command timed out after {timeout}s: {' '.join(args)}")
-    result = Result(child.returncode, "".join(f"{line}\n" for line in lines), "")
-    if check and not result.ok:
-        raise CommandError(args, result)
-    return result
+        raise CommandTimeout(args, timeout)
+    return Result(child.returncode, "".join(f"{line}\n" for line in lines), "")
 
 
 def which(name: str) -> str | None:

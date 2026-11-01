@@ -1,16 +1,17 @@
 """Shared Traefik (file provider) and one route file per branch."""
 
+import http.client
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from wt import compose, proc
+from wt import compose, health, proc
 from wt.errors import WtError
 from wt.naming import Names
 from wt.paths import env_port, instance, wt_home
@@ -21,6 +22,9 @@ CERTS_IN_CONTAINER = "/etc/traefik/certs"
 HOST_GATEWAY_NAME = "host.docker.internal"  # how the Traefik container reaches host processes
 ROUTE_FILE_SUFFIXES = {".yml", ".yaml"}  # what Traefik's file provider loads from our folder
 ROUTE_FILE_SEPARATOR = "--"  # between project and branch slug in a route file name
+UNROUTED_STATUS = 404  # what Traefik answers when no router matches the host
+UNROUTED_REQUEST_TIMEOUT = 1.0  # seconds per probe request
+_GONE_ERRORS = (ConnectionRefusedError, ConnectionResetError)  # Traefik itself is not answering
 _HOST_MATCHER = re.compile(r"Host\(\s*`([^`]+)`\s*\)")
 
 
@@ -291,6 +295,47 @@ def _route_file_hosts(path: Path) -> set[str]:
         if isinstance(rule, str)
         for match in _HOST_MATCHER.findall(rule)
     }
+
+
+def wait_unrouted(
+    hosts: Sequence[str],
+    timeout: float = 5.0,
+    interval: float = 0.05,
+    *,
+    fetch_status: Callable[[str, float], int] | None = None,
+) -> bool:
+    """Wait until Traefik no longer routes any of `hosts`; False if `timeout` seconds pass first.
+
+    Traefik's file provider drops a route a few ms after its file is deleted, and until then
+    requests still reach the (dead) upstream and get 502. Unrouted means HTTP 404 or a refused/reset
+    connection; any other status, or any other error, is retried. Never raises.
+    `fetch_status(host, timeout)` is a test seam; the default asks Traefik's https port.
+    """
+    if not is_running():
+        return True
+    fetch = fetch_status or _https_status
+    deadline = time.monotonic() + timeout
+    pending = list(hosts)
+    while True:
+        pending = [h for h in pending if not _is_unrouted(fetch, h)]
+        if not pending:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
+
+
+def _https_status(host: str, timeout: float) -> int:
+    return health.status(host, "/", https_port(), timeout)
+
+
+def _is_unrouted(fetch: Callable[[str, float], int], host: str) -> bool:
+    try:
+        return fetch(host, UNROUTED_REQUEST_TIMEOUT) == UNROUTED_STATUS
+    except _GONE_ERRORS:
+        return True
+    except (OSError, http.client.HTTPException):
+        return False
 
 
 def route_file_owner(path: Path) -> str:

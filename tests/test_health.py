@@ -61,3 +61,16 @@ def test_wait_healthy_returns_before_one_second_past_short_deadline(
     elapsed = time.monotonic() - start
     assert not check.ok
     assert elapsed < 1.0
+
+
+def test_status_returns_the_http_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(health._LoopbackHTTPS, "request", lambda self, *a, **k: None)
+    monkeypatch.setattr(
+        health._LoopbackHTTPS, "getresponse", lambda self: SimpleNamespace(status=404)
+    )
+    assert health.status("api.x.localhost", "/", free_port(), timeout=0.5) == 404
+
+
+def test_status_raises_when_nothing_listens() -> None:
+    with pytest.raises(ConnectionRefusedError):
+        health.status("api.x.localhost", "/", free_port(), timeout=0.5)

@@ -17,6 +17,7 @@ from wt import providers as registry
 from wt.catalog import CatalogService, load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
+from wt.messages import no_services_message
 from wt.naming import Names
 from wt.paths import project_dir
 from wt.providers.base import BranchContext, Kind, Provider
@@ -39,9 +40,11 @@ _REASON_ELLIPSIS = "..."
 _REASON_HEAD_CHARS = 50
 _REASON_TAIL_CHARS = _REASON_MAX_CHARS - _REASON_HEAD_CHARS - len(_REASON_ELLIPSIS)
 _NOT_RUNNING_STATUSES = ("stopped", "removing")
+ROUTE_WAIT_SECONDS = 5  # the default wait of router.wait_unrouted
 
 Log = Callable[[str], None]
 Outcome = Literal["ok", "fail", "skipped"]
+StopKind = Literal["process", "compose"]
 
 
 def _non_empty_lines(text: str) -> list[str]:
@@ -78,6 +81,7 @@ class ServiceReport:
     detail: str
     url: str | None = None
     kind: Literal["compose", "run"] = "compose"
+    port: int | None = None  # the host port reserved for the service; None = it has none
 
 
 @dataclass
@@ -113,6 +117,18 @@ class Step:
     name: str
     group: ComposeGroup | None = None
     service: str | None = None
+
+
+@dataclass(frozen=True)
+class SetupJob:
+    """One `setup:` command ready to run."""
+
+    service: str
+    command: str  # rendered
+    cwd: Path  # the service's repo worktree
+    env: dict[str, str]
+    log: Path
+    timeout: int  # seconds
 
 
 @dataclass(frozen=True)
@@ -174,9 +190,7 @@ class Orchestrator:
         bs = self.store.load().branches.get(branch)
         if bs is None or bs.uses is None:
             if uses is None:
-                raise WtError(
-                    f"branch {branch} has no services yet; run wt add {branch} --uses a,b"
-                )
+                raise WtError(no_services_message(branch, list(self.loaded.service_order)))
             if not uses:
                 raise WtError("choose at least one service (wt add <b> --uses a,b)")
         return self._for(branch, uses)
@@ -207,6 +221,14 @@ class Orchestrator:
 
     def service_url(self, names: Names, svc: Service) -> str | None:
         return None if svc.subdomain is None else self.url(names.host(svc.subdomain))
+
+    def urls(self, branch: str) -> dict[str, str]:
+        """Service -> https URL for the routed services of the branch's stack; {} if unknown."""
+        if self.store.load().branches.get(branch) is None:
+            return {}
+        me = self._for(branch)
+        names = me.names(branch)
+        return {n: url for n, s in me.cfg.services.items() if (url := me.service_url(names, s))}
 
     def compose_groups(self) -> list[ComposeGroup]:
         groups: dict[str, ComposeGroup] = {}
@@ -294,6 +316,9 @@ class Orchestrator:
     def log_path(self, names: Names, service: str) -> Path:
         return self.branch_dir(names) / "logs" / f"{service}.log"
 
+    def setup_log_path(self, names: Names, service: str) -> Path:
+        return self.branch_dir(names) / "logs" / f"{service}.setup.log"
+
     def _branch_lock(self, names: Names) -> Any:
         return file_lock(f"branch-{self.cfg.project}-{names.slug}")
 
@@ -325,11 +350,12 @@ class Orchestrator:
         """`up` on the orchestrator that owns the branch's selection."""
         names = self.names(branch)
         plan, deps = self.start_plan()  # a cycle fails here, before anything is created
+        self._check_repos()
         self._log_warnings()
         with self._branch_lock(names):
             self._check_worktree_targets(names)
             self._check_hosts_free(names)
-            envs, commands, ports = self._reserve(branch, names)
+            envs, commands, setups, ports = self._reserve(branch, names)
 
             try:
                 if ignored := ", ".join(
@@ -348,21 +374,7 @@ class Orchestrator:
                 worktrees = self._up_worktrees(branch, names)
                 self._up_providers(branch, names)
 
-                cert = tls.ensure_cert(names)
-                if cert is None:
-                    self.log(
-                        "[yellow]warning:[/] mkcert not found; Traefik serves its default "
-                        "self-signed certificate (see `wt doctor`)"
-                    )
-                else:
-                    if not tls.ca_ready():
-                        self.log(
-                            "[yellow]warning:[/] the mkcert CA is not trusted yet; browsers will "
-                            "warn about the certificates; run `wt doctor --fix`"
-                        )
-                    self._record(
-                        branch, lambda bs: setattr(bs, "cert_files", [str(p) for p in cert])
-                    )
+                cert = self._up_certificate(branch, names)
 
                 routes = self._start_steps(
                     branch,
@@ -371,6 +383,7 @@ class Orchestrator:
                     deps,
                     worktrees,
                     commands,
+                    setups,
                     envs,
                     ports,
                     build=build,
@@ -393,6 +406,41 @@ class Orchestrator:
             except Exception:
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
                 raise
+            except KeyboardInterrupt:
+                # What was started stays in state, so `down` stops it.
+                self._record(branch, lambda bs: setattr(bs, "status", "failed"))
+                self.log(f"interrupted: wt up {branch} again, or wt down {branch}")
+                raise
+
+    def _up_certificate(self, branch: str, names: Names) -> tuple[Path, Path] | None:
+        """The branch certificate, or None without mkcert; says when it created the local CA."""
+        mkcert = tls.available()
+        had_ca = mkcert and tls.ca_ready()
+        cert = tls.ensure_cert(names)
+        if cert is None:
+            self.log(
+                "[yellow]warning:[/] mkcert not found; Traefik serves its default "
+                "self-signed certificate (see `wt doctor`)"
+            )
+            return None
+        if tls.ca_ready():
+            if mkcert and not had_ca:
+                self.log(
+                    f"wt created a local certificate authority at {tls.caroot()}. "
+                    "Run mkcert -install once so browsers trust it."
+                )
+        else:
+            self.log(
+                "[yellow]warning:[/] the mkcert CA is not trusted yet; browsers will "
+                "warn about the certificates; run `wt doctor --fix`"
+            )
+        self._record(branch, lambda bs: setattr(bs, "cert_files", [str(p) for p in cert]))
+        return cert
+
+    def _check_repos(self) -> None:
+        """Fail `up` and `add` before Traefik or any state exists when a repo is not usable."""
+        for repo in self.cfg.repos:
+            git.check_repo(self.loaded.repo_path(repo))
 
     def _check_worktree_targets(self, names: Names) -> None:
         """Fail `up` and `add` before anything is created when a target folder is not ours.
@@ -432,8 +480,10 @@ class Orchestrator:
 
     def _reserve(
         self, branch: str, names: Names
-    ) -> tuple[dict[str, dict[str, str]], dict[str, str], dict[str, int]]:
-        """Pre-flight for `up` and `add`; the caller holds the branch lock.
+    ) -> tuple[dict[str, dict[str, str]], dict[str, str], dict[str, str], dict[str, int]]:
+        """Pre-flight for `up` and `add`: (envs, run commands, setup commands, ports).
+
+        The caller holds the branch lock.
 
         Ports are picked, templates rendered (a typo fails here, before anything is created)
         and the ports recorded under one lock, so two callers never pick the same one.
@@ -442,9 +492,9 @@ class Orchestrator:
             index = allocate_index(self.cfg.project, branch)
             try:
                 ports = self._resolve_ports(branch, index)
-                envs, commands = self._render(
-                    names, {n: p for n, p in ports.items() if self.cfg.services[n].run is not None}
-                )
+                run_ports = {n: p for n, p in ports.items() if self.cfg.services[n].run is not None}
+                envs, commands = self._render(names, run_ports)
+                setups = self._render_setups(names, run_ports)
                 for provider in self.providers():
                     provider.preflight(self.provider_context(names))
                 with self.store.edit() as state:
@@ -469,7 +519,7 @@ class Orchestrator:
                 if branch not in self.store.load().branches:
                     release_index(self.cfg.project, branch)
                 raise
-        return envs, commands, ports
+        return envs, commands, setups, ports
 
     def add(self, branch: str, uses: list[str] | None = None) -> bool:
         """Worktrees and reserved ports only, status `stopped`. False when already known."""
@@ -480,6 +530,7 @@ class Orchestrator:
         """`add` on the orchestrator that owns the branch's selection."""
         names = self.names(branch)
         self.start_plan()  # a cycle fails here, before anything is created
+        self._check_repos()
         self._log_warnings()
         with self._branch_lock(names):
             if branch in self.store.load().branches:
@@ -515,19 +566,71 @@ class Orchestrator:
     def _stop_services(
         self, branch: str, names: Names, bs: BranchState | None, *, volumes: bool
     ) -> None:
-        """Processes, containers and routes. `volumes=False` (stop) keeps the compose volumes."""
-        self._down_processes(branch, bs)
+        """Routes, processes, containers. `volumes=False` (stop) keeps the compose volumes.
+
+        The routes go first, so a request right after gets a 404 and not a 502 from a half-stopped
+        backend. Then consumers before what they need (SPEC §22).
+        """
+        self._remove_routes(names, bs)
+        processes = dict(bs.processes) if bs else {}
+        for kind, target in self._stop_order(names, bs):
+            if kind == "process":
+                self._stop_process(branch, target, processes[target])
+                continue
+            self.log(f"compose down [bold]{target}[/]")
+            if volumes:
+                compose.down(target)
+            else:
+                compose.down_keep_volumes(target)
+
+    def _remove_routes(self, names: Names, bs: BranchState | None) -> None:
+        """Delete the route files, then wait until Traefik stops answering for their hosts.
+
+        Traefik drops a route a few ms after its file is gone; stopping a backend sooner would
+        give a 502. A route that still answers after the wait never blocks teardown.
+        """
+        recorded = [Path(bs.route_file)] if bs and bs.route_file else []
+        files = list(dict.fromkeys([router.route_file(names), *recorded]))
+        hosts = sorted(h for h, path in router.hosts_in_use().items() if path in files)
+        for route in files:
+            router.remove_routes(route)
+        if hosts and not router.wait_unrouted(hosts):
+            self.log(
+                f"[yellow]note:[/] route for {', '.join(hosts)} still answered after "
+                f"{ROUTE_WAIT_SECONDS} s; stopping anyway"
+            )
+
+    def _stop_order(self, names: Names, bs: BranchState | None) -> list[tuple[StopKind, str]]:
+        """What to stop: the reverse of the start order, then what the plan does not know.
+
+        The extras are recorded processes and projects of an older stack. A plan that cannot be
+        ordered (a cycle through compose groups) must not block teardown, so it is skipped.
+        """
+        try:
+            plan, _ = self.start_plan()
+        except WtError:
+            plan = []
+        recorded = list(bs.processes) if bs else []
+        order: list[tuple[StopKind, str]] = []
+        for step in reversed(plan):
+            if step.service is not None and step.service in recorded:
+                order.append(("process", step.service))
+            elif step.group is not None:
+                order.append(("compose", names.compose_project(step.group.repo)))
         projects = {names.compose_project(g.repo) for g in self.compose_groups()}
         projects |= set(bs.compose_projects.values()) if bs else set()
-        for project in sorted(projects):
-            self.log(f"compose down [bold]{project}[/]")
-            if volumes:
-                compose.down(project)
-            else:
-                compose.down_keep_volumes(project)
-        router.remove_routes(router.route_file(names))
-        if bs and bs.route_file:
-            router.remove_routes(Path(bs.route_file))
+        order += [("process", n) for n in recorded if ("process", n) not in order]
+        order += [("compose", p) for p in sorted(projects) if ("compose", p) not in order]
+        return order
+
+    def _stop_process(self, branch: str, name: str, ps: ProcessState) -> None:
+        self.log(f"stopping process [bold]{name}[/]")
+        host.stop(ps)
+
+        def cleared(b: BranchState) -> None:
+            b.processes.pop(name, None)
+
+        self._record(branch, cleared)
 
     def _up_providers(self, branch: str, names: Names) -> None:
         ctx = self.provider_context(names)
@@ -576,6 +679,19 @@ class Orchestrator:
         }
         return envs, commands
 
+    def _render_setups(self, names: Names, ports: dict[str, int]) -> dict[str, str]:
+        """The `setup:` commands, rendered like `run:` (a typo fails before anything is created)."""
+        return {
+            name: render(
+                svc.setup,
+                self.template_context(names, svc, ports),
+                f"services.{name}.setup",
+                quote=True,
+            )
+            for name, svc in self.cfg.services.items()
+            if svc.setup is not None
+        }
+
     def _resolve_ports(self, branch: str, index: int) -> dict[str, int]:
         """Host ports (§17): `port: auto` run services and compose services with a `port` get
         `host_port(index, service_index)`; an explicit run port is used as is. No probing: a
@@ -616,6 +732,7 @@ class Orchestrator:
         deps: dict[str, set[str]],
         worktrees: dict[str, Path],
         commands: dict[str, str],
+        setups: dict[str, str],
         envs: dict[str, dict[str, str]],
         ports: dict[str, int],
         *,
@@ -632,6 +749,9 @@ class Orchestrator:
                 )
             elif step.service is not None:
                 name = step.service
+                if name in setups:
+                    job = self._setup_job(names, name, setups[name], worktrees, envs)
+                    self._run_setup(branch, job)
                 routes += self._up_run_service(
                     branch, names, name, commands[name], worktrees, envs, ports
                 )
@@ -641,6 +761,31 @@ class Orchestrator:
                     if report.outcome != "ok":
                         raise WtError(f"service {name!r} is not healthy: {report.detail}")
         return routes
+
+    def _setup_job(
+        self,
+        names: Names,
+        name: str,
+        command: str,
+        worktrees: dict[str, Path],
+        envs: dict[str, dict[str, str]],
+    ) -> SetupJob:
+        svc = self.cfg.services[name]
+        log = self.setup_log_path(names, name)
+        return SetupJob(name, command, worktrees[svc.repo], envs[name], log, svc.setup_timeout)
+
+    def _run_setup(self, branch: str, job: SetupJob) -> None:
+        """Run a service's `setup:` unless this exact command already succeeded (SPEC §22)."""
+        digest = hashlib.sha256(job.command.encode()).hexdigest()
+        if self.store.load().branches[branch].setup_done.get(job.service) == digest:
+            return
+        self.log(f"setup [bold]{job.service}[/]")
+        _execute_setup(job)
+
+        def done(bs: BranchState) -> None:
+            bs.setup_done[job.service] = digest
+
+        self._record(branch, done)
 
     def _up_run_service(  # noqa: PLR0913
         self,
@@ -799,7 +944,8 @@ class Orchestrator:
 
     def _verify(self, branch: str, names: Names, *, timeout: float) -> list[ServiceReport]:
         self.log("verifying services")
-        processes = self.store.load().branches[branch].processes
+        recorded = self.store.load().branches[branch]
+        processes, ports = recorded.processes, recorded.ports
         containers = {
             group.repo: compose.ps(names.compose_project(group.repo))
             for group in self.compose_groups()
@@ -818,6 +964,7 @@ class Orchestrator:
                     f"GET {svc.health} -> {result.detail}",
                     url,
                     _kind(svc),
+                    ports.get(name),
                 )
             if svc.run is not None:
                 return self._check_process(name, processes.get(name), timeout)
@@ -827,7 +974,9 @@ class Orchestrator:
                 c.state == "running" and c.health != "unhealthy" for c in states
             )
             detail = ", ".join(f"{c.state}{'/' + c.health if c.health else ''}" for c in states)
-            return ServiceReport(name, "ok" if ok else "fail", detail or "no container")
+            return ServiceReport(
+                name, "ok" if ok else "fail", detail or "no container", port=ports.get(name)
+            )
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             return list(pool.map(check, self.cfg.services.items()))
@@ -836,18 +985,22 @@ class Orchestrator:
         """Unrouted host process: TCP connect when it has a port, otherwise just alive."""
         if ps is None:
             return ServiceReport(name, "fail", "not started", kind="run")
+
+        def report(outcome: Outcome, detail: str) -> ServiceReport:
+            return ServiceReport(name, outcome, detail, kind="run", port=ps.port)
+
         deadline = time.monotonic() + timeout
         while ps.port is not None:
             if not host.alive(ps):
                 break
             if host.tcp_ok(ps.port):
-                return ServiceReport(name, "ok", f"port {ps.port} accepts connections", kind="run")
+                return report("ok", f"port {ps.port} accepts connections")
             if time.monotonic() >= deadline:
-                return ServiceReport(name, "fail", f"nothing listens on port {ps.port}", kind="run")
+                return report("fail", f"nothing listens on port {ps.port}")
             time.sleep(0.2)
         if host.alive(ps):
-            return ServiceReport(name, "ok", f"running (pid {ps.pid})", kind="run")
-        return ServiceReport(name, "fail", f"exited; see {ps.log}", kind="run")
+            return report("ok", f"running (pid {ps.pid})")
+        return report("fail", f"exited; see {ps.log}")
 
     # ---- down -----------------------------------------------------------------------------
 
@@ -864,20 +1017,24 @@ class Orchestrator:
     def remove(self, branch: str, *, force: bool = False) -> bool:
         """`down`, then delete the git branch in every repo, except protected ones.
 
-        Also works after `down` (the branch is no longer in state): the branch is then looked
-        up in every repo of the project. True when state or a git branch was removed.
+        Also works after `down` (the branch is no longer in state). The branch is looked up in
+        every repo of the catalog. True when state or a git branch was removed.
         """
         if (other := self._for(branch)) is not self:
             return other.remove(branch, force=force)
         with self._branch_lock(self.names(branch)):
-            sources = self._down_locked(branch, force=force)
-            known = sources is not None
-            if sources is None:
-                sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
+            recorded = self._down_locked(branch, force=force)
+            known = recorded is not None
+            # The stack of this orchestrator knows only some repos; the branch may be in any.
+            sources = {**self._catalog_repo_paths(), **(recorded or {})}
             found, deleted = self._delete_branch_in_repos(branch, sources)
             if not known and not found:
                 self._log_nothing_to_remove(branch)
             return known or deleted > 0
+
+    def _catalog_repo_paths(self) -> dict[str, Path]:
+        """Every repo of the catalog (not only those of the selected services) -> its folder."""
+        return load_catalog(self.loaded.catalog).repos
 
     def _log_nothing_to_remove(self, branch: str) -> None:
         self.log(f"branch {branch} not found; nothing to remove")
@@ -1005,16 +1162,6 @@ class Orchestrator:
         )
         return False
 
-    def _down_processes(self, branch: str, bs: BranchState | None) -> None:
-        for name, ps in (bs.processes if bs else {}).items():
-            self.log(f"stopping process [bold]{name}[/]")
-            host.stop(ps)
-
-            def cleared(b: BranchState, n: str = name) -> None:
-                b.processes.pop(n, None)
-
-            self._record(branch, cleared)
-
     def _down_providers(self, branch: str, names: Names, bs: BranchState | None) -> None:
         if bs is None or not bs.providers:
             return
@@ -1086,14 +1233,19 @@ class Orchestrator:
                 if url is None or svc.subdomain is None:
                     continue
                 # a stopped branch has nothing listening: probing would only print noise
+                port = bs.ports.get(name)
                 if not probe or bs.status == "stopped":
-                    result.services.append(ServiceReport(name, "skipped", "", url, _kind(svc)))
+                    result.services.append(
+                        ServiceReport(name, "skipped", "", url, _kind(svc), port)
+                    )
                     continue
                 check = health.probe(
                     names.host(svc.subdomain), svc.health, router.https_port(), timeout=2.0
                 )
                 result.services.append(
-                    ServiceReport(name, "ok" if check.ok else "fail", check.detail, url, _kind(svc))
+                    ServiceReport(
+                        name, "ok" if check.ok else "fail", check.detail, url, _kind(svc), port
+                    )
                 )
             if docker_ok and result.status in ("up", "degraded"):
                 healthy = result.running >= result.total and not any(
@@ -1325,6 +1477,36 @@ def _remove_if_empty(folder: Path) -> None:
     """Never `rmtree`: a folder that holds anything is somebody's and stays."""
     if folder.is_dir() and not any(folder.iterdir()):
         folder.rmdir()
+
+
+def _execute_setup(job: SetupJob) -> None:
+    """`sh -c command` in the worktree, output to the log; a failure or timeout is a `WtError`.
+
+    The service env goes through `env=`, never argv, which any user can read in `ps`.
+    """
+    job.log.parent.mkdir(parents=True, exist_ok=True)
+    with open(job.log, "w") as handle:
+
+        def write(line: str) -> None:
+            handle.write(line + "\n")
+            handle.flush()
+
+        try:
+            proc.run(
+                ["sh", "-c", job.command],
+                cwd=job.cwd,
+                env=job.env,
+                capture=False,
+                timeout=job.timeout,
+                on_line=write,
+            )
+        except proc.CommandTimeout as exc:
+            raise WtError(
+                f"setup of {job.service} timed out after {job.timeout}s; see {job.log}"
+            ) from exc
+        except proc.CommandError as exc:
+            code = exc.result.returncode
+            raise WtError(f"setup of {job.service} failed (exit {code}); see {job.log}") from exc
 
 
 def _env_hash(env: dict[str, str]) -> str:

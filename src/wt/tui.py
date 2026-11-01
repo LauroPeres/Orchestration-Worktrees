@@ -21,6 +21,7 @@ from textual.widgets.selection_list import Selection
 
 from wt.config import Config
 from wt.errors import WtError
+from wt.messages import CONFIRM_REMOVE
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 
 REFRESH_SECONDS = 2.0
@@ -40,12 +41,12 @@ STATUS_STYLES: dict[str, Style] = {
     "unhealthy": RED,
 }
 KEY_GAP = "  "  # separates the `key: words` items of a hint line
-ACTIONS = "enter: services  u: up  d: down  a: add  r: remove  q: quit"
-CONFIRM_REMOVE = (
-    "remove {branch}: removes what wt created for it (containers, volumes, databases, "
-    "worktrees) and deletes the git branch in every repo of the project where it exists; "
-    "unpushed commits are lost. Remove? y/N"
+ACTIONS = "enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit"
+CONFIRM_DOWN = (
+    "down {branch}: stops what wt started and removes what wt created for it (containers, "
+    "volumes, databases, worktrees); the git branch is kept. Down? y/N"
 )
+FORCE_HINT = "use wt down --force"  # what a refused `down` (e.g. uncommitted changes) needs
 
 
 class OrchestratorLike(Protocol):
@@ -58,6 +59,8 @@ class OrchestratorLike(Protocol):
     def up(self, branch: str) -> object: ...
 
     def stop(self, branch: str) -> object: ...
+
+    def down(self, branch: str, *, force: bool = False) -> object: ...
 
     def add(self, branch: str, uses: list[str]) -> object: ...
 
@@ -87,6 +90,9 @@ class Row:
     status: BranchStatus | None = None
     note: str = ""
     stale: bool = False
+    error: str = (
+        ""  # the full text of the error behind `note` (the table shows only its first line)
+    )
 
     @property
     def key(self) -> str:
@@ -100,10 +106,13 @@ NO_CATALOG = "no catalog at {path}. Run wt init or wt migrate"
 ENTER_NAME = "Enter name"
 ADD_TITLE = "Add a worktree"
 REMOVE_TITLE = "Remove a worktree"
+DOWN_TITLE = "Down a worktree"
 INPUT_HINTS = "enter: confirm  esc: cancel"
 CONFIRM_HINTS = "y: yes  n: no  esc: cancel"
 # The table's keys; on a page that asks something they would stack another page on top.
-TABLE_ACTIONS = frozenset({"up_selected", "down_selected", "add_new", "remove_selected"})
+TABLE_ACTIONS = frozenset(
+    {"up_selected", "stop_selected", "down_selected", "add_new", "remove_selected"}
+)
 MARKER_CHECKED = "[x] "
 MARKER_UNCHECKED = "[ ] "
 # Textual draws a checkbox as 4 segments (left, inner, right, space) before the option text.
@@ -443,7 +452,8 @@ class WtApp(App[None]):
     CSS = """
     DataTable { height: auto; max-height: 1fr; border: solid ansi_default; }
     #actions { height: auto; }  /* wraps on a narrow terminal */
-    #message, #hints { height: 1; }
+    #hints { height: 1; }
+    #message { height: auto; }  /* an error is shown whole, wrapped */
     #title { height: 1; margin-bottom: 1; text-style: bold; }
     DataTable > .datatable--header {
         text-style: none; background: ansi_default; color: ansi_green;
@@ -466,7 +476,8 @@ class WtApp(App[None]):
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("u", "up_selected", "Up", show=False),
-        Binding("d", "down_selected", "Down", show=False),
+        Binding("d", "stop_selected", "Stop", show=False),
+        Binding("x", "down_selected", "Down", show=False),
         Binding("a", "add_new", "Add", show=False),
         Binding("r", "remove_selected", "Remove", show=False),
         Binding("q", "quit", "Quit", show=False),
@@ -495,6 +506,8 @@ class WtApp(App[None]):
         self._loading = False
         self._busy = False
         self._empty_hinted = False
+        self._reload_pending = False  # an action finished while a load was running
+        self._announced: str | None = None  # key of the failed-project row whose error is shown
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="table", cursor_type="row")
@@ -580,11 +593,27 @@ class WtApp(App[None]):
             branch = row.status.branch
             self.start(f"up {branch}", lambda: self._orch_for(row.project).up(branch))
 
-    def action_down_selected(self) -> None:
+    def action_stop_selected(self) -> None:
         row = self._selected_worktree()
         if row is not None and row.status is not None and self.guard():
             branch = row.status.branch
-            self.start(f"down {branch}", lambda: self._orch_for(row.project).stop(branch))
+            self.start(f"stop {branch}", lambda: self._orch_for(row.project).stop(branch))
+
+    def action_down_selected(self) -> None:
+        row = self._selected_worktree()
+        if row is None or row.status is None or not self.guard():
+            return
+        branch = row.status.branch
+
+        def confirmed(yes: bool | None) -> None:
+            if yes and self.guard():
+                self.start(
+                    f"down {branch}",
+                    lambda: self._orch_for(row.project).down(branch, force=False),
+                    error_hint=FORCE_HINT,
+                )
+
+        self.push_screen(ConfirmScreen(DOWN_TITLE, CONFIRM_DOWN.format(branch=branch)), confirmed)
 
     def _usable_projects(self) -> list[str]:
         return [name for name, e in self._entries.items() if e.orch is not None]
@@ -658,17 +687,20 @@ class WtApp(App[None]):
         question = CONFIRM_REMOVE.format(branch=branch)
         self.push_screen(ConfirmScreen(REMOVE_TITLE, question), confirmed)
 
-    def start(self, label: str, call: Callable[[], object]) -> None:
+    def start(self, label: str, call: Callable[[], object], error_hint: str = "") -> None:
+        """Run `call` in a worker. `error_hint` is appended to the message of a `WtError`."""
         self._busy = True
         self.say(label)
-        self._run_action(label, call)
+        self._run_action(label, call, error_hint)
 
     @work(thread=True, group="action", exit_on_error=False)
-    def _run_action(self, label: str, call: Callable[[], object]) -> None:
+    def _run_action(self, label: str, call: Callable[[], object], error_hint: str) -> None:
         try:
             call()
         except WtError as exc:
-            self.call_from_thread(self._action_done, str(exc))
+            self.call_from_thread(
+                self._action_done, f"{exc}; {error_hint}" if error_hint else str(exc)
+            )
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.call_from_thread(self._action_done, error_text(exc))
         else:
@@ -685,9 +717,18 @@ class WtApp(App[None]):
     # -- refresh --------------------------------------------------------------------
 
     def action_refresh(self) -> None:
-        if not self._loading:
-            self._loading = True
-            self._load_rows()
+        if self._loading:
+            # the running load may have read the state before the change that asked for this one
+            self._reload_pending = True
+            return
+        self._loading = True
+        self._load_rows()
+
+    def _load_finished(self) -> None:
+        self._loading = False
+        if self._reload_pending:
+            self._reload_pending = False
+            self.action_refresh()
 
     def _collect(self) -> list[Row]:
         if self.orch is not None:
@@ -704,7 +745,7 @@ class WtApp(App[None]):
             try:
                 statuses = sorted(entry.orch().ls(probe=True), key=lambda r: r.branch)
             except WtError as exc:
-                result.append(Row(entry.name, note=str(exc).splitlines()[0]))
+                result.append(Row(entry.name, note=str(exc).splitlines()[0], error=str(exc)))
                 continue
             # Only the worktrees wt created; the repos' own checkout (main) is not listed.
             result.extend(Row(entry.name, s) for s in statuses if not s.main_checkout)
@@ -720,9 +761,23 @@ class WtApp(App[None]):
             self.call_from_thread(self._apply_rows, rows)
 
     def _load_failed(self, message: str) -> None:
-        self._loading = False
+        self._load_finished()
         if not self._busy:
             self.say(message)
+
+    @on(DataTable.RowHighlighted, "#table")
+    def _announce_selected_error(self) -> None:
+        """Show the whole error of a project that failed to load while its row is selected."""
+        if self.screen is not self._main:
+            return
+        row = self.selected_row
+        if row is not None and row.error:
+            if self._announced != row.key:
+                self._announced = row.key
+                self.say(f"{row.project}: {row.error}")
+        elif self._announced is not None:
+            self._announced = None
+            self.say("")
 
     def _apply_rows(self, rows: list[Row]) -> None:
         try:
@@ -745,7 +800,8 @@ class WtApp(App[None]):
             keys = [r.key for r in rows]
             if previous is not None and previous.key in keys:
                 table.move_cursor(row=keys.index(previous.key))
+            self._announce_selected_error()
         except NoMatches:
             pass  # the app is closing: its widgets are gone before this late refresh arrived
         finally:
-            self._loading = False
+            self._load_finished()

@@ -8,9 +8,10 @@ from rich.style import Style
 from textual.widgets import DataTable, Label, SelectionList, Static
 
 from wt.errors import WtError
+from wt.messages import CONFIRM_REMOVE
 from wt.orchestrator import BranchStatus, Choice, RepoRow
 from wt.tui import (
-    CONFIRM_REMOVE,
+    CONFIRM_DOWN,
     ConfigureScreen,
     ConfirmScreen,
     InputScreen,
@@ -39,6 +40,7 @@ class FakeOrch:
         self.ls_count = 0
         self.error: Exception | None = None
         self.gate: threading.Event | None = None
+        self.ls_gate: threading.Event | None = None  # holds `ls` after it has read the rows
         self.service_rows: list[RepoRow] = [
             RepoRow("front", "healthy", 10001, "https://front.demo.localhost"),
             RepoRow("back", "starting", 10002, None),
@@ -61,7 +63,10 @@ class FakeOrch:
 
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         self.ls_count += 1
-        return self.rows
+        rows = self.rows
+        if self.ls_gate is not None:
+            self.ls_gate.wait(5)
+        return rows
 
     def _act(self, *call: Any) -> None:
         self.calls.append(call)
@@ -80,6 +85,10 @@ class FakeOrch:
 
     def add(self, branch: str, uses: list[str]) -> object:
         self._act("add", branch, list(uses))
+        return True
+
+    def down(self, branch: str, *, force: bool = False) -> object:
+        self._act("down", branch, force)
         return True
 
     def remove(self, branch: str, *, force: bool = False) -> object:
@@ -159,8 +168,10 @@ def test_rows_and_columns() -> None:
             assert [str(c.label) for c in table.columns.values()] == ["NAME", "STATUS"]
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
             actions: Any = app.query_one("#actions", Static).render()
-            assert actions.plain == "enter: services  u: up  d: down  a: add  r: remove  q: quit"
-            assert green_keys(actions) == ["enter", "u", "d", "a", "r", "q"]  # the words are plain
+            assert actions.plain == (
+                "enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit"
+            )
+            assert green_keys(actions) == ["enter", "u", "d", "x", "a", "r", "q"]  # words are plain
 
     asyncio.run(scenario())
 
@@ -193,7 +204,7 @@ def test_u_and_d_call_up_and_stop_of_selected() -> None:
             await pilot.press("down", "d")
             await settle(pilot)
             assert orch.calls == [("up", "feat-a"), ("stop", "main")]
-            assert message(app) == "down main: done"
+            assert message(app) == "stop main: done"
 
     asyncio.run(scenario())
 
@@ -217,7 +228,7 @@ def test_each_action_is_a_page_of_its_own_and_cancel_returns_to_the_table() -> N
             await pilot.pause()
             assert isinstance(app.screen, ConfigureScreen) and not app.screen.query("#table")
             pages = len(app.screen_stack)
-            await pilot.press("a", "r", "u", "d")  # the table's keys do nothing here
+            await pilot.press("a", "r", "u", "d", "x")  # the table's keys do nothing here
             await pilot.pause()
             assert isinstance(app.screen, ConfigureScreen) and len(app.screen_stack) == pages
             assert green_keys(app.screen.query_one("#hints", Static).render()) == [
@@ -521,6 +532,72 @@ def test_r_confirms_then_removes_with_force() -> None:
     asyncio.run(scenario())
 
 
+DOWN_QUESTION = (
+    "down feat-a: stops what wt started and removes what wt created for it (containers, "
+    "volumes, databases, worktrees); the git branch is kept. Down? y/N"
+)
+
+
+def test_x_confirms_on_its_own_page_then_downs_without_force() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table_page = app.screen
+            await pilot.press("x")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen) and app.screen is not table_page
+            assert page_title(app) == "Down a worktree" and not app.screen.query("#table")
+            assert CONFIRM_DOWN.format(branch="feat-a") == DOWN_QUESTION
+            shown = str(app.screen.query_one("#dialog Label", Label).render())
+            assert shown.replace("\n", " ") == DOWN_QUESTION
+            assert orch.calls == []  # nothing runs before the answer
+            await pilot.press("n")
+            await settle(pilot)
+            await pilot.press("x", "escape")
+            await settle(pilot)
+            await pilot.press("x", "enter")  # Enter is "no" (default N)
+            await settle(pilot)
+            assert orch.calls == [] and app.screen is table_page
+            await pilot.press("x", "y")
+            await settle(pilot)
+            assert orch.calls == [("down", "feat-a", False)]
+            assert message(app) == "down feat-a: done"
+
+    asyncio.run(scenario())
+
+
+def test_a_refused_down_shows_the_error_and_the_force_hint() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.error = WtError("feat-a has uncommitted changes in api")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("x", "y")
+            await settle(pilot)
+            assert orch.calls == [("down", "feat-a", False)]
+            assert message(app) == "feat-a has uncommitted changes in api; use wt down --force"
+            assert app.is_running
+
+    asyncio.run(scenario())
+
+
+def test_the_other_errors_do_not_get_the_force_hint() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.error = WtError("boom")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("d")  # stop
+            await settle(pilot)
+            assert message(app) == "boom"
+
+    asyncio.run(scenario())
+
+
 def screen_lines(app: WtApp) -> list[str]:
     """What the terminal shows right now, one string per screen row (after clipping)."""
     return [strip.text for strip in app.screen._compositor.render_strips()]
@@ -598,6 +675,29 @@ def test_refresh_after_action_and_on_timer() -> None:
     asyncio.run(scenario())
 
 
+def test_the_table_refreshes_when_a_worker_finishes_even_while_a_refresh_is_running() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            orch.ls_gate = threading.Event()
+            app.action_refresh()  # a refresh is now in flight and holds the old rows
+            await pilot.pause()
+            orch.rows = [status("feat-a", "stopped"), status("main", "stopped")]
+            await pilot.press("u")
+            for _ in range(100):
+                await pilot.pause()
+                if message(app) == "up feat-a: done":
+                    break
+            assert message(app) == "up feat-a: done"
+            orch.ls_gate.set()
+            await settle(pilot)
+            assert cells(app) == [["feat-a", "stopped"], ["main", "stopped"]]  # not the 2 s tick
+
+    asyncio.run(scenario())
+
+
 def test_q_quits() -> None:
     async def scenario() -> None:
         app = WtApp(FakeOrch())
@@ -629,6 +729,65 @@ def test_all_projects_names_and_add_uses_selected_project() -> None:
             await pilot.press("up", "up", "u")  # stale project row: no call
             await settle(pilot)
             assert "config not found" in message(app)
+
+    asyncio.run(scenario())
+
+
+LONG_ERROR = (
+    "invalid catalog.yaml:\nservice 'front': run mentions {{ nope }} which is not a template "
+    "variable, so wt cannot start it. Fix the template in the catalog and try again."
+)
+
+
+class BrokenOrch(FakeOrch):
+    def ls(self, *, probe: bool = True) -> list[BranchStatus]:
+        raise WtError(LONG_ERROR)
+
+
+def test_a_project_that_fails_to_load_shows_its_full_error_when_selected() -> None:
+    async def scenario() -> None:
+        shop = FakeOrch("shop")
+
+        def discover() -> list[ProjectEntry]:
+            return [
+                ProjectEntry("bad", lambda: BrokenOrch("bad"), ""),
+                ProjectEntry("shop", lambda: shop, ""),
+            ]
+
+        app = WtApp(projects=discover)
+        async with app.run_test(size=(50, 24)) as pilot:
+            await settle(pilot)
+            assert cells(app)[0] == ["bad", "invalid catalog.yaml:"]  # the row keeps the first line
+            assert message(app) == f"bad: {LONG_ERROR}"  # selected at start: the whole text
+            shown = " ".join(" ".join(screen_lines(app)).split())
+            assert "Fix the template in the catalog and try again." in shown  # wrapped, not cut
+            await pilot.press("down")
+            await pilot.pause()
+            assert message(app) == ""  # another row: the error no longer applies
+            await pilot.press("up")
+            await pilot.pause()
+            assert message(app) == f"bad: {LONG_ERROR}"
+
+    asyncio.run(scenario())
+
+
+def test_the_error_of_a_broken_project_does_not_replace_an_action_message_on_refresh() -> None:
+    async def scenario() -> None:
+        shop = FakeOrch("shop")
+        app = WtApp(
+            projects=lambda: [
+                ProjectEntry("bad", lambda: BrokenOrch("bad"), ""),
+                ProjectEntry("shop", lambda: shop, ""),
+            ]
+        )
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("down", "u")  # shop/feat-a
+            await settle(pilot)
+            assert message(app) == "up feat-a: done"
+            app.action_refresh()
+            await settle(pilot)
+            assert message(app) == "up feat-a: done"
 
     asyncio.run(scenario())
 
