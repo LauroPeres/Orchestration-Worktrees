@@ -1022,8 +1022,10 @@ use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for
 - **TUI look (replaces the first wording).** A little color, a real table, one screen per action.
   - Main screen: a bordered table (one row per worktree, columns `NAME` and `STATUS`) whose column
     names are green, the action line (`enter: services  u: up  d: down  a: add  r: remove  q: quit`) with the key
-    letters in green, and the message line. Everything else uses the terminal's own colors; the
-    selected row is reverse video. No other colors or backgrounds.
+    letters in green, and the message line. The selected row (main table, services table, services
+    checklist) is a green bar (black text on green). The STATUS and HEALTH cells are colored by value:
+    `up`, `healthy`, `ok` green; `degraded`, `creating`, `removing` yellow; `failed`, `fail`, `unhealthy`
+    red; `stopped` and the rest plain. Everything else uses the terminal's own colors.
   - Every action that needs input (full-screen pages, not overlays) clears the page and shows only that step, then returns to the
     table: `a` shows the "Enter name" input, then the services checklist (own page each); `r` shows
     the confirmation alone. `u` and `d` act on the selected row and report on the message line.
