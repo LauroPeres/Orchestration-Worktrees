@@ -733,7 +733,9 @@ class Orchestrator:
                 bs.repos[repo] = RepoState(
                     source=str(source),
                     path=str(res.path),
-                    created=res.created,
+                    # wt never claims a checkout it did not create: git reports the recorded
+                    # path (the repo's own folder) as "ours" because it is the target
+                    created=res.created and (before is None or before.created),
                     branch_created=res.branch_created or bool(before and before.branch_created),
                 )
 
@@ -941,7 +943,7 @@ class Orchestrator:
         for repo in sorted(set(self.cfg.repos) | set(bs.repos if bs else [])):
             recorded = bs.repos.get(repo) if bs else None
             if recorded is not None:
-                if recorded.created:
+                if recorded.created and self._is_removable(recorded):
                     removals.append((Path(recorded.source), Path(recorded.path)))
             elif repo in self.cfg.repos and self.worktree_target(names, repo).exists():
                 source, target = self.loaded.repo_path(repo), self.worktree_target(names, repo)
@@ -993,6 +995,16 @@ class Orchestrator:
         sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
         sources.update({r: Path(s.source) for r, s in (bs.repos if bs else {}).items()})
         return sources
+
+    def _is_removable(self, recorded: RepoState) -> bool:
+        """False when the record is the repo's own folder: git refuses it, so wt must not try."""
+        if Path(recorded.path).resolve() != Path(recorded.source).resolve():
+            return True
+        self.log(
+            f"[yellow]warning:[/] {recorded.path} is the repo's main checkout; "
+            "left in place, wt does not remove it"
+        )
+        return False
 
     def _down_processes(self, branch: str, bs: BranchState | None) -> None:
         for name, ps in (bs.processes if bs else {}).items():

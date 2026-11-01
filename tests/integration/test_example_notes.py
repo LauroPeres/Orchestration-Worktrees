@@ -18,6 +18,8 @@ from wt.errors import WtError
 from wt.orchestrator import Orchestrator
 from wt.providers import postgres
 
+from .isolation import reserve_free_indexes
+
 pytestmark = pytest.mark.docker
 
 USES = ["front"]  # the front consumes the back, so the back comes in too
@@ -68,6 +70,7 @@ def notes(
     instance = f"wtnotes{free_port()}"
     monkeypatch.setenv("WT_INSTANCE", instance)
     monkeypatch.setenv("WT_HOME", str(tmp_path / "wt-home"))
+    reserve_free_indexes(tmp_path / "wt-home")
     monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
     monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
     monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))

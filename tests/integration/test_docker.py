@@ -1,6 +1,7 @@
 """End to end against a real Docker daemon: `pytest -m docker`."""
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -17,6 +18,8 @@ from wt import health, naming, router
 from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
+
+from .isolation import reserve_free_indexes
 
 pytestmark = pytest.mark.docker
 
@@ -56,6 +59,7 @@ def make_stack(
         pytest.skip("docker is not available")
     instance = f"wtit{free_port()}"
     monkeypatch.setenv("WT_INSTANCE", instance)
+    reserve_free_indexes(Path(os.environ["WT_HOME"]))
     monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
     monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
     monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/local/bin")  # no mkcert: self-signed path
@@ -263,10 +267,15 @@ def test_worktrees_get_formula_ports_and_publish_on_loopback(
         up_retrying(stack, branch, monkeypatch)
 
     branches = stack.store.load().branches
-    assert [branches[b].index for b in ("main", "feat/cart")] == [0, 1]
+    first = branches["main"].index
+    assert first is not None
+    assert [branches[b].index for b in ("main", "feat/cart")] == [first, first + 1]
     main_port = branches["main"].ports["api"]
     cart_port = branches["feat/cart"].ports["api"]
-    assert (main_port, cart_port) == (naming.PORT_BASE, naming.PORT_BASE + 100)
+    assert (main_port, cart_port) == (
+        naming.host_port(first, 0),
+        naming.host_port(first + 1, 0),
+    )
 
     for port in (main_port, cart_port):
         status, body = get(f"http://127.0.0.1:{port}/")

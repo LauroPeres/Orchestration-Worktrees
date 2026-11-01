@@ -2543,6 +2543,47 @@ def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
     assert not rows["feat/cart"].main_checkout
 
 
+def test_the_repos_own_checkout_is_never_claimed_by_a_second_up(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    main_folder = o.loaded.repo_path("api")
+    removed: list[Path] = []
+    real_remove = git.remove_worktree
+
+    def spy(repo: Path, path: Path, *, force: bool) -> None:
+        removed.append(path)
+        real_remove(repo, path, force=force)
+
+    monkeypatch.setattr(git, "remove_worktree", spy)
+    o.up("main")
+    o.stop("main")
+    o.up("main")
+    assert o.store.load().branches["main"].repos["api"].created is False
+    o.down("main")
+    assert removed == []
+    assert (main_folder / ".git").exists()
+    assert (main_folder / "docker-compose.yml").exists()
+
+
+def test_down_skips_a_removal_that_points_at_the_repos_own_folder(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("main")
+    main_folder = o.loaded.repo_path("api")
+    o._record("main", lambda b: setattr(b.repos["api"], "created", True))  # a damaged record
+    removed: list[Path] = []
+    monkeypatch.setattr(git, "remove_worktree", lambda repo, path, *, force: removed.append(path))
+    logs: list[str] = []
+    o.log = logs.append
+    o.down("main")
+    assert removed == []
+    assert main_folder.exists()
+    assert any("main checkout" in m for m in logs)
+    assert "main" not in o.store.load().branches
+
+
 def test_private_port_window_stays_below_the_ephemeral_range(private_port_base: int) -> None:
     assert private_port_base >= PORT_WINDOW_FLOOR
     assert private_port_base + PORT_WINDOW <= LOWEST_EPHEMERAL_PORT

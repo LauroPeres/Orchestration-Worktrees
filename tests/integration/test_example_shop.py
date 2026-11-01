@@ -25,6 +25,8 @@ from wt.orchestrator import Orchestrator
 from wt.paths import project_dir
 from wt.providers import kafka, keycloak, postgres, redis
 
+from .isolation import reserve_free_indexes
+
 pytestmark = pytest.mark.docker
 
 USES = ["web", "worker"]  # web consumes api, so the whole stack is selected
@@ -100,6 +102,7 @@ def shop_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     instance = f"wtshop{free_port()}"
     monkeypatch.setenv("WT_INSTANCE", instance)
     monkeypatch.setenv("WT_HOME", str(tmp_path / "wt-home"))
+    reserve_free_indexes(tmp_path / "wt-home")
     monkeypatch.setenv("WT_HTTP_PORT", str(free_port()))
     monkeypatch.setenv("WT_HTTPS_PORT", str(free_port()))
     monkeypatch.setenv("WT_POSTGRES_PORT", str(free_port()))
