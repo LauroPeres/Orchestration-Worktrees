@@ -1252,3 +1252,75 @@ def test_merge_uses_style_keeps_plugin_infra_beside_the_built_ins(tmp_path: Path
     legacy = {**USES_LEGACY, "catalog": "./catalog.yaml"}
     infra = merge_legacy(None, legacy, tmp_path).catalog["services"]["back"]["infra"]
     assert infra == {"postgres": {"databases": ["notes"]}, "echo": {"file": "f"}}
+
+
+# --- Keycloak users across the services of a stack (SPEC section 25) ---
+
+ALICE = "{username: alice, password: pw-one, roles: [dev]}"
+
+
+def two_keycloak(a: str, b: str) -> str:
+    return two_infra(a, b).replace("postgres:", "keycloak:")
+
+
+def keycloak_users(a: str, b: str) -> str:
+    return two_keycloak(
+        f"{{realm: shop, client: web, users: [{a}]}}",
+        f"{{realm: shop, client: web, users: [{b}]}}",
+    )
+
+
+def test_identical_keycloak_users_are_kept_once_and_distinct_ones_are_added(
+    tmp_path: Path,
+) -> None:
+    bob = "{username: bob, password: pw-two}"
+    text = keycloak_users(f"{ALICE}, {bob}", f"{ALICE}")
+    keycloak = load_project(project_catalog(tmp_path, text), ["two"]).config.shared.keycloak
+    assert keycloak is not None
+    assert [u.username for u in keycloak.users] == ["alice", "bob"]
+    text = keycloak_users(ALICE, bob)
+    keycloak = load_project(project_catalog(tmp_path, text), ["two"]).config.shared.keycloak
+    assert keycloak is not None
+    assert [u.username for u in keycloak.users] == ["bob", "alice"]  # selection order: two, one
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "{username: alice, password: pw-OTHER, roles: [dev]}",
+        "{username: alice, password: pw-one, roles: [ops]}",
+        "{username: alice, password: pw-one, roles: [dev], email: a@x.io}",
+    ],
+)
+def test_keycloak_user_set_differently_by_two_services_conflicts_without_a_password(
+    tmp_path: Path, other: str
+) -> None:
+    path = project_catalog(tmp_path, keycloak_users(ALICE, other))
+    with pytest.raises(WtError) as caught:
+        load_project(path, ["two"])
+    assert str(caught.value) == (
+        "infra keycloak.users conflicts: user 'alice' is set differently "
+        "by services 'two' and 'one'"
+    )
+    assert "pw-" not in str(caught.value)
+
+
+def test_keycloak_users_still_merge_with_the_other_keycloak_keys(tmp_path: Path) -> None:
+    text = two_keycloak(
+        f"{{realm: shop, client: web, users: [{ALICE}]}}", "{realm: shop, client: web}"
+    )
+    keycloak = load_project(project_catalog(tmp_path, text), ["two"]).config.shared.keycloak
+    assert keycloak is not None
+    assert (keycloak.realm, [u.username for u in keycloak.users]) == ("shop", ["alice"])
+
+
+def test_render_check_ignores_keycloak_users(tmp_path: Path) -> None:
+    text = keycloak_users(ALICE, ALICE)
+    assert render_check(load_catalog(write(tmp_path, text))) == {}
+
+
+def test_catalog_rejects_duplicate_usernames_in_one_service(tmp_path: Path) -> None:
+    text = keycloak_users(f"{ALICE}, {ALICE}", ALICE)
+    with pytest.raises(WtError, match="duplicate keycloak user 'alice'") as caught:
+        load_catalog(write(tmp_path, text))
+    assert "pw-one" not in str(caught.value)

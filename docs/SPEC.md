@@ -165,9 +165,9 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
 | v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
 | v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
-| v0.7.1 | Keycloak dev users (`infra.keycloak.users`) |
+| v0.8.1 ✔ (§25) | Keycloak dev users (`infra.keycloak.users`) |
+| v0.9.0 (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
-| v0.9 | native Windows (spike first) |
 
 ## 11. Clean-room rules
 
@@ -1183,3 +1183,30 @@ less than 2 GiB free (`low disk space: <n> free; wt cache prune frees <m>`).
 
 **Benchmarks.** `examples/` gets a script that measures a cold install and a restored install of a small npm
 project with a local registry mirror/cache; README numbers come only from it, with the command.
+
+## 25. v0.8.1 Keycloak dev users, v0.9.0 Windows report
+
+Decided 2026-11-01 (plan `roadmap-to-v09`; the user asked for both as the last steps). The Keycloak users were
+planned as v0.7.1; after v0.8.0 they ship as v0.8.1.
+
+**Keycloak dev users (v0.8.1).** `infra.keycloak.users: list[{username: str, password: str, email: str | None,
+roles: list[str]}] = []` (usernames unique, `[A-Za-z0-9._-]{1,64}`, non-empty password).
+- In the shared realm, on `create`: a missing user is created with `enabled=true`, `emailVerified=true` and the
+  profile Keycloak 26 requires before a login works: `firstName` = the username, `lastName` = `wt`, and `email`
+  as configured or `<username>@wt.invalid` (found with a real server: without them the login fails with
+  `Account is not fully set up`). Its password is set to the configured value on every `up` (idempotent),
+  missing realm roles are created and assigned.
+- Users are shared by all branches of the realm and are never deleted by `down` (like the realm itself, §19).
+- Passwords are development values: they never appear in logs, errors or `--json` output (an error names the
+  user, not the password), and in no process argument on the machine, host or container: wt json-encodes
+  `{"type":"password","value":…,"temporary":false}` on the host, hands it to the container in an environment
+  variable (`docker exec -e VAR`, no value in argv) and the in-container script feeds it to
+  `kcadm.sh create users/<id>/reset-password -f -` through a shell built-in pipe (`printf`), so no process ever
+  has the password in its arguments.
+- Errors keep the form `keycloak: <reason> (kcadm.sh <verb> <resource>)`.
+- `wt catalog --check` rejects duplicate usernames and an empty password.
+
+**Windows (v0.9.0).** A CI job `windows` (windows-latest, Python 3.12) runs the unit tests with
+`continue-on-error: true`; it never blocks a merge. `docs/windows.md` lists, per area (paths and symlinks, file
+locks, host processes and signals, mkcert trust, Traefik mounts, `bash -c` scripts, git worktrees), what fails
+with the first error line from that job. The README says Windows is not supported and to use WSL2.

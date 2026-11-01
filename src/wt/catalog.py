@@ -17,6 +17,7 @@ from wt.config import (
     NAME,
     PROJECT,
     Config,
+    KeycloakUser,
     LoadedConfig,
     Service,
     Shared,
@@ -252,13 +253,39 @@ def _infra_settings(infra: Shared, provider: str) -> dict[str, Any]:
     return {key: getattr(conf, key) for key in sorted(conf.model_fields_set)}
 
 
+def _merge_users(
+    target: dict[str, Any], users: list[KeycloakUser], name: str, owner: dict[str, str]
+) -> None:
+    """Union the Keycloak users by username; the same user set twice must be identical.
+
+    The error names the user and the two services, never a password.
+    """
+    merged: list[KeycloakUser] = target.setdefault("users", [])
+    by_username = {user.username: user for user in merged}
+    for user in users:
+        known = by_username.get(user.username)
+        if known is None:
+            merged.append(user)
+            by_username[user.username] = user
+            owner[user.username] = name
+        elif known != user:
+            raise WtError(
+                f"infra keycloak.users conflicts: user {user.username!r} is set differently "
+                f"by services {owner[user.username]!r} and {name!r}"
+            )
+
+
 def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     owner: dict[tuple[str, str], str] = {}
+    user_owner: dict[str, str] = {}
     for name, svc in services.items():
         for provider in svc.infra.configured():
             target = merged.setdefault(provider, {})
             for key, value in _infra_settings(svc.infra, provider).items():
+                if provider == "keycloak" and key == "users":
+                    _merge_users(target, value, name, user_owner)
+                    continue
                 if isinstance(value, list):
                     target[key] = [
                         *target.get(key, []),

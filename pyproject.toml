@@ -1,6 +1,6 @@
 [project]
 name = "orchestration-worktrees"
-version = "0.8.0"
+version = "0.8.1"
 description = "Run an isolated copy of your dev stack for every git branch, side by side."
 readme = "README.md"
 license = "MIT"

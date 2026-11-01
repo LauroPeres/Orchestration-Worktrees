@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.8.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.8.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -336,6 +336,24 @@ mode, data in the `wt-keycloak-data` volume, published on `127.0.0.1:58080`).
 - Overrides: `WT_KEYCLOAK_PORT` (host port, default `58080`) and `WT_KEYCLOAK_IMAGE` (default
   `quay.io/keycloak/keycloak:26.8.1`).
 
+### Dev users
+
+```yaml
+infra:
+  keycloak:
+    realm: shop
+    client: web
+    users:
+      - {username: alice, password: dev-pw, email: alice@example.test, roles: [editor]}
+      - {username: bob, password: dev-password}
+```
+
+On `up`, wt creates each missing user in the shared realm (with a first name, last name and email so
+the login works), sets the configured password every time, and creates and assigns the roles. Users
+are shared by all branches and `down` never deletes them, like the realm. The password is a
+development value: wt keeps it out of logs, errors, `--json` output and the argument list of every
+process.
+
 ## Names on the shared servers
 
 Redis, Kafka and Keycloak are shared by every project, so each per-branch name carries the project
@@ -642,7 +660,8 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from tests |
 | v0.7.0 ✔ | Provider plugins, `wt init --with`, TUI log pane, catalog edit commands |
 | v0.8.0 ✔ | Install caches for npm and uv, `wt cache ls/prune`, doctor cache check |
-| later | Keycloak dev users (v0.7.1), Windows CI job (v0.9) |
+| v0.8.1 ✔ | Keycloak dev users (`infra.keycloak.users`) |
+| later | Windows CI job and report (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
 

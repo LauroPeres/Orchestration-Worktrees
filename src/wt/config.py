@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from wt.errors import WtError
 
@@ -22,6 +22,9 @@ KEYCLOAK_NAME = r"^[A-Za-z0-9_][A-Za-z0-9._-]*$"
 # Keycloak rejects a realm of ~251+ characters (server error) and a client id of 251+
 # (`unknown_error`); 64 is far below that and plenty for a name.
 MAX_KEYCLOAK_NAME = 64
+
+# a Keycloak dev user's username and role names
+KEYCLOAK_USER_NAME = r"^[A-Za-z0-9._-]{1,64}$"
 
 DEFAULT_SETUP_TIMEOUT = 600  # seconds
 MAX_SETUP_TIMEOUT = 3600
@@ -103,9 +106,58 @@ class Redis(Strict):
     prefix: bool = True
 
 
+class KeycloakUser(Strict):
+    # No input in validation errors: a mistake in a user must not echo the password back.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    username: str = Field(pattern=KEYCLOAK_USER_NAME, description="login name of the dev user")
+    password: str = Field(
+        min_length=1,
+        repr=False,
+        description="development password, set on every `up` (never logged or printed)",
+    )
+    email: str | None = Field(None, description="email address of the user (needs an '@')")
+    roles: list[str] = Field(
+        default_factory=list, description="realm roles to create and assign to the user"
+    )
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[^@\s]+@[^@\s]+", value):
+            raise ValueError("must look like name@host")
+        return value
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, value: list[str]) -> list[str]:
+        for role in value:
+            if not re.fullmatch(KEYCLOAK_USER_NAME, role):
+                raise ValueError(f"role {role!r} must match {KEYCLOAK_USER_NAME}")
+        duplicates = sorted({role for role in value if value.count(role) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate role {duplicates[0]!r}")
+        return value
+
+
 class Keycloak(Strict):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
     realm: str = Field(pattern=KEYCLOAK_NAME, max_length=MAX_KEYCLOAK_NAME)
     client: str = Field(pattern=KEYCLOAK_NAME, max_length=MAX_KEYCLOAK_NAME)
+    users: list[KeycloakUser] = Field(
+        default_factory=list, description="dev users created in the shared realm on `up`"
+    )
+
+    @field_validator("users")
+    @classmethod
+    def _check_users(cls, value: list[KeycloakUser]) -> list[KeycloakUser]:
+        seen: set[str] = set()
+        for user in value:
+            if user.username in seen:
+                raise ValueError(f"duplicate keycloak user {user.username!r}")
+            seen.add(user.username)
+        return value
 
 
 class Shared(Strict):
