@@ -383,7 +383,7 @@ and the last 67 characters): Docker puts the cause, for example `address already
 end, while path errors such as `not a git repository: <long path>` put it at the start. `down` never continues past a failed provider step, because it
 would then delete the record and orphan the resource.
 
-**Down order.** host processes → compose (with volumes) → routes → certs → providers destroy →
+**Down order (routes first since v0.6.1, §22).** routes → host processes → compose (with volumes) → certs → providers destroy →
 worktrees. Each step skips what state says was never created. Without a state entry, a folder
 at the worktree path is removed only if git lists it as a worktree of that repo; any other folder
 is left in place with a warning, also with `--force` (D18).
