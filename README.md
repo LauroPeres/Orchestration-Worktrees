@@ -199,13 +199,13 @@ wt cache prune           # drops entries not used for 30 days (--older-than DAYS
 wt cache prune --all     # everything, including the uv and npm caches (asks first; --yes)
 ```
 
-Measured with `examples/bench-cache/bench.sh <npm-project>` (node v26.12.1, npm 12.2.1, a Vite + React
-project with 74 packages, network available, one run): the first `up` took 24.6 s with `setup_cache: npm`
-(cold `npm ci`, then stored) against 18.6 s without it; the second branch took 3.3 s restored against 3.0 s
-for a second plain `npm ci` with npm's own cache already warm. So on a small project the restore costs about
-the same as a warm npm cache; what it adds is an install that does not need the network and a lock-keyed
-copy you can inspect and prune. Larger projects or a cold npm cache are where it should pay off; that was not
-measured.
+Measured with `examples/bench-cache/bench.sh <npm-project>` (node v26.12.1, npm 12.2.1, a Vite +
+React project with 74 packages, network available, one run): the first `up` took 24.6 s with
+`setup_cache: npm` (cold `npm ci`, then stored) against 18.6 s without it; the second branch took
+3.3 s restored against 3.0 s for a second plain `npm ci` with npm's own cache already warm. So on
+a small project the restore costs about the same as a warm npm cache; what it adds is an install
+that does not need the network and a lock-keyed copy you can inspect and prune. Larger projects or
+a cold npm cache are where it should pay off; that was not measured.
 
 Pruning never breaks a worktree: they hold copies. `wt doctor` shows the cache size and warns
 when the disk holding `~/.wt` has less than 2 GiB free.
