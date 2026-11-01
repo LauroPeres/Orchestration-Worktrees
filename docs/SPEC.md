@@ -24,7 +24,7 @@ Non-goals (for now): production deploys, Kubernetes, remote/cloud environments, 
 ## 3. User experience
 
 ```bash
-wt init                    # writes a starter worktree.yaml
+wt init                    # writes a starter catalog.yaml (changed by §21)
 wt up feat/cart            # git worktree + services + routes + isolated deps
 wt ls                      # branches, URLs, status, health
 wt logs feat/cart api      # follow one service
@@ -39,7 +39,7 @@ After `wt up feat/cart`:
   `shop:feat-cart:`
 - `main` keeps running, untouched.
 
-## 4. Configuration (`worktree.yaml`)
+## 4. Configuration (`worktree.yaml`; replaced by the global `catalog.yaml` in §21)
 
 ```yaml
 project: shop
@@ -162,7 +162,10 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.4 ✔ (§18) | Kafka + Redis providers, worker in the example, README with diagram (no GIF), benchmarks |
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
-| later | shared dependency caches, plugin entry points, native Windows |
+| v0.6.0 (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
+| v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
+| v0.8 | shared dependency caches |
+| v0.9 | native Windows (spike first) |
 
 ## 11. Clean-room rules
 
@@ -919,3 +922,86 @@ leaves those keys or topics alone and logs `kept <prefix>: it could belong to pr
 by hand if it is yours`. Old consumer groups and Keycloak clients are matched by exact name and are
 always deleted.
 
+## 21. v0.6.0: one global catalog, `wt` from anywhere, JSON output
+
+Decided 2026-11-01 (approval step skipped in away mode; the user's choices are in the plan log of
+`global-catalog`). Replaces §4 (`worktree.yaml`), the `uses:`/`catalog:` keys of §15 and the project
+discovery of §16. Everything else (state, naming, ports, hosts, providers, routing) is unchanged.
+
+**One catalog = one project.**
+- **File.** The catalog is the only configuration file. Location, first match wins: `--catalog PATH`
+  (`-c`), `WT_CATALOG`, `$WT_HOME/catalog.yaml`. wt never looks in the current folder or its parents.
+  Another project uses another catalog file (`WT_CATALOG`); its state lives in `$WT_HOME/<project>/` as before.
+- **Keys.** `project` and `domain` (required; same patterns as the old `worktree.yaml`), `repos`,
+  `services` (§15, unchanged: every `Service` key plus `infra`, `consumes`, `remote`). Unknown keys are
+  an error. `catalog:`, `uses:` and `shared:` do not exist; the shared servers come from `infra`.
+  Relative `repos` paths are relative to the catalog file's folder.
+- **Missing file.** `WtError("no catalog at <path>. Run wt init, or wt migrate <worktree.yaml>")`.
+- **Removed.** `worktree.yaml`, `find_config`, `--config`, `WT_CONFIG`. A `worktree.yaml` is only read by `wt migrate`.
+
+**Anchor and selection.**
+- `load_project(path, uses=None) -> LoadedConfig` (model layer). `LoadedConfig.path` and `.catalog`
+  are the catalog file; `.uses` is always a tuple; `service_order` is the catalog order (ports, §17 D-b).
+- The orchestrator holds an **anchor** (`uses=None` means the first service in catalog order, plus its
+  closure), used only for project-level work (project, domain, names, `ls`, choices). Every branch
+  operation that creates or starts things uses the branch's own stored selection (`BranchState.uses`,
+  §17 D-a), closure through `consumes` as in §20.
+- A branch recorded before v0.6.0 without `uses` has no selection.
+
+**Creating a wt (a git branch plus its services).**
+- `wt add BRANCH [--uses a,b]` and `wt up BRANCH [--uses a,b]`. `--uses` takes catalog service names,
+  comma separated. `add` of a branch already in state is a no-op with a note: the stored selection is
+  not changed (use the TUI configure screen). `up` of a branch that is not in state with `--uses` is
+  `add` then `up`.
+- No selection (no `--uses`, branch unknown or without `uses`): `up` and `add` fail with
+  `branch <b> has no services yet; run wt add <b> --uses a,b`. On a terminal, `add` without `--uses`
+  instead asks for the services as a numbered checklist (empty answer cancels, nothing is created).
+- Empty `--uses` value: `choose at least one service (wt add <b> --uses a,b)`. Unknown name: the usual
+  `unknown service` error listing the catalog's names.
+- `ls`, `stop`, `down`, `remove`, `logs` need no selection (they use the anchor and what the state records).
+- The TUI `a` key (any folder where a catalog loads): `InputScreen("Enter name")`, then the configure
+  checklist (§20: dependencies checked and locked, title `Services for <name>`), then `add`. Esc at
+  either step cancels without side effects. No catalog: the message line says
+  `no catalog at <path>. Run wt init or wt migrate`.
+- `wt tui` opens the project of the catalog. `wt tui --all`, or no catalog, lists every project
+  known from state (§16 "outside a project"); `a` there behaves as in §16 (the project of the selected row).
+  A project whose state points to a file that is not a catalog with that `project` shows
+  `created with a worktree.yaml: run wt migrate <path>`.
+- `BranchState`/`state.json` gain nothing; `config_path` now records the catalog path.
+
+**`wt init`.** Writes a starter catalog at the catalog location (project = name of the current
+folder, one repo = the current folder as an absolute path, one compose service). It refuses to
+overwrite: `catalog already exists at <path>`.
+
+**`wt migrate PATH`.** Imports a v0.5.x `worktree.yaml` into the catalog (created when missing).
+- `project`/`domain`: set when the catalog is new; an existing catalog with another project or domain is
+  an error (`catalog is project <x>, <path> is project <y>`).
+- `repos`: made absolute against the worktree.yaml's folder.
+- `services:` style: every service is copied; the project-level `shared:` becomes `infra`: a service gets
+  the `shared` provider sections its `env`, `run` or `health` text mentions as `{{ <provider>.`; a section
+  mentioned by no service goes to the first service.
+- `uses:` style (own `catalog:` file or the default one): the services named by `uses` (and their
+  dependencies) are copied from that catalog with their repos.
+- A name that already exists in the catalog with a different definition is an error listing every such name
+  (`service 'api' differs from the catalog's`); an identical one is skipped. Running it twice changes
+  nothing. The catalog is validated before it is written (atomic write); a failure leaves it untouched.
+- Branches of that project in state that have no `uses` get `uses` = the migrated stack (all services for
+  `services:` style, the file's `uses` for `uses:` style), so they keep working.
+- Output: one line per service added or skipped, then the adopted branches.
+
+**JSON output.** `--json` on `ls`, `doctor`, `catalog`, `add`, `up`, `down`, `stop`, `remove` prints one
+document on stdout and nothing else (progress goes to stderr, no rich markup). Keys are lower_snake_case,
+absent values are `null`, and every document starts with `"schema": 1`:
+```
+ls:      {"schema":1,"project":"notes","branches":[{"branch":"feat/x","status":"up","services":[
+          {"name":"back","kind":"compose","status":"up","health":"ok","url":"https://…","port":8000}]}]}
+doctor:  {"schema":1,"ok":true,"checks":[{"name":"docker","ok":true,"detail":"…","fixable":false}]}
+catalog: {"schema":1,"project":"notes","domain":"notes.localhost","services":[{"name":"back","repo":"notes-back",
+          "kind":"compose","infra":["postgres"],"consumes":{"back":"API_URL"},"consumed_by":["front"],"remote":null}]}
+actions: {"schema":1,"branch":"feat/x","action":"up","status":"up","urls":{"front":"https://…"},"warnings":[]}
+error:   {"schema":1,"error":"<the text the CLI prints>"}      (stdout, exit code 1)
+```
+`health` is `ok`, `fail` or `null` (not probed). `kind` is `compose` or `run`. The TUI snapshot for agents is `wt ls --json`.
+
+**Examples.** `examples/shop/bootstrap.sh` and `examples/notes` produce a `catalog.yaml` (the walkthroughs
+use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for `wt migrate` demos.
