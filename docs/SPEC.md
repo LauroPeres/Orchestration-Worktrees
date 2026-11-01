@@ -525,10 +525,10 @@ final verify step. A cycle across steps (e.g. through groups) is a WtError befor
   (no pytest-asyncio, no Docker).
 
 **`worktree` command (opens the TUI from any folder).** A second console script, `worktree`
-(`wt.cli:worktree_main`, same `--config`/`WT_CONFIG` option), shares its entry with `wt tui`.
-- Inside a project (a `worktree.yaml` found from the cwd, or `--config`): the TUI of that project,
+(`wt.cli:worktree_main`, same `--catalog`/`WT_CATALOG` option, changed by §21), shares its entry with `wt tui`.
+- With a catalog (§21: `--catalog`, `WT_CATALOG` or `$WT_HOME/catalog.yaml`): the TUI of that project,
   as above.
-- Outside a project: the left pane is a tree, project header then its branches. Projects come from
+- Without one, or with `--all`: the left pane is a tree, project header then its branches. Projects come from
   `$WT_HOME/<project>/state.json` (`src/wt/projects.py`), sorted by name, re-read on every refresh.
   A project with no branches, or whose state file is unreadable, is skipped. Its `config_path`
   gives its config; each project gets its own `Orchestrator`, built lazily on first use.

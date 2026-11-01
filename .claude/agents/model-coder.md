@@ -1,6 +1,6 @@
 ---
 name: model-coder
-description: Implements wt's pure model — the worktree.yaml schema (config.py), the service catalog (catalog.py), deterministic naming and ports (naming.py), sandboxed templating, paths and errors — with their tests. Use for steps that add a config key, change validation, names, ports or template rules. Haiku is fine for mechanical steps (a field with a default, a message).
+description: Implements wt's pure model — the catalog.yaml schema (catalog.py, resolved `Config` in config.py), deterministic naming and ports (naming.py), sandboxed templating, paths and errors — with their tests. Use for steps that add a config key, change validation, names, ports or template rules. Haiku is fine for mechanical steps (a field with a default, a message).
 model: sonnet
 effort: high
 tools: Read, Edit, Write, Grep, Glob, Bash
@@ -19,4 +19,4 @@ skills: [code-framework:agent-standard, code-framework:clean-code, architecture,
   The model layer imports nothing above it (import-linter). Known exception: `templating` reads
   the provider registry for the "arrives in" hint — don't extend it.
 - New config keys: on a `Strict` model (`extra="forbid"`), with a `Field(description=...)` and a
-  default that keeps existing `worktree.yaml` files valid. Behavior keys need a SPEC decision first.
+  default that keeps existing `catalog.yaml` files valid. Behavior keys need a SPEC decision first.

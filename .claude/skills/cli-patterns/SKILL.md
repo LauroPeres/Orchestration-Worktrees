@@ -16,7 +16,7 @@ def stop(
     Orchestrator(_load(ctx), log=_log).stop(branch)
     console.print(f"[green]{branch} is stopped.[/]")
 ```
-- `_load(ctx)` finds and loads `worktree.yaml` (honors `--config`); `_log` is the progress printer.
+- `_load(ctx)` loads the global catalog with `load_project` (`--catalog`, `WT_CATALOG`, `$WT_HOME/catalog.yaml`); `_log` is the progress printer.
 - The docstring is the help text: one line, says what is kept and what is removed.
 - Exactly one core call; the command only chooses what to print (tables: `_report_table`).
 - `WtError` propagates; `_run` prints it without a traceback and exits 1.
