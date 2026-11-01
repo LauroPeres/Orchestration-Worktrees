@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.8.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.9.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -30,7 +30,8 @@ one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design 
 - [mkcert](https://github.com/FiloSottile/mkcert) for trusted certificates (optional; without it
   branches get a self-signed certificate). On Debian/Ubuntu:
   `sudo apt install -y mkcert libnss3-tools`
-- macOS, Linux, or Windows through WSL2
+- macOS, Linux, or Windows through WSL2 (native Windows is not supported; see
+  [docs/windows.md](docs/windows.md) for what fails)
 
 ## Install
 
@@ -661,7 +662,8 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.7.0 ✔ | Provider plugins, `wt init --with`, TUI log pane, catalog edit commands |
 | v0.8.0 ✔ | Install caches for npm and uv, `wt cache ls/prune`, doctor cache check |
 | v0.8.1 ✔ | Keycloak dev users (`infra.keycloak.users`) |
-| later | Windows CI job and report (v0.9) |
+| v0.9.0 ✔ | Windows CI job (report only) and `docs/windows.md`; Windows stays unsupported |
+| later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
 
