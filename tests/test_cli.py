@@ -1180,7 +1180,8 @@ NO_CATALOG_COMMANDS = [
 
 def _document(result: Any) -> dict[str, Any]:
     """The one JSON document on stdout; json.loads rejects anything printed around it."""
-    return json.loads(result.stdout)
+    document: dict[str, Any] = json.loads(result.stdout)
+    return document
 
 
 def _stub_doctor(monkeypatch: pytest.MonkeyPatch, checks: list[doctor.Check]) -> None:

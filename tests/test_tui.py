@@ -121,7 +121,11 @@ ANSI_BLACK = 0
 
 
 def is_green(style: Any) -> bool:
-    return isinstance(style, Style) and style.color is not None and style.color.number == ANSI_GREEN
+    """Green in the terminal's own palette: a Rich Style (strips) or a Textual Style (Content)."""
+    if isinstance(style, Style):
+        return style.color is not None and style.color.number == ANSI_GREEN
+    foreground = getattr(style, "foreground", None)  # textual.style.Style on a Static's Content
+    return foreground is not None and getattr(foreground, "ansi", None) == ANSI_GREEN
 
 
 def is_green_bar(style: Style) -> bool:
@@ -224,7 +228,7 @@ def test_each_action_is_a_page_of_its_own_and_cancel_returns_to_the_table() -> N
             assert app.screen is table_page and app.query_one("#table", DataTable)
             await pilot.press("r")
             await pilot.pause()
-            assert isinstance(app.screen, ConfirmScreen) and app.screen is not table_page
+            assert isinstance(app.screen, ConfirmScreen) and id(app.screen) != id(table_page)
             assert page_title(app) == "Remove a worktree" and not app.screen.query("#table")
             pages = len(app.screen_stack)
             await pilot.press("a", "r")
@@ -232,7 +236,7 @@ def test_each_action_is_a_page_of_its_own_and_cancel_returns_to_the_table() -> N
             assert isinstance(app.screen, ConfirmScreen) and len(app.screen_stack) == pages
             await pilot.press("escape")
             await settle(pilot)
-            assert app.screen is table_page and orch.calls == []
+            assert id(app.screen) == id(table_page) and orch.calls == []
 
     asyncio.run(scenario())
 
