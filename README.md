@@ -345,9 +345,34 @@ The full format and rules are in [docs/SPEC.md §15](docs/SPEC.md#15-v03-impleme
 and [§21](docs/SPEC.md#21-v060-one-global-catalog-wt-from-anywhere-json-output).
 A working example is in [examples/notes](examples/notes/README.md).
 
+## Editing the catalog from the command line
+
+`wt init --with postgres,redis,kafka,keycloak` writes a starter catalog with those `infra` sections
+enabled. After that, agents and scripts can change it without opening the YAML (comments and key
+order stay, and the result is validated before it is written; every command takes `--json`):
+
+```bash
+wt catalog add-repo music-back ~/code/music-back
+wt catalog add-service api --repo music-back --run "uvicorn app:app --port {{ port }}" \
+    --port auto --subdomain api --health /docs --infra postgres:app --setup "uv sync"
+wt catalog remove-service api      # refused while another service consumes it
+wt catalog remove-repo music-back  # refused while a service uses it
+```
+
+## Writing a provider plugin
+
+Postgres, Redis, Kafka and Keycloak are built in. Another package can add an `infra` key through
+the `wt.providers` entry-point group: the entry-point name is the key, the value is a class that
+implements the `Provider` protocol (`wt/providers/base.py`) and has a pydantic `config_model` for
+the key's mapping. `examples/provider-echo/` is a complete 60-line example with a README. An
+`infra` key that is neither built in nor installed fails every command with `unknown infra 'x'
+(installed providers: …)`; a plugin that cannot be imported is reported by `wt doctor` (`plugin
+x`) and does not break commands that do not use it. A plugin cannot take a built-in name.
+
 ## Terminal UI (`wt tui`)
 
-`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit.
+`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit; in the services
+view `c` configures and `l` follows the log of a service.
 `wt tui` shows one compact table with one row per worktree of the catalog's project
 (`wt tui --all` lists every project wt knows). `a` asks "Enter name", then which catalog services
 that worktree runs. Columns: `NAME` and `STATUS`. Below the table is the action line and a message
