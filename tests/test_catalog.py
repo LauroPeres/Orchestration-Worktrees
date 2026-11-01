@@ -724,6 +724,51 @@ def test_load_project_rejects_more_than_100_services(tmp_path: Path) -> None:
         load_project(path)
 
 
+# --- the optional `worktrees` folder ---
+def test_worktrees_key_is_optional_and_loads_as_none(tmp_path: Path) -> None:
+    assert Catalog.model_validate(yaml.safe_load(GOOD)).worktrees is None
+    assert load_project(project_catalog(tmp_path)).worktrees_dir is None
+
+
+def test_worktrees_home_is_expanded_and_not_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    loaded = load_project(project_catalog(tmp_path, header=PROJECT_HEADER + "worktrees: ~/x\n"))
+    assert loaded.worktrees_dir == tmp_path / "home" / "x"
+    assert not (tmp_path / "home").exists()
+
+
+def test_worktrees_absolute_path_is_kept(tmp_path: Path) -> None:
+    folder = tmp_path / "elsewhere" / "wt"
+    header = f"{PROJECT_HEADER}worktrees: {folder}\n"
+    assert load_project(project_catalog(tmp_path, header=header)).worktrees_dir == folder
+
+
+def test_worktrees_relative_path_is_read_against_the_catalog_folder(tmp_path: Path) -> None:
+    catalog_dir = tmp_path / "conf"
+    catalog_dir.mkdir()
+    header = PROJECT_HEADER + "worktrees: ../trees/wt\n"
+    loaded = load_project(project_catalog(catalog_dir, header=header))
+    assert loaded.worktrees_dir == tmp_path / "trees" / "wt"
+    assert not (tmp_path / "trees").exists()
+
+
+@pytest.mark.parametrize("value", ['""', '"   "'])
+def test_blank_worktrees_is_an_error(tmp_path: Path, value: str) -> None:
+    path = project_catalog(tmp_path, header=f"{PROJECT_HEADER}worktrees: {value}\n")
+    with pytest.raises(WtError, match=r"invalid catalog\.yaml:\n  worktrees: must not be empty"):
+        load_project(path)
+
+
+def test_with_uses_keeps_the_worktrees_folder(tmp_path: Path) -> None:
+    header = PROJECT_HEADER + "worktrees: ./trees\n"
+    loaded = load_project(project_catalog(tmp_path, header=header), ["back"])
+    other = loaded.with_uses(["front"])
+    assert other.uses == ("front",)
+    assert other.worktrees_dir == loaded.worktrees_dir == tmp_path / "trees"
+
+
 # --- wt migrate: read_legacy and merge_legacy (pure) ---
 SHOP = """\
 project: shop
@@ -1076,3 +1121,28 @@ def test_merge_home_relative_catalog_repo_with_the_same_path_is_no_clash(
     result = merge_legacy(existing, legacy_dict(), tmp_path)
     assert result.catalog["repos"]["api"] == "~/shop-api"
     assert result.added == ()
+
+
+def test_merge_keeps_the_worktrees_key_as_written(tmp_path: Path) -> None:
+    existing = {**merge_legacy(None, legacy_dict(), tmp_path).catalog, "worktrees": "~/Code/wt"}
+    result = merge_legacy(existing, legacy_dict(), tmp_path)
+    assert result.catalog["worktrees"] == "~/Code/wt"
+    assert result.added == ()
+    assert merge_legacy(result.catalog, legacy_dict(), tmp_path).catalog == result.catalog
+
+
+def test_merge_keeps_the_worktrees_key_when_it_adds_services(tmp_path: Path) -> None:
+    existing = {**merge_legacy(None, legacy_dict(), tmp_path).catalog, "worktrees": "./trees"}
+    other = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"cron": "/srv/cron"},
+        "services": {"cron": {"repo": "cron", "run": "cron"}},
+    }
+    result = merge_legacy(existing, other, tmp_path)
+    assert result.added == ("cron",)
+    assert result.catalog["worktrees"] == "./trees"
+
+
+def test_merge_never_adds_a_worktrees_key(tmp_path: Path) -> None:
+    assert "worktrees" not in merge_legacy(None, legacy_dict(), tmp_path).catalog

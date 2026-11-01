@@ -233,3 +233,7 @@ def test_with_uses_on_a_project_catalog_errors(tmp_path: Path) -> None:
 
 def test_a_worktree_yaml_is_not_from_a_catalog(tmp_path: Path) -> None:
     assert not load_config(write(tmp_path, BASE)).from_catalog
+
+
+def test_a_worktree_yaml_has_no_worktrees_folder(tmp_path: Path) -> None:
+    assert load_config(write(tmp_path, BASE)).worktrees_dir is None

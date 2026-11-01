@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Self
 
 import yaml
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from wt.config import (
     CONFIG_NAME,
@@ -62,7 +62,18 @@ class Catalog(Strict):
         default=None, pattern=DOMAIN, description="base domain; required by load_project"
     )
     repos: dict[str, str] = Field(default_factory=dict)
+    worktrees: str | None = Field(
+        default=None,
+        description="folder for the worktrees (~ expanded, relative to this file); optional",
+    )
     services: dict[str, CatalogService] = Field(min_length=1)
+
+    @field_validator("worktrees")
+    @classmethod
+    def _worktrees_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must not be empty")
+        return value
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -153,6 +164,17 @@ def load_catalog(path: Path) -> LoadedCatalog:
         repo = Path(value).expanduser()
         repos[name] = repo if repo.is_absolute() else (path.parent / repo).resolve()
     return LoadedCatalog(catalog=catalog, path=path, repos=repos)
+
+
+def worktrees_folder(catalog: Catalog, catalog_file: Path) -> Path | None:
+    """The `worktrees` folder as wt uses it: `~` expanded, relative to the catalog's folder.
+
+    Not created and not required to exist (wt creates it with the first worktree).
+    """
+    if catalog.worktrees is None:
+        return None
+    folder = Path(catalog.worktrees.strip()).expanduser()
+    return folder if folder.is_absolute() else (catalog_file.parent / folder).resolve()
 
 
 def _merge_infra(services: dict[str, CatalogService]) -> dict[str, dict[str, Any]]:
@@ -324,13 +346,14 @@ def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
         service_order=selected.order,
         warnings=selected.warnings,
         from_catalog=True,
+        worktrees_dir=worktrees_folder(catalog, path),
     )
 
 
 # --- wt migrate: fold a v0.5.x worktree.yaml into the catalog (pure: the caller writes it) ---
 @dataclass(frozen=True)
 class MergeResult:
-    catalog: dict[str, Any]  # raw catalog, ready to dump: project, domain, repos, services
+    catalog: dict[str, Any]  # raw catalog, ready to dump: the existing keys, plus the merge
     added: tuple[str, ...]  # services the legacy file brought
     skipped: tuple[str, ...]  # services already in the catalog, identical
     uses: tuple[str, ...]  # the stack to record for the project's branches that have none
@@ -491,6 +514,7 @@ def merge_legacy(
         raise WtError(f"{legacy_name} does not fit the catalog: " + "; ".join(conflicts))
     added = tuple(name for name in incoming.services if name not in services)
     merged = {
+        **current,  # keys wt does not manage (e.g. `worktrees`) stay as written
         **identity,
         "repos": {**repos, **{n: p for n, p in incoming.repos.items() if n not in repos}},
         "services": {**services, **{name: incoming.services[name] for name in added}},

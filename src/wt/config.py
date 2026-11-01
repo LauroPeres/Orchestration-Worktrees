@@ -172,6 +172,7 @@ class LoadedConfig:
     service_order: tuple[str, ...] = ()  # catalog order (or `services:` order): the port index
     warnings: tuple[str, ...] = ()  # non-fatal notes from loading, for the caller to show
     from_catalog: bool = False  # loaded by load_project: re-resolve with it, not load_config
+    worktrees_dir: Path | None = None  # the catalog's `worktrees` folder, resolved; None = default
 
     @property
     def root(self) -> Path:
