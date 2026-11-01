@@ -164,7 +164,8 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
 | v0.6.1 ✔ (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
-| v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
+| v0.7.0 (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
+| v0.7.1 | Keycloak dev users (`infra.keycloak.users`) |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |
 
@@ -1092,3 +1093,49 @@ one) and fill `urls` for `add`, `stop` and `up` from the branch's recorded route
 - **`ls --all --json`** is `{"schema":1,"projects":[{"project":"dev","branches":[…],"error":null}]}`; a project
   that fails to load has `"branches": []` and `"error": "<text>"`. The table form adds a PROJECT column.
 - **Action documents** have the keys `schema, branch, action, changed, status, urls, warnings` in that order.
+
+## 23. v0.7.0: extensible
+
+Decided 2026-11-01 (plan `roadmap-to-v09`; approval step skipped in away mode). Everything not named here is
+unchanged.
+
+**Shared provider helpers (no behaviour change).** Redis, Kafka and Keycloak repeat one shape: one deadline
+for `compose up --wait` plus readiness (`server.up`, §14), the conversion of a failing destroy into
+`<provider>: could not clean branch <b> (<reason>). Try `wt doctor --fix`, then `wt down <b>` again.` (§18-§19),
+and project-scoped names (§20). That shape moves into one helper in `providers/base.py` (or a module the
+providers share). Error texts, names, timeouts and tests of the providers do not change; Postgres moves last
+and only if it gets simpler.
+
+**Plugin providers.** A package can add an `infra` key.
+- Entry-point group `wt.providers`; the entry-point name is the `infra` key; the value is a class or a factory
+  returning an object that implements the `Provider` protocol (`providers/base.py`) and has
+  `config_model: type[pydantic.BaseModel]` (validates the key's mapping).
+- `Shared` keeps its four built-in fields and gains `extra: dict[str, dict[str, Any]]` for every other `infra`
+  key. An `infra` key that is neither built in nor an installed plugin is
+  `unknown infra 'x' (installed providers: postgres, kafka, redis, keycloak, …)`.
+- A plugin named like a built-in is `provider 'redis' is built in`. A plugin that fails to import is
+  `WtError("provider plugin 'x' failed to load: <reason>")`: commands that do not use it keep working, and
+  `wt doctor` shows a failed `plugin x` check. Plugins are loaded lazily, once per process.
+- `create`, `verify`, `destroy`, `preflight`, `ensure_server` and `template_vars` follow §6; state records a
+  plugin's resource names like the built-ins' (`BranchState.providers`).
+- `examples/provider-echo/` is a small package (own `pyproject.toml`, entry point `echo`) whose provider appends
+  create/verify/destroy events to a file; it is installed into a throwaway venv by the e2e test.
+
+**`wt init --with a,b`.** Writes the starter catalog with the named `infra` sections uncommented on the sample
+service (defaults as in the README). Unknown names fail with the list of built-in and installed providers.
+
+**TUI log pane.** In the services view `l` opens a full-screen page that follows
+`branches/<slug>/logs/<service>.log` of the selected service: the last 200 lines, refreshed every second,
+scrolled to the end. Title `<branch> · <service>`, `esc: back`. No file yet: `no log yet`.
+
+**Catalog edit commands.** All take `--catalog` and `--json` (§21 shape: `{"schema":1,"changed":true,…}`).
+```
+wt catalog add-repo NAME PATH
+wt catalog add-service NAME --repo R (--run CMD | --compose FILE) [--port N|auto] [--subdomain S] [--health P]
+        [--env K=V]... [--consumes DEP:VAR]... [--infra postgres:db1,db2]... [--setup CMD]
+wt catalog remove-service NAME      # refused while another service consumes it
+wt catalog remove-repo NAME         # refused while a service uses it
+```
+They edit the file in place with `ruamel.yaml` (round-trip: comments and key order stay), validate the result
+with `load_project` (and each service alone, as `--check` does) **before** writing, and write atomically. An
+existing name is an error (`service 'x' already exists`). `ruamel.yaml` becomes a runtime dependency.
