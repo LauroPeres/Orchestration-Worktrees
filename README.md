@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.6.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.6.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -170,6 +170,15 @@ branch's worktree:
   listening only on loopback is unreachable. Docker Desktop (macOS, WSL2) also works with
   `127.0.0.1`, but `0.0.0.0` is the portable choice.
 - `down` stops the whole process group (SIGTERM, then SIGKILL after 10 s).
+
+## Install step per service (`setup:`)
+
+A `run:` service can declare `setup: <command>` (for example `npm ci` or `uv sync`). wt runs it
+once per worktree, in the service's repo, before `run:` starts, with the service's environment;
+its output goes to `~/.wt/<project>/branches/<name>/logs/<service>.setup.log`. It runs again only
+when the command text changes, never on a second `wt up` of the same worktree. `setup_timeout:
+<seconds>` (default 600) limits it and is separate from the `up` wait. A failure stops `up` with
+`setup of <service> failed (exit <n>); see <log>`.
 
 ## Postgres per branch (`infra.postgres`)
 
@@ -338,6 +347,7 @@ A working example is in [examples/notes](examples/notes/README.md).
 
 ## Terminal UI (`wt tui`)
 
+`wt tui` keys: `u` up, `d` stop, `x` down (asks first), `a` add, `r` remove, `q` quit.
 `wt tui` shows one compact table with one row per worktree of the catalog's project
 (`wt tui --all` lists every project wt knows). `a` asks "Enter name", then which catalog services
 that worktree runs. Columns: `NAME` and `STATUS`. Below the table is the action line and a message
@@ -574,6 +584,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.5 | Keycloak provider ✔ (shared realm, one client per branch; the shop has a Sign in link) |
 | v0.5.1 ✔ | Stabilise, dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ | One global `catalog.yaml`, `wt add/up --uses` from any folder, `wt migrate`, `--json` |
+| v0.6.1 ✔ | `setup:` step, `stop`/`down` keys, `--json` gaps, `ls --all`, fixes from hands-on tests |
 | later | plugin entry points (v0.7), shared dependency caches (v0.8), native Windows (v0.9) |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

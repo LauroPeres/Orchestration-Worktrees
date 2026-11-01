@@ -2,6 +2,7 @@ import pytest
 
 from wt.errors import WtError
 from wt.naming import (
+    MAX_LABEL,
     MAX_SLUG,
     PORT_BASE,
     PORT_STRIDE,
@@ -61,6 +62,27 @@ def test_names() -> None:
     assert n.compose_project("api") == "wt-shop-feat-cart-api"
     assert n.network_alias("api") == "wt-shop-feat-cart-api"
     assert n.router("api") == "shop--feat-cart--api"
+
+
+def test_compose_project_and_alias_use_the_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WT_INSTANCE", "wttest")
+    n = Names("shop", "feat/cart", "shop.localhost")
+    assert n.compose_project("api") == "wttest-shop-feat-cart-api"
+    assert n.network_alias("api") == "wttest-shop-feat-cart-api"
+    assert n.router("api") == "shop--feat-cart--api"  # not instance-scoped
+
+
+def test_default_instance_names_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WT_INSTANCE", raising=False)
+    n = Names("shop", "feat/cart", "shop.localhost")
+    assert n.compose_project("api") == "wt-shop-feat-cart-api"
+
+
+def test_long_instance_names_still_fit_a_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WT_INSTANCE", "i" * 30)
+    n = Names("shop", "feat/" + "x" * 60, "shop.localhost")
+    assert len(n.compose_project("api")) <= MAX_LABEL
+    assert len(n.network_alias("api")) <= MAX_LABEL
 
 
 @pytest.mark.parametrize("branch", ["feat/x", "feat-x", "Feat_X"])

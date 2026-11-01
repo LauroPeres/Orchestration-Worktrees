@@ -1,6 +1,6 @@
 [project]
 name = "orchestration-worktrees"
-version = "0.6.0"
+version = "0.6.1"
 description = "Run an isolated copy of your dev stack for every git branch, side by side."
 readme = "README.md"
 license = "MIT"
@@ -88,9 +88,6 @@ layers = [
     "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects",
     "wt.config : wt.catalog : wt.naming : wt.templating : wt.paths : wt.errors",
 ]
-# Known exception (architecture skill): the "provider arrives in vX" hint reads the provider
-# registry. Remove this line when the hint moves to core or is dropped (needs a SPEC decision).
-ignore_imports = ["wt.templating -> wt.providers"]
 
 [[tool.importlinter.contracts]]
 name = "Providers stay independent of each other (shared code goes in base or server)"

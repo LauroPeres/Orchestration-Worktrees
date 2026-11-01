@@ -309,7 +309,7 @@ def test_up_without_a_selection_fails_and_creates_nothing(
     result = wt(["up", "other"], tmp_path, shop_catalog)
 
     assert result.returncode == 1
-    assert "branch other has no services yet; run wt add other --uses a,b" in (
+    assert "branch other has no services yet; run wt add other --uses api (services: api" in (
         result.stdout + result.stderr
     )
     orch = Orchestrator(load_project(shop_catalog), log=lambda m: None)

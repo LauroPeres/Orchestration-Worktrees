@@ -149,6 +149,25 @@ def test_providers_roundtrip(isolated_home: Path) -> None:
     assert store.load().branches["b"].providers == {"postgres": ["shop__b"]}
 
 
+def test_old_state_without_setup_done_loads_empty(isolated_home: Path) -> None:
+    store = StateStore("shop")
+    _write_raw(
+        store,
+        json.dumps(
+            {"version": 1, "project": "shop", "branches": {"x": {"branch": "x", "slug": "x"}}}
+        ),
+    )
+    assert store.load().branches["x"].setup_done == {}
+
+
+def test_setup_done_roundtrip(isolated_home: Path) -> None:
+    store = StateStore("shop")
+    digest = "a" * 64
+    with store.edit() as state:
+        state.branches["b"] = BranchState(branch="b", slug="b", setup_done={"api": digest})
+    assert store.load().branches["b"].setup_done == {"api": digest}
+
+
 def test_old_state_without_index_loads(isolated_home: Path) -> None:
     store = StateStore("shop")
     _write_raw(

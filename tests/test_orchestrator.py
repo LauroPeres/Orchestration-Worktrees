@@ -3041,7 +3041,9 @@ def test_up_without_a_selection_says_how_to_choose(
 ) -> None:
     with pytest.raises(WtError) as err:
         global_orch.up("feat/x")
-    assert str(err.value) == "branch feat/x has no services yet; run wt add feat/x --uses a,b"
+    assert str(err.value) == (
+        "branch feat/x has no services yet; run wt add feat/x --uses back (services: back, front)"
+    )
     with pytest.raises(WtError, match="has no services yet"):
         global_orch.add("feat/x")
     assert global_orch.store.load().branches == {}
@@ -3409,3 +3411,616 @@ def test_down_keeps_a_slug_folder_that_holds_something_else(
     assert not (trees / "feat-x" / "web").exists()
     assert (trees / "feat-x" / "notes.txt").read_text() == "mine"
     assert o.down("feat/x") is False  # idempotent
+
+
+# ---- v0.6.1: checks first, report ports, down order, remove, Ctrl-C, CA, urls ---------------
+
+
+@pytest.fixture
+def traefik_starts(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> list[str]:
+    """One entry per `router.ensure_running` call: the shared Traefik (and its network) started."""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        router, "ensure_running", lambda timeout=60, on_line=None: calls.append("traefik")
+    )
+    return calls
+
+
+def _nothing_was_written(o: Orchestrator, isolated_home: Path) -> None:
+    assert o.store.load().branches == {}
+    assert not (isolated_home / "shop").exists()
+
+
+@pytest.mark.parametrize("action", ["up", "add"])
+def test_a_missing_repo_folder_fails_before_traefik_and_before_any_state(
+    orch,
+    docker: FakeDocker,
+    traefik_starts: list[str],
+    tmp_path: Path,
+    isolated_home: Path,
+    action: str,
+) -> None:
+    o = orch()
+    shutil.rmtree(tmp_path / "shop-api")
+    with pytest.raises(WtError, match="repo folder does not exist"):
+        getattr(o, action)("feat/cart", uses=selection(o))
+    assert traefik_starts == []
+    _nothing_was_written(o, isolated_home)
+
+
+@pytest.mark.parametrize("action", ["up", "add"])
+def test_a_folder_that_is_not_a_git_repo_fails_before_traefik_and_before_any_state(
+    orch,
+    docker: FakeDocker,
+    traefik_starts: list[str],
+    tmp_path: Path,
+    isolated_home: Path,
+    action: str,
+) -> None:
+    o = orch()
+    shutil.rmtree(tmp_path / "shop-api" / ".git")
+    with pytest.raises(WtError, match="not a git repository"):
+        getattr(o, action)("feat/cart", uses=selection(o))
+    assert traefik_starts == []
+    _nothing_was_written(o, isolated_home)
+
+
+@pytest.mark.parametrize("action", ["up", "add"])
+def test_an_invalid_branch_name_leaves_no_state_entry_and_starts_nothing(
+    orch,
+    docker: FakeDocker,
+    traefik_starts: list[str],
+    isolated_home: Path,
+    action: str,
+) -> None:
+    o = orch()
+    with pytest.raises(WtError, match="is not a valid git branch name"):
+        getattr(o, action)("bad..name", uses=selection(o))
+    assert traefik_starts == []
+    _nothing_was_written(o, isolated_home)
+
+
+@pytest.mark.parametrize("action", ["up", "add"])
+def test_a_missing_selection_names_the_catalog_services_and_starts_nothing(
+    global_orch: Orchestrator,
+    traefik_starts: list[str],
+    isolated_home: Path,
+    action: str,
+) -> None:
+    with pytest.raises(WtError) as err:
+        getattr(global_orch, action)("feat/x")
+    assert str(err.value) == (
+        "branch feat/x has no services yet; run wt add feat/x --uses back (services: back, front)"
+    )
+    assert traefik_starts == []
+    _nothing_was_written(global_orch, isolated_home)
+
+
+def test_the_no_services_hint_lists_at_most_ten_catalog_services(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    services = {f"s{i:02d}": {"repo": "api", "compose": "docker-compose.yml"} for i in range(12)}
+    catalog = {**SHOP_CATALOG, "services": services}
+    o = Orchestrator(write_global_catalog(tmp_path, catalog), log=lambda m: None)
+    with pytest.raises(WtError) as err:
+        o.up("feat/x")
+    listed = "s00, s01, s02, s03, s04, s05, s06, s07, s08, s09, …"
+    assert str(err.value).endswith(f"--uses s00 (services: {listed})")
+
+
+def test_reports_carry_the_reserved_port_of_run_and_published_compose_services(
+    run_orch,
+) -> None:
+    o = run_orch()
+    reports = {r.service: r for r in o.up("feat/cart", uses=selection(o))}
+    ports = o.store.load().branches["feat/cart"].ports
+    assert (
+        reports["web"].port
+        == ports["web"]
+        == o.store.load().branches["feat/cart"].processes["web"].port
+    )
+    assert reports["api"].port == ports["api"]  # compose service with a published port
+    assert reports["db"].port is None  # no port at all
+
+
+def test_ls_reports_carry_the_port_of_routed_services(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    [row] = o.ls(probe=False)
+    [api] = row.services
+    assert api.port == o.store.load().branches["feat/cart"].ports["api"]
+
+
+@pytest.fixture
+def stop_events(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> list[str]:
+    """Route removals, process stops and compose downs, in call order."""
+    events: list[str] = []
+    real_remove, real_stop = router.remove_routes, host.stop
+
+    def remove_routes(path: Path) -> None:
+        events.append("route")
+        real_remove(path)
+
+    def stop(ps: ProcessState, grace: float = 5.0) -> None:
+        events.append(f"process {ps.command.rsplit('#', 1)[-1].strip()}")
+        real_stop(ps, grace=0.2)
+
+    monkeypatch.setattr(router, "remove_routes", remove_routes)
+    monkeypatch.setattr(host, "stop", stop)
+    monkeypatch.setattr(compose, "down", lambda p: events.append(f"compose {p}"))
+    monkeypatch.setattr(compose, "down_keep_volumes", lambda p: events.append(f"compose {p}"))
+    return events
+
+
+def test_down_removes_the_route_before_it_stops_anything(run_orch, stop_events: list[str]) -> None:
+    o = run_orch({"front": sleeper("front", port="auto", subdomain="front")})
+    o.up("feat/x", uses=selection(o))
+    stop_events.clear()
+    assert o.down("feat/x") is True
+    assert stop_events[0] == "route"
+    assert set(stop_events[1:]) == {"process front", "compose wt-shop-feat-x-api"}
+
+
+def test_down_stops_a_consumer_process_before_the_process_it_needs(
+    run_orch, stop_events: list[str]
+) -> None:
+    o = run_orch(
+        {"lib": sleeper("lib"), "app": sleeper("app", needs=["lib"])},
+    )
+    o.up("feat/x", uses=selection(o))
+    stop_events.clear()
+    o.down("feat/x")
+    processes = [e for e in stop_events if e.startswith("process")]
+    assert processes == ["process app", "process lib"]
+
+
+def test_down_stops_a_consuming_compose_group_before_the_process_it_needs(
+    run_orch, stop_events: list[str]
+) -> None:
+    o = run_orch({"lib": sleeper("lib")}, extra_needs={"api": ["lib"]})
+    o.up("feat/x", uses=selection(o))
+    stop_events.clear()
+    o.down("feat/x")
+    assert stop_events[1:] == ["compose wt-shop-feat-x-api", "process lib"]
+
+
+def test_stop_uses_the_same_order(run_orch, stop_events: list[str]) -> None:
+    o = run_orch({"lib": sleeper("lib")}, extra_needs={"api": ["lib"]})
+    o.up("feat/x", uses=selection(o))
+    stop_events.clear()
+    o.stop("feat/x")
+    assert stop_events[1:] == ["compose wt-shop-feat-x-api", "process lib"]
+
+
+def test_down_still_cleans_when_the_services_need_each_other_through_their_groups(
+    orch, docker: FakeDocker
+) -> None:
+    # api and db share a compose group, `lib` needs db and api needs lib: no start order exists
+    o = orch(
+        extra_services={"lib": {"repo": "api", "run": "sleep 60"}},
+        extra_needs={"api": ["lib"], "lib": ["db"]},
+    )
+    with pytest.raises(WtError, match="need each other in a cycle"):
+        o.add("feat/x", uses=selection(o))
+    with o.store.edit() as current:  # a branch recorded by a version that had no such check
+        current.branches["feat/x"] = state.BranchState(branch="feat/x", slug="feat-x")
+        current.branches["feat/x"].compose_projects["api"] = "wt-shop-feat-x-api"
+    assert o.down("feat/x") is True
+    assert docker.downs == ["wt-shop-feat-x-api"]
+    assert o.store.load().branches == {}
+
+
+def test_remove_after_down_deletes_the_branch_in_every_repo_of_the_catalog(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)  # anchor: `back`, in repo api only
+    o.add("feat/x", uses=BOTH_REPOS)
+    assert o.down("feat/x") is True
+    assert all("feat/x" in _branches(tmp_path / r) for r in ("shop-api", "shop-web"))
+    assert o.remove("feat/x") is True
+    assert all("feat/x" not in _branches(tmp_path / r) for r in ("shop-api", "shop-web"))
+    assert o.remove("feat/x") is False  # idempotent
+
+
+def test_remove_after_down_keeps_a_foreign_checkout_in_a_repo_outside_the_anchor(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    o.add("feat/x", uses=BOTH_REPOS)
+    o.down("feat/x")
+    foreign = tmp_path / "foreign"
+    git_run(tmp_path / "shop-web", "worktree", "add", str(foreign), "feat/x")
+    logs = _logged(o)
+    assert o.remove("feat/x") is True  # deleted in api
+    assert "feat/x" not in _branches(tmp_path / "shop-api")
+    assert "feat/x" in _branches(tmp_path / "shop-web")  # kept: checked out in a folder not ours
+    assert foreign.is_dir()
+    assert "keeping branch 'feat/x' in repo 'web': checked out elsewhere" in logs
+
+
+def test_ctrl_c_during_up_marks_the_branch_failed_and_leaves_the_processes_for_down(
+    run_orch, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = run_orch({"lib": sleeper("lib")}, extra_needs={"api": ["lib"]})
+    logs = _logged(o)
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(compose, "up", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        o.up("feat/x", uses=selection(o))
+    bs = o.store.load().branches["feat/x"]
+    assert bs.status == "failed"
+    assert "lib" in bs.processes and host.alive(bs.processes["lib"])  # down will stop it
+    assert logs.count("interrupted: wt up feat/x again, or wt down feat/x") == 1
+    assert o.down("feat/x") is True
+    assert o.store.load().branches == {}
+
+
+def test_up_after_ctrl_c_finishes_the_branch(run_orch, monkeypatch: pytest.MonkeyPatch) -> None:
+    o = run_orch({"lib": sleeper("lib")}, extra_needs={"api": ["lib"]})
+    real_up = compose.up
+    monkeypatch.setattr(compose, "up", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        o.up("feat/x", uses=selection(o))
+    monkeypatch.setattr(compose, "up", real_up)
+    o.up("feat/x")
+    assert o.store.load().branches["feat/x"].status == "up"
+
+
+CA_MESSAGE = (
+    "wt created a local certificate authority at {path}. "
+    "Run mkcert -install once so browsers trust it."
+)
+
+
+def _with_mkcert(
+    monkeypatch: pytest.MonkeyPatch, caroot: Path, *, ca_before: bool, ca_after: bool
+) -> None:
+    """mkcert is installed; the CA exists `ca_before` the certificate is made and `ca_after` it."""
+    made = []
+
+    def ensure_cert(names: naming.Names) -> tuple[Path, Path]:
+        made.append(names)
+        return Path("c.pem"), Path("k.pem")
+
+    monkeypatch.setattr(tls, "available", lambda: True)
+    monkeypatch.setattr(tls, "ensure_cert", ensure_cert)
+    monkeypatch.setattr(tls, "ca_ready", lambda: ca_after if made else ca_before)
+    monkeypatch.setattr(tls, "caroot", lambda: caroot)
+
+
+def test_up_says_once_where_it_created_the_local_ca(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _with_mkcert(monkeypatch, tmp_path / "ca", ca_before=False, ca_after=True)
+    o = orch()
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert logs.count(CA_MESSAGE.format(path=tmp_path / "ca")) == 1
+    assert not any("wt doctor --fix" in m for m in logs)
+
+
+@pytest.mark.parametrize(("before", "after"), [(True, True), (False, False)])
+def test_up_stays_quiet_about_the_ca_when_it_did_not_create_one(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, before, after
+) -> None:
+    _with_mkcert(monkeypatch, tmp_path / "ca", ca_before=before, ca_after=after)
+    o = orch()
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert not any("certificate authority" in m for m in logs)
+
+
+def test_up_without_mkcert_does_not_mention_a_ca(orch, docker: FakeDocker) -> None:
+    o = orch()
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert not any("certificate authority" in m for m in logs)
+
+
+@pytest.fixture
+def plain_https(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "https_port", lambda: 443)
+
+
+def test_urls_lists_the_routed_services_of_a_branch(
+    orch, docker: FakeDocker, plain_https: None
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert o.urls("feat/cart") == {"api": "https://api.feat-cart.shop.localhost"}
+
+
+def test_urls_survive_stop_and_cover_a_branch_that_was_only_added(
+    orch, docker: FakeDocker, plain_https: None
+) -> None:
+    o = orch()
+    o.add("feat/cart", uses=selection(o))
+    expected = {"api": "https://api.feat-cart.shop.localhost"}
+    assert o.urls("feat/cart") == expected
+    o.up("feat/cart")
+    o.stop("feat/cart")
+    assert o.urls("feat/cart") == expected
+
+
+def test_urls_follow_the_https_port(orch, docker: FakeDocker, monkeypatch) -> None:
+    monkeypatch.setattr(router, "https_port", lambda: 8443)
+    o = orch()
+    o.add("feat/cart", uses=selection(o))
+    assert o.urls("feat/cart") == {"api": "https://api.feat-cart.shop.localhost:8443"}
+
+
+def test_urls_use_the_selection_of_the_branch(orch, docker: FakeDocker, plain_https: None) -> None:
+    o = orch()
+    o.add("feat/db-only", uses=["db"])
+    assert o.urls("feat/db-only") == {}
+
+
+def test_urls_of_an_unknown_or_removed_branch_is_empty(
+    orch, docker: FakeDocker, plain_https: None
+) -> None:
+    o = orch()
+    assert o.urls("feat/nope") == {}
+    o.up("feat/cart", uses=selection(o))
+    o.down("feat/cart")
+    assert o.urls("feat/cart") == {}
+
+
+# ---- setup: (SPEC §22) ---------------------------------------------------------------------
+
+
+def _setup_orch(run_orch, tmp_path: Path, command: str, **extra: object) -> Orchestrator:
+    """A catalog whose `web` runs `command` as its setup and counts the runs in `setups.txt`."""
+    counter = tmp_path / "setups.txt"
+    o: Orchestrator = run_orch(
+        run_service(setup=command.replace("COUNT", f"echo x >> {counter}"), **extra),
+    )
+    return o
+
+
+def _setup_runs(tmp_path: Path) -> int:
+    counter = tmp_path / "setups.txt"
+    return len(counter.read_text().split()) if counter.exists() else 0
+
+
+def _sha(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_setup_runs_in_the_worktree_with_the_service_env_before_the_process_starts(
+    run_orch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_home: Path
+) -> None:
+    o = _setup_orch(
+        run_orch,
+        tmp_path,
+        "COUNT; echo env=$GREETING > marker.txt; echo to-the-log",
+        env={"GREETING": "hi"},
+    )
+    seen: list[bool] = []
+    worktree = isolated_home / "shop" / "worktrees" / "feat-x" / "api"
+    real_start = host.start
+
+    def start(*args: Any, **kwargs: Any) -> ProcessState:
+        seen.append((worktree / "marker.txt").exists())
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(host, "start", start)
+    o.up("feat/x", uses=selection(o))
+    assert seen == [True]  # the setup had finished when the process started
+    assert (worktree / "marker.txt").read_text() == "env=hi\n"
+    log = isolated_home / "shop" / "branches" / "feat-x" / "logs" / "web.setup.log"
+    assert "to-the-log" in log.read_text()
+
+
+def test_setup_records_the_hash_of_the_rendered_command(run_orch, tmp_path: Path) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT # {{ branch }}")
+    o.up("feat/x", uses=selection(o))
+    rendered = f"echo x >> {tmp_path / 'setups.txt'} # feat/x"
+    assert o.store.load().branches["feat/x"].setup_done == {"web": _sha(rendered)}
+
+
+def test_setup_runs_once_per_worktree_not_once_per_up(run_orch, tmp_path: Path) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT")
+    o.up("feat/x", uses=selection(o))
+    o.up("feat/x")
+    o.stop("feat/x")
+    o.up("feat/x")
+    assert _setup_runs(tmp_path) == 1
+    assert o.store.load().branches["feat/x"].setup_done  # stop keeps the record
+
+
+def test_setup_runs_again_when_its_text_changes(run_orch, tmp_path: Path) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT")
+    o.up("feat/x", uses=selection(o))
+    o.cfg.services["web"].setup = f"echo x >> {tmp_path / 'setups.txt'}; echo changed"
+    o.up("feat/x")
+    assert _setup_runs(tmp_path) == 2
+    o.up("feat/x")
+    assert _setup_runs(tmp_path) == 2
+
+
+def test_down_forgets_the_setup_so_a_new_branch_runs_it_again(run_orch, tmp_path: Path) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT")
+    o.up("feat/x", uses=selection(o))
+    o.down("feat/x")
+    assert o.store.load().branches == {}
+    o.up("feat/x", uses=selection(o))
+    assert _setup_runs(tmp_path) == 2
+
+
+def test_each_service_with_a_setup_runs_it_in_its_own_repo_in_start_order(
+    run_orch, tmp_path: Path, isolated_home: Path
+) -> None:
+    order = tmp_path / "order.txt"
+    first = sleeper("first", setup=f"echo first >> {order}")
+    second = sleeper("second", needs=["first"], setup=f"echo second >> {order}")
+    o = run_orch({"first": first, "second": second})
+    o.up("feat/x", uses=selection(o))
+    assert order.read_text().split() == ["first", "second"]
+
+
+def test_a_failing_setup_fails_the_branch_with_the_exit_code_and_the_log(
+    run_orch, tmp_path: Path, isolated_home: Path
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT; echo boom; exit 3")
+    log = isolated_home / "shop" / "branches" / "feat-x" / "logs" / "web.setup.log"
+    with pytest.raises(WtError) as err:
+        o.up("feat/x", uses=selection(o))
+    assert str(err.value) == f"setup of web failed (exit 3); see {log}"
+    assert "boom" in log.read_text()
+    bs = o.store.load().branches["feat/x"]
+    assert bs.status == "failed"
+    assert bs.setup_done == {}  # a failed setup is not remembered
+    assert bs.processes == {}  # and the process never started
+
+
+def test_up_after_a_failed_setup_runs_it_again_and_succeeds_once_fixed(
+    run_orch, tmp_path: Path
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT; exit 1")
+    with pytest.raises(WtError, match="setup of web failed"):
+        o.up("feat/x", uses=selection(o))
+    o.cfg.services["web"].setup = f"echo x >> {tmp_path / 'setups.txt'}"
+    o.up("feat/x")
+    assert o.store.load().branches["feat/x"].status == "up"
+    assert _setup_runs(tmp_path) == 2
+
+
+def test_a_setup_that_runs_too_long_is_killed_and_reported(
+    run_orch, tmp_path: Path, isolated_home: Path
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "sleep 30 # COUNT", setup_timeout=1)
+    log = isolated_home / "shop" / "branches" / "feat-x" / "logs" / "web.setup.log"
+    started = time.monotonic()
+    with pytest.raises(WtError) as err:
+        o.up("feat/x", uses=selection(o))
+    assert str(err.value) == f"setup of web timed out after 1s; see {log}"
+    assert time.monotonic() - started < 15
+    assert o.store.load().branches["feat/x"].status == "failed"
+
+
+def test_setup_time_does_not_count_against_the_up_timeout(run_orch, tmp_path: Path) -> None:
+    o = _setup_orch(run_orch, tmp_path, "sleep 2")
+    reports = o.up("feat/x", uses=selection(o), timeout=1)
+    assert {r.service: r.outcome for r in reports}["web"] == "ok"
+
+
+def test_a_bad_setup_template_fails_before_anything_is_created(
+    run_orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = run_orch(run_service(setup="echo {{ nope.x }}"))
+    with pytest.raises(WtError, match=r"services\.web\.setup"):
+        o.up("feat/x", uses=selection(o))
+    assert o.store.load().branches == {}
+    assert not (isolated_home / "shop").exists()
+
+
+def test_a_service_without_setup_has_no_setup_record(run_orch) -> None:
+    o = run_orch()
+    o.up("feat/x", uses=selection(o))
+    assert o.store.load().branches["feat/x"].setup_done == {}
+
+
+def test_setup_passes_the_env_through_env_never_through_argv(
+    run_orch, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT", env={"SECRET_TOKEN": "s3cr3t-value"})
+    real_run = proc.run
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def spy(args: Any, **kwargs: Any) -> proc.Result:
+        calls.append((list(args), kwargs))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", spy)
+    o.up("feat/x", uses=selection(o))
+    [(args, kwargs)] = [c for c in calls if c[0][:2] == ["sh", "-c"]]
+    assert kwargs["env"]["SECRET_TOKEN"] == "s3cr3t-value"
+    assert not any("s3cr3t-value" in a for a in args)
+
+
+def test_a_command_timeout_becomes_the_setup_timeout_message(
+    run_orch, tmp_path: Path, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _setup_orch(run_orch, tmp_path, "COUNT", setup_timeout=7)
+    real_run = proc.run
+
+    def run(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args[:2]) == ["sh", "-c"]:
+            raise proc.CommandTimeout(args, kwargs["timeout"])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", run)
+    log = isolated_home / "shop" / "branches" / "feat-x" / "logs" / "web.setup.log"
+    with pytest.raises(WtError) as err:
+        o.up("feat/x", uses=selection(o))
+    assert str(err.value) == f"setup of web timed out after 7s; see {log}"
+    assert o.store.load().branches["feat/x"].status == "failed"
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch, stop_events: list[str]) -> list[list[str]]:
+    """Every `router.wait_unrouted` call (its hosts); also noted in `stop_events`. Returns True."""
+    calls: list[list[str]] = []
+
+    def wait_unrouted(hosts: Any, *args: Any, **kwargs: Any) -> bool:
+        calls.append(list(hosts))
+        stop_events.append("wait")
+        return True
+
+    monkeypatch.setattr(router, "wait_unrouted", wait_unrouted)
+    return calls
+
+
+@pytest.mark.parametrize("action", ["down", "stop"])
+def test_stop_waits_until_the_routes_are_gone_before_it_stops_anything(
+    run_orch, stop_events: list[str], waits: list[list[str]], action: str
+) -> None:
+    o = run_orch(
+        {"lib": sleeper("lib"), "app": sleeper("app", needs=["lib"], port="auto", subdomain="app")}
+    )
+    o.up("feat/x", uses=selection(o))
+    stop_events.clear()
+    getattr(o, action)("feat/x")
+    assert stop_events[:2] == ["route", "wait"]
+    assert [e for e in stop_events[2:] if e.startswith("process")] == [
+        "process app",
+        "process lib",
+    ]
+    assert sorted(h for call in waits for h in call) == [
+        "api.feat-x.shop.localhost",
+        "app.feat-x.shop.localhost",
+    ]
+
+
+def test_a_route_that_still_answers_is_noted_and_everything_is_stopped_anyway(
+    run_orch, stop_events: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = run_orch({"lib": sleeper("lib")})
+    o.up("feat/x", uses=selection(o))
+    monkeypatch.setattr(router, "wait_unrouted", lambda hosts, *a, **k: False)
+    logs = _logged(o)
+    stop_events.clear()
+    assert o.down("feat/x") is True
+    assert "process lib" in stop_events
+    assert "compose wt-shop-feat-x-api" in stop_events
+    assert (
+        "[yellow]note:[/] route for api.feat-x.shop.localhost still answered after 5 s; "
+        "stopping anyway"
+    ) in logs
+    assert o.store.load().branches == {}
+
+
+def test_stop_does_not_wait_when_the_branch_routes_nothing(
+    orch, docker: FakeDocker, waits: list[list[str]]
+) -> None:
+    o = orch()
+    o.add("feat/x", uses=["db"])
+    o.stop("feat/x")
+    o.down("feat/x")
+    assert waits == []

@@ -1,3 +1,7 @@
+import http.client
+import http.server
+import ssl
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -5,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from wt import compose, host, proc, router
+from wt import compose, health, host, proc, router
 from wt.errors import WtError
 from wt.naming import Names
 
@@ -335,3 +339,132 @@ def test_hosts_in_use_compares_case_insensitively(isolated_home: Path) -> None:
 )
 def test_route_file_owner(file_name: str, owner: str) -> None:
     assert router.route_file_owner(Path("/x") / file_name) == owner
+
+
+class _StatusServer:
+    """Local plain-HTTP server answering `statuses` in order, then `last` forever."""
+
+    def __init__(self, statuses: list[int], last: int) -> None:
+        self.hits: list[str] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                outer.hits.append(self.headers.get("Host", ""))
+                self.send_response(statuses.pop(0) if statuses else last)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                """Keep test output quiet."""
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = int(self.server.server_address[1])
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def fetch(self, host: str, timeout: float) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            conn.request("GET", "/", headers={"Host": host})
+            return conn.getresponse().status
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def traefik_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "is_running", lambda: True)
+
+
+def test_wait_unrouted_true_when_traefik_is_not_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(router, "is_running", lambda: False)
+
+    def must_not_probe(host: str, timeout: float) -> int:
+        raise AssertionError("probed although Traefik is not running")
+
+    assert router.wait_unrouted(["a.x.localhost"], fetch_status=must_not_probe)
+
+
+@pytest.mark.usefixtures("traefik_running")
+def test_wait_unrouted_waits_until_the_route_answers_404() -> None:
+    server = _StatusServer([200, 502, 200], last=404)
+    try:
+        done = router.wait_unrouted(["a.x.localhost"], 3.0, 0.01, fetch_status=server.fetch)
+    finally:
+        server.close()
+    assert done
+    assert len(server.hits) == 4
+    assert set(server.hits) == {"a.x.localhost"}
+
+
+@pytest.mark.usefixtures("traefik_running")
+def test_wait_unrouted_needs_every_host() -> None:
+    statuses = {"a.x.localhost": [404], "b.x.localhost": [502, 502, 404]}
+
+    def fetch(host: str, timeout: float) -> int:
+        queue = statuses[host]
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    assert router.wait_unrouted(list(statuses), 3.0, 0.01, fetch_status=fetch)
+    assert statuses["b.x.localhost"] == [404]
+
+
+@pytest.mark.usefixtures("traefik_running")
+@pytest.mark.parametrize("still_routed", [200, 301, 502, 503])
+def test_wait_unrouted_times_out_while_the_route_answers(still_routed: int) -> None:
+    server = _StatusServer([], last=still_routed)
+    start = time.monotonic()
+    try:
+        done = router.wait_unrouted(["a.x.localhost"], 0.3, 0.02, fetch_status=server.fetch)
+    finally:
+        server.close()
+    assert not done
+    assert time.monotonic() - start < 2.0
+
+
+@pytest.mark.usefixtures("traefik_running")
+@pytest.mark.parametrize("error", [ConnectionRefusedError, ConnectionResetError])
+def test_wait_unrouted_counts_refused_and_reset_as_unrouted(error: type[OSError]) -> None:
+    def fetch(host: str, timeout: float) -> int:
+        raise error
+
+    assert router.wait_unrouted(["a.x.localhost"], 0.3, 0.01, fetch_status=fetch)
+
+
+@pytest.mark.usefixtures("traefik_running")
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError(),
+        OSError(),
+        ssl.SSLError(),
+        http.client.BadStatusLine("x"),
+    ],
+)
+def test_wait_unrouted_retries_other_errors_until_timeout(error: Exception) -> None:
+    calls: list[str] = []
+
+    def fetch(host: str, timeout: float) -> int:
+        calls.append(host)
+        raise error
+
+    assert not router.wait_unrouted(["a.x.localhost"], 0.2, 0.01, fetch_status=fetch)
+    assert len(calls) > 1
+
+
+@pytest.mark.usefixtures("traefik_running")
+def test_wait_unrouted_default_probe_hits_the_https_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple[str, int, float]] = []
+
+    def fake_status(host: str, path: str, port: int, timeout: float) -> int:
+        seen.append((host, port, timeout))
+        return 404
+
+    monkeypatch.setenv("WT_HTTPS_PORT", "8443")
+    monkeypatch.setattr(health, "status", fake_status)
+    assert router.wait_unrouted(["a.x.localhost"])
+    assert seen == [("a.x.localhost", 8443, router.UNROUTED_REQUEST_TIMEOUT)]

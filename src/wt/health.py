@@ -29,17 +29,23 @@ class _LoopbackHTTPS(http.client.HTTPSConnection):
         self.sock = self._ctx.wrap_socket(sock, server_hostname=self.host)
 
 
-def probe(host: str, path: str, port: int, timeout: float = 3.0) -> Check:
+def status(host: str, path: str, port: int, timeout: float = 3.0) -> int:
+    """HTTP status of `GET path` for `host` through the loopback port; network errors propagate."""
     conn = _LoopbackHTTPS(host, port, timeout)
     try:
         conn.request("GET", path, headers={"Host": host, "User-Agent": "wt-health"})
-        status = conn.getresponse().status
-    except (OSError, http.client.HTTPException) as exc:
-        return Check(False, f"no response ({exc.__class__.__name__})")
+        return conn.getresponse().status
     finally:
         conn.close()
-    ok = 200 <= status < 400 or status in HEALTHY
-    return Check(ok, f"HTTP {status}")
+
+
+def probe(host: str, path: str, port: int, timeout: float = 3.0) -> Check:
+    try:
+        code = status(host, path, port, timeout)
+    except (OSError, http.client.HTTPException) as exc:
+        return Check(False, f"no response ({exc.__class__.__name__})")
+    ok = 200 <= code < 400 or code in HEALTHY
+    return Check(ok, f"HTTP {code}")
 
 
 def wait_healthy(host: str, path: str, port: int, timeout: float) -> Check:
