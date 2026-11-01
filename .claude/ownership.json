@@ -15,10 +15,10 @@
   ],
   "runtime-coder": [
     "src/wt/proc.py", "src/wt/git.py", "src/wt/compose.py", "src/wt/host.py", "src/wt/router.py",
-    "src/wt/tls.py", "src/wt/health.py", "src/wt/state.py", "src/wt/projects.py",
+    "src/wt/tls.py", "src/wt/health.py", "src/wt/state.py", "src/wt/projects.py", "src/wt/cache.py",
     "tests/test_proc.py", "tests/test_git.py", "tests/test_compose.py", "tests/test_host.py",
     "tests/test_router.py", "tests/test_tls.py", "tests/test_health.py", "tests/test_state.py",
-    "tests/test_projects.py"
+    "tests/test_projects.py", "tests/test_cache.py"
   ],
   "model-coder": [
     "src/wt/config.py", "src/wt/catalog.py", "src/wt/naming.py", "src/wt/templating.py",
