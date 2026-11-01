@@ -117,11 +117,7 @@ def test_rows_and_columns() -> None:
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
             actions: Any = app.query_one("#actions", Static).render()
             assert actions.plain == "enter: services  u: up  d: down  a: add  r: remove  q: quit"
-            green = [actions.plain[s.start : s.end] for s in actions.spans]
-            assert green == ["enter", "u", "d", "a", "r", "q"]
-            table = app.query_one("#table", DataTable)
-            up, stopped = table.get_row_at(0)[1], table.get_row_at(1)[1]
-            assert up.style == "green" and not stopped.style
+            assert not actions.spans
 
     asyncio.run(scenario())
 
@@ -432,8 +428,7 @@ def dialog_text(app: WtApp) -> tuple[str, int]:
     """The words visible inside the `#dialog` box, and the box height."""
     region = app.screen.query_one("#dialog").region
     rows = screen_lines(app)[region.y : region.y + region.height]
-    inner = [row.strip("│ ") for row in rows if row.startswith("│")]
-    return " ".join(" ".join(inner).split()), region.height
+    return " ".join(" ".join(rows).split()), region.height
 
 
 def test_remove_confirmation_wraps_so_the_whole_sentence_is_visible() -> None:
@@ -445,7 +440,7 @@ def test_remove_confirmation_wraps_so_the_whole_sentence_is_visible() -> None:
             await pilot.pause()
             text, height = dialog_text(app)
             assert text == REMOVE_QUESTION
-            assert 3 < height <= size[1]
+            assert 1 < height <= size[1]
             assert "unpushed commits are lost. Remove? y/N" in text
 
     for size in [(100, 30), (60, 20)]:
@@ -572,9 +567,8 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
                 ["back", "starting", "10002", "-"],
                 ["db", "stopped", "-", "-"],
             ]
-            healthy, port = table.get_row_at(0)[1], table.get_row_at(0)[2]
-            assert healthy.style == "green" and port.style == "purple"
-            assert not table.get_row_at(1)[1].style
+            for row in range(table.row_count):
+                assert not any(cell.spans or cell.style for cell in table.get_row_at(row))
             actions: Any = app.screen.query_one("#actions", Static).render()
             assert actions.plain == "c: configure  esc: back  q: quit"
             await pilot.press("escape")
@@ -653,7 +647,6 @@ def test_c_toggle_and_confirm_calls_configure_and_refreshes() -> None:
             assert checked(app) == ["front", "back"]
             hints: Any = app.screen.query_one("#hints", Static).render()
             assert hints.plain == "space: toggle  enter: confirm  esc: cancel"
-            assert [hints.plain[s.start : s.end] for s in hints.spans] == ["space", "enter", "esc"]
             await pilot.press("space", "down", "down", "space")  # uncheck front, check db
             assert checked(app) == ["back", "db"]
             await pilot.press("enter")
@@ -928,6 +921,20 @@ def test_configure_is_blocked_while_an_action_runs() -> None:
             assert "busy" in str(app.screen.query_one("#message", Static).render())
             orch.gate.set()
             await settle(pilot)
+
+    asyncio.run(scenario())
+
+
+def test_checklist_shows_its_state_as_text_markers() -> None:
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            lines = [line.rstrip() for line in screen_lines(app)]
+            assert lines[1:4] == ["[x] front (web)", "[x] back (api)", "[ ] db (api)"]
+            await pilot.press("space")  # uncheck front
+            await pilot.pause()
+            assert screen_lines(app)[1].rstrip() == "[ ] front (web)"
 
     asyncio.run(scenario())
 
