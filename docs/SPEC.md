@@ -694,7 +694,7 @@ port rules of §13 (compose isolation) and §14 (ports).
    action line `c: configure  esc: back  q: quit`, plus a message line. `c` opens a modal with a
    checkbox list (`<service> (<repo>)`): space toggles, enter confirms, esc cancels. Confirm runs
    `configure` as the one running action. For a `services:` project the message is
-   `configure needs a catalog project (uses: in worktree.yaml)`. Colors: the initials of the action
+   `configure needs a catalog project (uses: in worktree.yaml)`. Colors (removed by §21 'TUI look'): the initials of the action
    line are green, PORT values are purple, STATUS `healthy` and `up` are green, everything else is
    plain. This replaces "no colors" in §16.
 9. **`examples/notes`.** `uses: [front, back]`. `back` gets `remote: https://api.staging.notes.example`.
@@ -1014,7 +1014,7 @@ use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for
   key the folder stays `$WT_HOME/<project>/worktrees/<slug>/<repo>`.
 - **Existing branches keep their place.** The path recorded in the state (`RepoState.path`) wins over
   the computed one for `up`, `down`, `stop` and `remove`; changing `worktrees` never moves a branch.
-- **Not our folder.** Before creating `<worktrees>/<slug>/<repo>`, if the folder exists and is not a git
+- **Not our folder.** Before creating `<worktrees>/<slug>/<repo>`, if the folder exists, is not empty and is not a git
   worktree of that repo, `up`/`add` fail before anything else is created:
   `<path> already exists and was not created by wt; move it, or choose another name or worktrees folder`.
   (The `<worktrees>/<slug>` folder may exist and be empty or hold only wt worktrees of other repos.)
