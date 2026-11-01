@@ -163,6 +163,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.5 ✔ (§19) | Keycloak provider (SSO across branch subdomains) |
 | v0.5.1 ✔ (§20) | Stabilise (stale-port rule, destroy errors, one deadline, published ports, duplicate hosts), dependencies run together, project-scoped names on the shared servers |
 | v0.6.0 ✔ (§21) | One global `catalog.yaml` (`$WT_HOME`) replaces the per-repo `worktree.yaml`; `wt add`/`up` from any folder with a chosen set of services; `wt migrate`; `--json` output |
+| v0.6.1 (§22) | Fixes from hands-on tests (down removes the route first, `up` checks before it starts Traefik, TUI `stop`/`down` keys, `--json` gaps, `ls --all`, `catalog --check` renders templates) and a per-service `setup:` step |
 | v0.7 | plugin entry points, shared provider helpers, `wt init --with`, TUI log pane |
 | v0.8 | shared dependency caches |
 | v0.9 | native Windows (spike first) |
@@ -1030,3 +1031,49 @@ use `WT_CATALOG`); `examples/shop/legacy/worktree.yaml` keeps the old format for
     table: `a` shows the "Enter name" input, then the services checklist (own page each); `r` shows
     the confirmation alone. `u` and `d` act on the selected row and report on the message line.
   - The services checklist keeps `[x]` markers and `(required by …)` labels as text.
+
+## 22. v0.6.1: fixes from hands-on tests, and `setup:`
+
+Decided 2026-11-01 (plan `roadmap-to-v09`; approval step skipped in away mode). Everything not named
+here is unchanged.
+
+**`setup:` (catalog service key).** `setup: str | None` (a shell command, templates rendered and
+shell-quoted like `run:`) and `setup_timeout: int = 600` (seconds, 1 to 3600). Only a `run:` service may
+set them (`setup:` with `compose:` is a validation error: `setup: needs run:`).
+- `BranchState.setup_done: dict[str, str]` maps a service to the sha256 of its rendered setup command.
+- In `up`, in start-plan order, before a service's process starts: when `setup_done[service]` differs from
+  the hash, run the command with `sh -c` in the service's repo worktree with the service's environment;
+  its output goes to `branches/<slug>/logs/<service>.setup.log`. Exit 0 records the hash. Otherwise
+  `WtError("setup of <service> failed (exit <n>); see <log>")`, or `… timed out after <n>s; see <log>`;
+  the branch is left `failed` like any failed step. The `up` wait (default 120 s) does not include setup.
+- `down` clears `setup_done`; `stop` keeps it.
+
+**TUI keys.** The action line is `enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit`.
+`d` stops (unchanged behaviour). `x` opens a full-screen confirmation page (`down <name>: stops what wt
+started and removes what wt created for it (containers, volumes, databases, worktrees); the git branch
+is kept. Down? y/N`) and runs `down` without `--force`; a refusal (uncommitted changes) is shown on the
+message line with `use wt down --force`.
+
+**`--json` gaps.** `ServiceReport.port: int | None`; `ls` documents fill `services[].port` from it.
+Action documents add `"changed": bool` (false for no-ops: `add` of a known branch, `down` of an unknown
+one) and fill `urls` for `add`, `stop` and `up` from the branch's recorded routes (`{}` for `down` and
+`remove`). `status` is the branch status after the action and `null` when the branch no longer exists.
+
+**Fixes.**
+- **`up` checks first.** Git repositories, branch name and the service selection are validated before
+  Traefik or the network are started. An invalid branch name writes no state entry.
+- **Local CA.** When `up` creates the local certificate authority it prints once: `wt created a local
+  certificate authority at <path>. Run mkcert -install once so browsers trust it.` `wt doctor` adds a
+  `ca trusted` line (info) when it can tell.
+- **Down order (amends §14).** The route file is removed first, then host processes, compose (with
+  volumes), certs, providers; a request right after `down` gets 404, not 502.
+- **TUI.** The table refreshes as soon as a worker finishes. In the all-projects view the full error of a
+  project that fails to load is shown on the message line when its row is selected.
+- **`wt ls --all`** lists every project known from state; `wt ls` is unchanged.
+- **Compose project names** are `<instance>-<project>-<slug>` (`instance()` is `wt` by default, so a
+  default setup sees no change; `WT_INSTANCE` now isolates them too).
+- **`wt catalog --check` renders** each service's `run`, `setup`, `env` and `health` against dummy values
+  (model layer: `catalog.render_check(loaded) -> dict[str, str]`, service to error) and reports the ones
+  that fail, in addition to the checks of §15.
+- **Shared text.** The remove confirmation sentence lives once, in `wt.messages` (model layer), and is
+  used by the CLI and the TUI.
