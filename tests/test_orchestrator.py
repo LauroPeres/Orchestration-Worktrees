@@ -3133,13 +3133,13 @@ def test_adopt_branches_validates_the_names_before_writing(
     assert _stored(global_orch, "feat/a") is None
 
 
-def test_catalog_choices_without_a_branch_lists_the_catalog_unselected(
+def test_catalog_choices_without_a_branch_lists_the_catalog_with_direct_consumers(
     global_orch: Orchestrator, docker: FakeDocker
 ) -> None:
     choices = global_orch.catalog_choices(None)
     assert choices is not None
     assert [(c.service, c.repo, c.selected, c.required_by) for c in choices] == [
-        ("back", "api", False, ()),
+        ("back", "api", False, ("front",)),  # front consumes it
         ("front", "api", False, ()),
     ]
     assert global_orch.catalog_choices() == choices
@@ -3161,3 +3161,41 @@ def test_catalog_choices_are_none_for_a_worktree_yaml_service_project(
     orch, docker: FakeDocker
 ) -> None:
     assert orch().catalog_choices(None) is None
+
+
+def test_catalog_choices_without_a_branch_name_only_direct_consumers(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    make_repo("shop-api", {"docker-compose.yml": COMPOSE})
+    chain = {
+        **SHOP_CATALOG,
+        "services": {
+            name: {
+                "repo": "api",
+                "compose": "docker-compose.yml",
+                "compose_service": "api",
+                "port": 8000,
+                "subdomain": name,
+                **({"consumes": {dep: dep.upper()}} if dep else {}),
+            }
+            for name, dep in (("c", None), ("b", "c"), ("a", "b"))
+        },
+    }
+    o = Orchestrator(write_global_catalog(tmp_path, chain), log=lambda m: None)
+    choices = o.catalog_choices(None)
+    assert choices is not None
+    assert [(c.service, c.selected, c.required_by) for c in choices] == [
+        ("a", False, ()),  # the file is dumped sorted, so catalog order is a, b, c
+        ("b", False, ("a",)),
+        ("c", False, ("b",)),  # a reaches c only through b: not listed
+    ]
+
+
+def test_log_command_uses_the_selection_stored_for_the_branch(
+    global_orch: Orchestrator, docker: FakeDocker
+) -> None:
+    global_orch.add("feat/x", uses=["front"])  # the anchor is back, the branch stores front
+    args = global_orch.log_command("feat/x", "front", follow=False, tail=9)
+    assert args[-1] == "api"  # front's compose service
+    with pytest.raises(WtError, match="unknown service 'nope'"):
+        global_orch.log_command("feat/x", "nope", follow=False, tail=9)

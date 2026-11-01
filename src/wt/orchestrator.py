@@ -14,7 +14,7 @@ from typing import Any, Literal
 
 from wt import compose, git, health, host, naming, proc, router, tls
 from wt import providers as registry
-from wt.catalog import load_catalog
+from wt.catalog import CatalogService, load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
 from wt.naming import Names
@@ -1067,6 +1067,8 @@ class Orchestrator:
 
     def log_command(self, branch: str, service: str, *, follow: bool, tail: int) -> list[str]:
         """Command that prints (and optionally follows) a service's log."""
+        if (other := self._for(branch)) is not self:  # the service may only be in its stack
+            return other.log_command(branch, service, follow=follow, tail=tail)
         svc = self.cfg.services.get(service)
         if svc is None:
             raise WtError(f"unknown service {service!r} (known: {', '.join(self.cfg.services)})")
@@ -1151,13 +1153,17 @@ class Orchestrator:
     def catalog_choices(self, branch: str | None = None) -> list[Choice] | None:
         """Every catalog service with its repo and its place in the branch's stack (§20).
 
-        Without a branch (one that is about to be created) nothing is selected.
+        Without a branch (one that is about to be created) nothing is selected and `required_by`
+        lists each service's direct consumers in the whole catalog.
         """
         if self.loaded.uses is None or self.loaded.catalog is None:
             return None
         if branch is None:
             catalog = load_catalog(self.loaded.catalog).catalog
-            return [Choice(name, svc.repo, False) for name, svc in catalog.services.items()]
+            return [
+                Choice(name, svc.repo, False, _consumers(catalog.services, name))
+                for name, svc in catalog.services.items()
+            ]
         if self.store.load().branches.get(branch) is None:
             raise WtError(f"branch {branch!r} not found (see `wt ls`)")
         mine = self._for(branch).loaded
@@ -1256,6 +1262,11 @@ class Orchestrator:
                     b.compose_projects.pop(repo, None)
 
         self._record(branch, cleared)
+
+
+def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:
+    """The catalog services that consume `name` directly, in catalog order."""
+    return tuple(other for other, svc in services.items() if name in svc.consumes)
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:
