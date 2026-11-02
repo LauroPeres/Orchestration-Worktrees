@@ -1240,7 +1240,9 @@ repo went to `<worktrees>/<slug>/`, so one wt lived in two folders. Rules (amend
 **TUI.**
 - Status colors: `stopped` is red (every status cell, main and services tables). Infra statuses use the same
   map: `running` green, `stopped` and `missing` red, `unhealthy` red.
-- **Infra rows (services view).** After the repo rows, one row per shared server the wt's stack uses
+- **Infra rows (services view).** After the repo rows, first the shared Traefik router (always: `traefik (infra)`,
+  STATUS its container's state, PORT the HTTPS port, last column `N routes` for the routed services of the
+  wt), then one row per shared server the wt's stack uses
   (`postgres`, `redis`, `kafka`, `keycloak`, plugin names): NAME `<provider> (infra)`, STATUS the server
   container's state (`running`, `unhealthy`, `stopped`, `missing`; a plugin without a server shows
   `running` when the branch has its slice recorded, else `-`), PORT the host port of the server when it has one,
@@ -1260,3 +1262,10 @@ repo went to `<worktrees>/<slug>/`, so one wt lived in two folders. Rules (amend
   (new session, no wait, no output). No terminal found: `no terminal found; set WT_TERMINAL`.
 - Action lines: main `enter: services  u: up  d: stop  x: down  a: add  r: remove  n: terminal  q: quit`;
   services `u: url  c: configure  l: logs  esc: back  q: quit`.
+
+**Certificate trust (found with a real Chrome).** `mkcert` creates the root CA on first use, but browsers reject
+the branch certificates (`ERR_CERT_AUTHORITY_INVALID`) until `mkcert -install` has put it in a trust store, which
+needs the user's sudo password once, so wt never runs it by itself. `tls.ca_trusted() -> bool | None` tells
+whether the CA is installed (Linux: `trust list`, the usual anchor folders, the Chrome/NSS database through
+`certutil`; macOS: the keychains; `None` when it cannot be told). `wt doctor` adds a `ca trusted` line: `ok`
+when installed, `warn` with `run mkcert -install once, then restart the browser` when not, `info` when unknown.
