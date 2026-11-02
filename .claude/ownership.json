@@ -1,8 +1,8 @@
 {
   "_comment": "Which files each agent may edit (globs relative to the repo root, `*` crosses folders). One owner per file. Read by the code-framework ownership hook and by the fixer's debugging skill. docs/, README.md, pyproject.toml, uv.lock and .github/ belong to the main session (the planner).",
   "interface-coder": [
-    "src/wt/cli.py", "src/wt/tui.py", "src/wt/catalog_edit.py", "src/wt/__main__.py",
-    "tests/test_cli.py", "tests/test_tui.py", "tests/test_catalog_edit.py"
+    "src/wt/cli.py", "src/wt/tui.py", "src/wt/catalog_edit.py", "src/wt/terminal.py", "src/wt/__main__.py",
+    "tests/test_cli.py", "tests/test_tui.py", "tests/test_catalog_edit.py", "tests/test_terminal.py"
   ],
   "core-coder": [
     "src/wt/orchestrator.py", "src/wt/doctor.py",
