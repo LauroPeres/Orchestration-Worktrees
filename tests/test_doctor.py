@@ -1,6 +1,7 @@
 import copy
 import socket
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import pytest
 
@@ -1081,10 +1082,64 @@ def test_ca_trusted_reports_what_the_trust_stores_say(
     detail: str,
 ) -> None:
     monkeypatch.setattr(tls, "ca_trusted", lambda: trusted)
-    check = doctor.check_ca_trusted()
+    check = doctor.check_ca_trusted(fix=False)
     assert check is not None
     assert (check.name, check.level, check.detail) == ("ca trusted", level, detail)
     assert ("mkcert -install" in check.hint) is (trusted is False)
+
+
+def test_ca_trusted_without_fix_points_at_doctor_fix_and_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch, mkcert_with_ca: None
+) -> None:
+    monkeypatch.setattr(tls, "ca_trusted", lambda: False)
+    monkeypatch.setattr(tls, "install_ca_user", lambda: pytest.fail("only with --fix"))
+    check = doctor.check_ca_trusted(fix=False)
+    assert check is not None
+    assert check.hint == (
+        "run `wt doctor --fix` (adds the CA to your browser database without sudo), "
+        "or `mkcert -install` in a terminal for the system store"
+    )
+
+
+def test_ca_trusted_fix_adds_the_ca_to_the_browser_databases_and_turns_ok(
+    monkeypatch: pytest.MonkeyPatch, mkcert_with_ca: None, tmp_path: Path
+) -> None:
+    installed: list[bool] = []
+
+    def install_ca_user() -> list[Path]:
+        installed.append(True)
+        return [tmp_path / "a", tmp_path / "b"]
+
+    monkeypatch.setattr(tls, "ca_trusted", lambda: bool(installed))
+    monkeypatch.setattr(tls, "install_ca_user", install_ca_user)
+    monkeypatch.setattr(tls, "install_ca", lambda: pytest.fail("mkcert -install needs a TTY"))
+    check = doctor.check_ca_trusted(fix=True)
+    assert check == doctor.Check(
+        "ca trusted", "ok", "mkcert CA added to 2 browser database(s); restart the browser"
+    )
+
+
+@pytest.mark.parametrize(
+    ("added", "trusted_after"),
+    [([], False), ([Path("/db")], False), ([Path("/db")], None)],
+)
+def test_ca_trusted_fix_that_cannot_help_keeps_the_warning_with_the_sudo_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    mkcert_with_ca: None,
+    added: list[Path],
+    trusted_after: bool | None,
+) -> None:
+    answers = iter([False, trusted_after])
+    monkeypatch.setattr(tls, "ca_trusted", lambda: next(answers))
+    monkeypatch.setattr(tls, "install_ca_user", lambda: added)
+    monkeypatch.setattr(tls, "install_ca", lambda: pytest.fail("mkcert -install needs a TTY"))
+    check = doctor.check_ca_trusted(fix=True)
+    assert check is not None
+    assert check.level == "warn"
+    assert check.hint == (
+        "run `mkcert -install` once in a terminal (it needs your sudo password for the system "
+        "store), then restart the browser"
+    )
 
 
 @pytest.mark.parametrize(("available", "ready"), [(False, True), (True, False)])
@@ -1094,7 +1149,7 @@ def test_ca_trusted_is_skipped_without_mkcert_or_a_ca(
     monkeypatch.setattr(tls, "available", lambda: available)
     monkeypatch.setattr(tls, "ca_ready", lambda: ready)
     monkeypatch.setattr(tls, "ca_trusted", lambda: pytest.fail("no CA to look for"))
-    assert doctor.check_ca_trusted() is None
+    assert doctor.check_ca_trusted(fix=True) is None
 
 
 def test_run_checks_puts_ca_trusted_right_after_the_mkcert_check(

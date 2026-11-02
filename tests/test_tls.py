@@ -144,10 +144,12 @@ class _Stores:
         self.anchors = tmp_path / "anchors"
         self.tools = {"mkcert", "trust", "certutil"}
         self.answers: dict[str, proc.Result | None] = {}  # None: the command cannot run
+        self.listings: dict[str, proc.Result] = {}  # `certutil -L` answer per NSS folder
         self.calls: list[list[str]] = []
         monkeypatch.setattr(tls, "_platform", lambda: "linux")
         monkeypatch.setattr(tls, "_ANCHOR_DIRS", (self.anchors,))
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
         monkeypatch.setattr(
             proc, "which", lambda name: f"/bin/{name}" if name in self.tools else None
         )
@@ -157,14 +159,31 @@ class _Stores:
         self.calls.append(list(args))
         if args[0] == "mkcert":
             return proc.Result(0, f"{self.root}\n", "")
+        if args[:2] == ["certutil", "-L"] and args[-1].removeprefix("sql:") in self.listings:
+            return self.listings[args[-1].removeprefix("sql:")]
         answer = self.answers.get(args[0], proc.Result(0, "", ""))
         if answer is None:
             raise WtError(f"could not run {args[0]}")
         return answer
 
+    def put_nss(self, folder: Path, listing: str = "") -> Path:
+        """An NSS database that lists `listing` (what `certutil -L` prints)."""
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "cert9.db").write_text("db")
+        self.listings[str(folder)] = proc.Result(0, listing, "")
+        return folder
+
+    def installs(self) -> list[list[str]]:
+        return [call for call in self.calls if call[:1] == ["certutil"] and "-A" in call]
+
     def put_anchor(self, content: str) -> None:
         self.anchors.mkdir(exist_ok=True)
         (self.anchors / "mkcert.crt").write_text(content)
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    return tmp_path / "home"
 
 
 @pytest.fixture
@@ -190,17 +209,51 @@ def test_ca_trusted_ignores_an_anchor_with_other_content(stores: _Stores) -> Non
     assert tls.ca_trusted() is False
 
 
-def test_ca_trusted_hit_in_the_chrome_nss_database(stores: _Stores) -> None:
+def test_ca_trusted_hit_in_the_legacy_nss_database(stores: _Stores, home: Path) -> None:
     stores.answers["trust"] = proc.Result(0, TRUST_WITHOUT_CA, "")
-    stores.answers["certutil"] = proc.Result(0, "mkcert dev@box     C,,\n", "")
+    database = stores.put_nss(home / ".pki" / "nssdb", "mkcert dev@box     C,,\n")
     assert tls.ca_trusted() is True
-    certutil = next(call for call in stores.calls if call[0] == "certutil")
-    assert certutil[-1].startswith("sql:") and certutil[-1].endswith(".pki/nssdb")
+    assert ["certutil", "-L", "-d", f"sql:{database}"] in stores.calls
 
 
-def test_ca_trusted_is_false_when_every_checkable_store_misses(stores: _Stores) -> None:
+def test_ca_trusted_hit_in_the_xdg_nss_database(stores: _Stores, home: Path) -> None:
     stores.answers["trust"] = proc.Result(0, TRUST_WITHOUT_CA, "")
-    stores.answers["certutil"] = proc.Result(0, "Digicert   C,,\n", "")
+    stores.put_nss(home / ".pki" / "nssdb", "Digicert   C,,\n")
+    stores.put_nss(home / ".local" / "share" / "pki" / "nssdb", "mkcert dev@box     C,,\n")
+    assert tls.ca_trusted() is True
+
+
+def test_ca_trusted_follows_xdg_data_home(
+    stores: _Stores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stores.tools = {"mkcert", "certutil"}
+    data_home = tmp_path / "data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    stores.put_nss(data_home / "pki" / "nssdb", "mkcert dev@box     C,,\n")
+    assert tls.ca_trusted() is True
+
+
+def test_ca_trusted_nss_database_without_the_ca_is_a_checked_miss(
+    stores: _Stores, home: Path
+) -> None:
+    stores.tools = {"mkcert", "certutil"}
+    stores.put_nss(home / ".local" / "share" / "pki" / "nssdb", "Digicert   C,,\n")
+    assert tls.ca_trusted() is False
+
+
+def test_ca_trusted_nss_database_that_cannot_be_read_is_unchecked(
+    stores: _Stores, home: Path
+) -> None:
+    stores.tools = {"mkcert", "certutil"}
+    stores.put_nss(home / ".pki" / "nssdb")
+    stores.listings.clear()
+    stores.answers["certutil"] = proc.Result(255, "", "could not open the database")
+    assert tls.ca_trusted() is None
+
+
+def test_ca_trusted_is_false_when_every_checkable_store_misses(stores: _Stores, home: Path) -> None:
+    stores.answers["trust"] = proc.Result(0, TRUST_WITHOUT_CA, "")
+    stores.put_nss(home / ".pki" / "nssdb", "Digicert   C,,\n")
     stores.put_anchor("something else")
     assert tls.ca_trusted() is False
 
@@ -230,10 +283,10 @@ def test_ca_trusted_treats_a_trust_command_that_cannot_run_as_unchecked(
     assert tls.ca_trusted() is None
 
 
-def test_ca_trusted_certutil_without_a_database_is_not_a_hit(stores: _Stores) -> None:
+def test_ca_trusted_certutil_without_a_database_is_unchecked(stores: _Stores) -> None:
     stores.tools = {"mkcert", "certutil"}
-    stores.answers["certutil"] = proc.Result(255, "", "could not open the database")
     assert tls.ca_trusted() is None
+    assert [call for call in stores.calls if call[0] == "certutil"] == []
 
 
 def test_ca_trusted_is_none_without_the_ca_file(stores: _Stores) -> None:
@@ -273,3 +326,85 @@ def test_ca_trusted_on_macos_is_false_when_no_keychain_has_it(
     stores.tools = {"mkcert", "security"}
     stores.answers["security"] = proc.Result(44, "", "could not be found")
     assert tls.ca_trusted() is False
+
+
+def test_install_ca_user_trusts_the_ca_in_both_nss_databases(stores: _Stores, home: Path) -> None:
+    legacy = stores.put_nss(home / ".pki" / "nssdb")
+    xdg = stores.put_nss(home / ".local" / "share" / "pki" / "nssdb")
+    assert tls.install_ca_user() == [legacy, xdg]
+    assert stores.installs() == [
+        [
+            "certutil",
+            "-d",
+            f"sql:{folder}",
+            "-A",
+            "-t",
+            "C,,",
+            "-n",
+            "mkcert development CA (wt)",
+            "-i",
+            str(stores.root / "rootCA.pem"),
+        ]
+        for folder in (legacy, xdg)
+    ]
+
+
+def test_install_ca_user_follows_xdg_data_home(
+    stores: _Stores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_home = tmp_path / "data"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+    elsewhere = stores.put_nss(data_home / "pki" / "nssdb")
+    stores.put_nss(tmp_path / "home" / ".local" / "share" / "pki" / "nssdb")  # not the XDG one now
+    assert tls.install_ca_user() == [elsewhere]
+
+
+def test_install_ca_user_skips_a_database_that_already_lists_the_ca(
+    stores: _Stores, home: Path
+) -> None:
+    stores.put_nss(home / ".pki" / "nssdb", "mkcert development CA (wt)   C,,\n")
+    fresh = stores.put_nss(home / ".local" / "share" / "pki" / "nssdb", "Digicert   C,,\n")
+    assert tls.install_ca_user() == [fresh]
+    assert len(stores.installs()) == 1
+
+
+def test_install_ca_user_does_nothing_when_already_installed_everywhere(
+    stores: _Stores, home: Path
+) -> None:
+    stores.put_nss(home / ".pki" / "nssdb", "mkcert dev@box   C,,\n")
+    assert tls.install_ca_user() == []
+    assert stores.installs() == []
+
+
+def test_install_ca_user_reports_only_the_databases_where_certutil_succeeded(
+    stores: _Stores, home: Path
+) -> None:
+    stores.put_nss(home / ".pki" / "nssdb")
+    stores.answers["certutil"] = proc.Result(255, "", "read-only database")
+    assert tls.install_ca_user() == []
+    assert len(stores.installs()) == 1
+
+
+def test_install_ca_user_never_raises_when_certutil_cannot_run(stores: _Stores, home: Path) -> None:
+    stores.put_nss(home / ".pki" / "nssdb")
+    stores.answers["certutil"] = None
+    assert tls.install_ca_user() == []
+
+
+def test_install_ca_user_ignores_missing_databases(stores: _Stores, home: Path) -> None:
+    (home / ".pki" / "nssdb").mkdir(parents=True)  # a folder without cert9.db is not a database
+    assert tls.install_ca_user() == []
+    assert stores.installs() == []
+
+
+def test_install_ca_user_needs_certutil(stores: _Stores, home: Path) -> None:
+    stores.put_nss(home / ".pki" / "nssdb")
+    stores.tools = {"mkcert"}
+    assert tls.install_ca_user() == []
+
+
+def test_install_ca_user_needs_the_ca_file(stores: _Stores, home: Path) -> None:
+    stores.put_nss(home / ".pki" / "nssdb")
+    (stores.root / "rootCA.pem").unlink()
+    assert tls.install_ca_user() == []
+    assert stores.installs() == []

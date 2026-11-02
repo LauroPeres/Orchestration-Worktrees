@@ -4,6 +4,7 @@ One certificate per branch covers the branch domain and its subdomains. A `*.sho
 wildcard would not cover `api.feat-cart.shop.localhost`.
 """
 
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -38,6 +39,10 @@ _ANCHOR_DIRS = (
     Path("/usr/share/ca-certificates/mkcert"),
 )
 _CA_LABEL = "mkcert"
+# The nickname wt gives the CA in a browser's NSS database; it contains _CA_LABEL so a later
+# `certutil -L` finds it.
+_NSS_NICKNAME = "mkcert development CA (wt)"
+_NSS_DATABASE_FILE = "cert9.db"
 _MACOS_KEYCHAINS = (
     "/Library/Keychains/System.keychain",
     "~/Library/Keychains/login.keychain-db",
@@ -58,11 +63,21 @@ def _answer(args: list[str]) -> proc.Result | None:
         return None
 
 
-def _ca_pem() -> str | None:
+def _ca_file() -> Path | None:
+    """The mkcert root CA file, or None when mkcert or the file is missing."""
     try:
         root = caroot()
-        return (root / "rootCA.pem").read_text().strip() if root else None
-    except (WtError, OSError, UnicodeDecodeError):
+    except WtError:
+        return None
+    path = root / "rootCA.pem" if root else None
+    return path if path is not None and path.is_file() else None
+
+
+def _ca_pem() -> str | None:
+    path = _ca_file()
+    try:
+        return path.read_text().strip() if path else None
+    except (OSError, UnicodeDecodeError):
         return None
 
 
@@ -91,15 +106,34 @@ def _in_anchor_folders(pem: str) -> bool | None:
     return False if checked else None
 
 
-def _in_chrome_nss_db(_pem: str) -> bool | None:
+def _nss_databases() -> list[Path]:
+    """Existing NSS folders Chrome and Firefox read: `~/.pki/nssdb` and the XDG one.
+
+    mkcert only knows the first, while Chrome keeps its database in `$XDG_DATA_HOME/pki/nssdb`
+    on current Linux desktops.
+    """
     try:
-        database = Path.home() / ".pki" / "nssdb"
+        home = Path.home()
     except RuntimeError:
-        return None
+        return []
+    data_home = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+    candidates = [home / ".pki" / "nssdb", data_home / "pki" / "nssdb"]
+    unique = list(dict.fromkeys(candidates))
+    return [folder for folder in unique if (folder / _NSS_DATABASE_FILE).is_file()]
+
+
+def _nss_lists_ca(database: Path) -> bool | None:
     result = _answer(["certutil", "-L", "-d", f"sql:{database}"])
-    if result is None or not result.ok:  # a missing database is "not checked", not "not trusted"
+    if result is None or not result.ok:  # an unreadable database is "not checked"
         return None
     return _CA_LABEL in result.stdout
+
+
+def _in_chrome_nss_db(_pem: str) -> bool | None:
+    results = [_nss_lists_ca(database) for database in _nss_databases()]
+    if True in results:
+        return True
+    return False if False in results else None
 
 
 def _in_macos_keychains(_pem: str) -> bool | None:
@@ -147,6 +181,27 @@ def ca_trusted() -> bool | None:
 
 def install_ca() -> None:
     proc.run(["mkcert", "-install"], capture=False)
+
+
+def install_ca_user() -> list[Path]:
+    """Trust the mkcert CA in the user's NSS databases (no sudo); return where it was added.
+
+    Never raises: a missing tool, CA file or database, or a failing `certutil`, just leaves the
+    folder out of the result. Databases that already list the CA are not touched.
+    """
+    ca_file = _ca_file()
+    if ca_file is None:
+        return []
+    added: list[Path] = []
+    for database in _nss_databases():
+        if _nss_lists_ca(database):
+            continue
+        database_arg = f"sql:{database}"
+        trust_args = ["-A", "-t", "C,,", "-n", _NSS_NICKNAME, "-i", str(ca_file)]
+        result = _answer(["certutil", "-d", database_arg, *trust_args])
+        if result is not None and result.ok:
+            added.append(database)
+    return added
 
 
 def cert_paths(names: Names) -> tuple[Path, Path]:
