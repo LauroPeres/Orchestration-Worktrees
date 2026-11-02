@@ -32,7 +32,7 @@ from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
 from wt.naming import slugify
-from wt.orchestrator import BranchStatus, Choice, Orchestrator, ServiceReport
+from wt.orchestrator import BranchStatus, Choice, MoveResult, Orchestrator, ServiceReport
 from wt.projects import KnownProject, known_projects
 from wt.state import atomic_write
 
@@ -314,6 +314,17 @@ def action_document(
     }
 
 
+def move_document(branch: str, result: MoveResult) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "branch": branch,
+        "action": "move",
+        "changed": result.changed,
+        "folder": str(result.folder) if result.folder else None,
+        "moved": result.moved,
+    }
+
+
 def _failed(report: ServiceReport) -> bool:
     return report.outcome == "fail"
 
@@ -533,6 +544,28 @@ def stop(
             _emit(action_document(branch, "stop", outcome))
         else:
             console.print(f"[green]{branch} is stopped.[/]")
+
+
+@app.command()
+def move(
+    ctx: typer.Context,
+    branch: Annotated[str, typer.Argument(help="Git branch.")],
+    json_output: JsonOption = False,
+) -> None:
+    """Move BRANCH's worktrees into one folder, <worktrees>/<slug>/. It must be stopped."""
+    with _json_errors(json_output):
+        result = Orchestrator(_load(ctx), log=_progress(json_output)).move(branch)
+        if json_output:
+            _emit(move_document(branch, result))
+            return
+        for repo in result.moved:
+            console.print(f"moved {escape(repo)}")
+        if result.folder is None:
+            console.print(f"{branch} has no worktree folder of its own")
+        elif result.changed:
+            console.print(f"[green]{branch} now lives in {escape(str(result.folder))}[/]")
+        else:
+            console.print(f"{branch} is already in {escape(str(result.folder))}")
 
 
 @app.command()

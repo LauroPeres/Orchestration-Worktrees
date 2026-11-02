@@ -167,7 +167,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
 | v0.8.1 ✔ (§25) | Keycloak dev users (`infra.keycloak.users`) |
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
-| v0.9.1 (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
+| v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1219,7 +1219,9 @@ Decided 2026-11-02 from the user's hands-on test. Everything not named here is u
 **One folder per wt (bug).** A wt created before the catalog had `worktrees:` kept its repos under
 `$WT_HOME/<project>/worktrees/<slug>/`; when it later gained a repo (the services page, `configure`), the new
 repo went to `<worktrees>/<slug>/`, so one wt lived in two folders. Rules (amend §21):
-- The folder of an existing wt is `dirname(recorded path)` of any repo it already has. A repo added later is
+- The folder of an existing wt is `dirname(recorded path)` of any repo it already has **and that wt created**
+  (a repo checked out in its own folder, e.g. `main`, never counts: its parent would be the user's own
+  code folder). A repo added later is
   created **next to the repos the wt already has**, whatever `worktrees:` says now. `worktrees:` decides the
   folder of a *new* wt only.
 - `Orchestrator.worktree_dir(branch) -> Path | None`: the common folder of all recorded repo paths of the

@@ -105,3 +105,53 @@ def test_target_that_is_a_file_is_refused(make_repo, tmp_path: Path) -> None:
     target.write_text("x")
     with pytest.raises(WtError, match="not a worktree"):
         git.ensure_worktree(repo, "feat/x", target)
+
+
+def test_move_worktree_keeps_files_and_branch(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    git.ensure_worktree(repo, "feat/x", old)
+    (old / "wip.txt").write_text("keep me")
+    git.move_worktree(repo, old, new)
+    assert not old.exists()
+    assert (new / "wip.txt").read_text() == "keep me"
+    assert git.list_worktrees(repo)[-1] == git.Worktree(new, "feat/x")
+    assert all(t.path != old for t in git.list_worktrees(repo))
+    assert run_git(new, "branch", "--show-current").strip() == "feat/x"
+
+
+def test_move_worktree_creates_missing_parents(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    old = tmp_path / "old"
+    new = tmp_path / "deep" / "er" / "new"
+    git.ensure_worktree(repo, "feat/x", old)
+    git.move_worktree(repo, old, new)
+    assert new.is_dir()
+
+
+def test_move_worktree_refuses_existing_target(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    git.ensure_worktree(repo, "feat/x", old)
+    new.mkdir()
+    with pytest.raises(WtError, match="already exists; move or remove it first"):
+        git.move_worktree(repo, old, new)
+    assert old.is_dir()
+
+
+def test_move_worktree_refuses_missing_source(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    old = tmp_path / "old"
+    with pytest.raises(WtError, match="does not exist"):
+        git.move_worktree(repo, old, tmp_path / "new")
+
+
+def test_move_worktree_refuses_main_checkout(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    new = tmp_path / "moved"
+    with pytest.raises(WtError) as excinfo:
+        git.move_worktree(repo, repo, new)
+    assert "\n" not in str(excinfo.value)
+    assert repo.is_dir() and not new.exists()

@@ -1,6 +1,7 @@
 """Terminal UI: a bordered table of worktrees and one page per action (SPEC §16, §21)."""
 
 import os
+import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,12 +26,15 @@ from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
 from wt.naming import Names
 from wt.orchestrator import BranchStatus, Choice, RepoRow
+from wt.providers import InfraRow
+from wt.terminal import open_terminal
 
 REFRESH_SECONDS = 2.0
 GREEN = Style(color="green")  # keys, column names, healthy statuses
 YELLOW = Style(color="yellow")
 RED = Style(color="red")
-# A status shows in color; any other value (`stopped`, `starting`, `-`) keeps the terminal's own.
+# A status shows in color; any other value (`starting`, `-`) keeps the terminal's own.
+# The infra rows use the same map (`running`, `missing`; SPEC §26).
 STATUS_STYLES: dict[str, Style] = {
     "up": GREEN,
     "healthy": GREEN,
@@ -41,9 +45,12 @@ STATUS_STYLES: dict[str, Style] = {
     "failed": RED,
     "fail": RED,
     "unhealthy": RED,
+    "stopped": RED,
+    "missing": RED,
+    "running": GREEN,
 }
 KEY_GAP = "  "  # separates the `key: words` items of a hint line
-ACTIONS = "enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit"
+ACTIONS = "enter: services  u: up  d: stop  x: down  a: add  r: remove  n: terminal  q: quit"
 CONFIRM_DOWN = (
     "down {branch}: stops what wt started and removes what wt created for it (containers, "
     "volumes, databases, worktrees); the git branch is kept. Down? y/N"
@@ -73,6 +80,10 @@ class OrchestratorLike(Protocol):
     def catalog_choices(self, branch: str | None = None) -> list[Choice]: ...
 
     def configure(self, branch: str, uses: list[str]) -> None: ...
+
+    def infra(self, branch: str) -> list[InfraRow]: ...
+
+    def worktree_dir(self, branch: str) -> Path | None: ...
 
     def names(self, branch: str) -> Names: ...
 
@@ -105,7 +116,7 @@ class Row:
         return f"{self.project}\0{self.status.branch if self.status else ''}"
 
 
-SERVICES_ACTIONS = "c: configure  l: logs  esc: back  q: quit"
+SERVICES_ACTIONS = "u: url  c: configure  l: logs  esc: back  q: quit"
 LOG_HINTS = "esc: back"
 LOG_TITLE = "{branch} \u00b7 {service}"
 NO_LOG_YET = "no log yet"
@@ -123,12 +134,23 @@ INPUT_HINTS = "enter: confirm  esc: cancel"
 CONFIRM_HINTS = "y: yes  n: no  esc: cancel"
 # The table's keys; on a page that asks something they would stack another page on top.
 TABLE_ACTIONS = frozenset(
-    {"up_selected", "stop_selected", "down_selected", "add_new", "remove_selected"}
+    {"up_selected", "stop_selected", "down_selected", "add_new", "remove_selected", "new_terminal"}
 )
+INFRA_SUFFIX = " (infra)"
+NO_OWN_FOLDER = "{branch} has no worktree folder of its own"
+OPENED_TERMINAL = "opened a terminal in {path}"
+OPENED_URL = "opened {url}"
+COULD_NOT_OPEN = "could not open {url}"
+NO_ROW_VALUE = "no {what} for {name}"  # `u` and `l` on a row that has none, e.g. an infra row
 MARKER_CHECKED = "[x] "
 MARKER_UNCHECKED = "[ ] "
 # Textual draws a checkbox as 4 segments (left, inner, right, space) before the option text.
 BUTTON_SEGMENTS = 4
+
+
+def open_url(url: str) -> bool:
+    """Open `url` in the default browser; False when none could be started."""
+    return webbrowser.open(url)
 
 
 def status_style(value: str) -> Style | None:
@@ -139,6 +161,14 @@ def status_style(value: str) -> Style | None:
 def status_cell(value: str) -> Text:
     """A table cell with the status as written, in the color of its value."""
     return Text(value, style=status_style(value) or "")
+
+
+def port_text(port: int | None) -> Text:
+    return Text(str(port) if port is not None else "-")
+
+
+def url_text(url: str | None) -> Text:
+    return Text(url or "-")
 
 
 def keys_text(line: str) -> Text:
@@ -207,6 +237,7 @@ class ServicesScreen(Screen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("q", "app.quit", "Quit", show=False),
+        Binding("u", "url", "URL", show=False),
         Binding("c", "configure", "Configure", show=False),
         Binding("l", "logs", "Logs", show=False),
     ]
@@ -217,7 +248,8 @@ class ServicesScreen(Screen[None]):
         self.branch = branch
         self._loading = False
         self._failed_shown = False
-        self._repos: list[str] = []
+        self._repos: list[RepoRow] = []  # the first rows of the table; the infra rows follow
+        self._infra: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="services", cursor_type="row")
@@ -251,13 +283,43 @@ class ServicesScreen(Screen[None]):
 
         app.push_screen(ConfigureScreen(choices), chosen)
 
-    def action_logs(self) -> None:
+    def _selected_repo(self, what: str) -> RepoRow | None:
+        """The repo row under the cursor; else say why there is none (`what`: URL, logs)."""
         table = self.query_one("#services", DataTable)
-        if not table.row_count or table.cursor_row >= len(self._repos):
+        cursor = table.cursor_row
+        if not table.row_count:
             self.say("nothing selected")
+        elif cursor >= len(self._repos):  # an infra row has neither URL nor log
+            name = self._infra[cursor - len(self._repos)]
+            self.say(NO_ROW_VALUE.format(what=what, name=name))
+        else:
+            return self._repos[cursor]
+        return None
+
+    def action_url(self) -> None:
+        repo = self._selected_repo("URL")
+        if repo is None:
+            return
+        if not repo.url:
+            self.say(NO_ROW_VALUE.format(what="URL", name=repo.name))
+        elif self._opened(repo.url):
+            self.say(OPENED_URL.format(url=repo.url))
+        else:
+            self.say(COULD_NOT_OPEN.format(url=repo.url))
+
+    @staticmethod
+    def _opened(url: str) -> bool:
+        try:
+            return open_url(url)
+        except Exception:  # a missing display or browser must not close the app
+            return False
+
+    def action_logs(self) -> None:
+        repo = self._selected_repo("logs")
+        if repo is None:
             return
         try:
-            service, path = log_target(self._orch(), self.branch, self._repos[table.cursor_row])
+            service, path = log_target(self._orch(), self.branch, repo.name)
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.say(error_text(exc))
             return
@@ -271,13 +333,22 @@ class ServicesScreen(Screen[None]):
     @work(thread=True, group="services", exit_on_error=False)
     def _load(self) -> None:
         try:
-            rows = self._orch().services(self.branch)
+            orch = self._orch()
+            rows = orch.services(self.branch)
         except WtError as exc:
             self.app.call_from_thread(self._failed, str(exc))
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.app.call_from_thread(self._failed, f"{type(exc).__name__}: {exc}")
         else:
-            self.app.call_from_thread(self._apply, rows)
+            infra, note = self._read_infra(orch)
+            self.app.call_from_thread(self._apply, rows, infra, note)
+
+    def _read_infra(self, orch: OrchestratorLike) -> tuple[list[InfraRow], str]:
+        """The infra rows, or no rows and the error: the repo rows show either way."""
+        try:
+            return orch.infra(self.branch), ""
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            return [], error_text(exc)
 
     def _failed(self, message: str) -> None:
         self._loading = False
@@ -285,18 +356,26 @@ class ServicesScreen(Screen[None]):
             self._failed_shown = True
             self.say(message)
 
-    def _apply(self, rows: list[RepoRow]) -> None:
+    def _apply(self, rows: list[RepoRow], infra: list[InfraRow], note: str) -> None:
         try:
             table = self.query_one("#services", DataTable)
             cursor = table.cursor_row
             table.clear()
-            self._repos = [r.name for r in rows]
+            self._repos = rows
+            self._infra = [i.name for i in infra]
             for r in rows:
-                port = Text(str(r.port) if r.port is not None else "-")
-                table.add_row(Text(r.name), status_cell(r.status), port, Text(r.url or "-"))
-            if rows:
-                table.move_cursor(row=min(cursor, len(rows) - 1))
-            if self._failed_shown:
+                table.add_row(
+                    Text(r.name), status_cell(r.status), port_text(r.port), url_text(r.url)
+                )
+            for i in infra:
+                name = Text(i.name + INFRA_SUFFIX)
+                table.add_row(name, status_cell(i.status), port_text(i.port), Text(i.detail))
+            if table.row_count:
+                table.move_cursor(row=min(cursor, table.row_count - 1))
+            if note:
+                self._failed_shown = True
+                self.say(note)
+            elif self._failed_shown:
                 self._failed_shown = False
                 self.say("")
         except NoMatches:
@@ -573,6 +652,7 @@ class WtApp(App[None]):
         Binding("x", "down_selected", "Down", show=False),
         Binding("a", "add_new", "Add", show=False),
         Binding("r", "remove_selected", "Remove", show=False),
+        Binding("n", "new_terminal", "Terminal", show=False),
         Binding("q", "quit", "Quit", show=False),
     ]
 
@@ -707,6 +787,22 @@ class WtApp(App[None]):
                 )
 
         self.push_screen(ConfirmScreen(DOWN_TITLE, CONFIRM_DOWN.format(branch=branch)), confirmed)
+
+    def action_new_terminal(self) -> None:
+        row = self._selected_worktree()
+        if row is None or row.status is None:
+            return
+        branch = row.status.branch
+        try:
+            folder = self._orch_for(row.project).worktree_dir(branch)
+            if folder is None:
+                self.say(NO_OWN_FOLDER.format(branch=branch))
+                return
+            open_terminal(folder)
+        except Exception as exc:  # keep the app open whatever the orchestrator raises
+            self.say(error_text(exc))
+            return
+        self.say(OPENED_TERMINAL.format(path=folder))
 
     def _usable_projects(self) -> list[str]:
         return [name for name, e in self._entries.items() if e.orch is not None]

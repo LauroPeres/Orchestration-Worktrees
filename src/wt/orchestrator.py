@@ -151,6 +151,15 @@ class RepoRow:
 
 
 @dataclass(frozen=True)
+class MoveResult:
+    """What `move` did: `folder` is where the wt lives now (None: it has no repo of its own)."""
+
+    changed: bool
+    folder: Path | None
+    moved: list[str]
+
+
+@dataclass(frozen=True)
 class Choice:
     """One catalog service in the configure list."""
 
@@ -211,16 +220,34 @@ class Orchestrator:
         return Names(self.cfg.project, branch, self.cfg.domain)
 
     def worktree_target(self, names: Names, repo: str) -> Path:
-        """Where the worktree of `repo` lives: the recorded path wins, so a branch never moves."""
+        """Where the worktree of `repo` lives (§21, §26).
+
+        The recorded path wins, so a branch never moves. A repo the branch gains later goes next
+        to the repos it already has; `worktrees:` only decides the folder of a new branch.
+        """
         bs = self.store.load().branches.get(names.branch)
         if bs is not None and repo in bs.repos:
             return Path(bs.repos[repo].path)
-        return self._slug_dir(names) / repo
+        own = _own_folders(bs) if bs is not None else []
+        return (own[0] if own else self._slug_dir(names)) / repo
 
     def _slug_dir(self, names: Names) -> Path:
         """The folder that groups the worktrees of one branch (§21 "Worktree location")."""
         root = self.loaded.worktrees_dir or project_dir(self.cfg.project) / "worktrees"
         return root / names.slug
+
+    def worktree_dir(self, branch: str) -> Path | None:
+        """The one folder holding the worktrees wt made for `branch`; None when it has none.
+
+        A wt spread over several folders is an error that points to `wt move`.
+        """
+        bs = self.store.load().branches.get(branch)
+        folders = _own_folders(bs) if bs is not None else []
+        if len(folders) > 1:
+            raise WtError(
+                f"{branch} is spread over several folders; stop it and run wt move {branch}"
+            )
+        return folders[0] if folders else None
 
     def branch_dir(self, names: Names) -> Path:
         return project_dir(self.cfg.project) / "branches" / names.slug
@@ -588,6 +615,49 @@ class Orchestrator:
                 b.route_file = None
 
             self._record(branch, stopped)
+
+    def move(self, branch: str) -> MoveResult:
+        """Move the worktrees wt made for a stopped `branch` to `<worktrees>/<slug>/<repo>` (§26).
+
+        The new path of each repo is recorded as soon as git moved it, so a failure midway leaves
+        the state truthful; running `move` again finishes the job.
+        """
+        names = self.names(branch)
+        with self._branch_lock(names):
+            bs = self.store.load().branches.get(branch)
+            if bs is None:
+                raise WtError(f"branch {branch!r} not found (see `wt ls`)")
+            if bs.status != "stopped" or any(host.alive(ps) for ps in bs.processes.values()):
+                raise WtError(f"{branch} is running; stop it first: wt stop {branch}")
+            own = {repo: rs for repo, rs in bs.repos.items() if rs.created}
+            folder = self._slug_dir(names) if own else None
+            moved: list[str] = []
+            old_folders: set[Path] = set()
+            try:
+                for repo, rs in own.items():
+                    target = self._slug_dir(names) / repo
+                    if Path(rs.path) != target:
+                        self._move_repo(branch, repo, rs, target)
+                        moved.append(repo)
+                        old_folders.add(Path(rs.path).parent)
+            finally:
+                for old in old_folders:
+                    _remove_if_empty(old)
+            return MoveResult(bool(moved), folder, moved)
+
+    def _move_repo(self, branch: str, repo: str, rs: RepoState, target: Path) -> None:
+        self.log(f"moving {rs.path} to {target}")
+        git.move_worktree(Path(rs.source), Path(rs.path), target)
+
+        def moved(b: BranchState) -> None:
+            b.repos[repo].path = str(target)
+
+        self._record(branch, moved)
+
+    def infra(self, branch: str) -> list[registry.InfraRow]:
+        """The shared servers `branch` uses and the state of each, for the services view."""
+        bs = self.store.load().branches.get(branch)
+        return registry.infra_rows(self._for(branch).cfg, bs.providers if bs else {})
 
     def _stop_services(
         self, branch: str, names: Names, bs: BranchState | None, *, volumes: bool
@@ -1522,6 +1592,14 @@ class Orchestrator:
 def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:
     """The catalog services that consume `name` directly, in catalog order."""
     return tuple(other for other, svc in services.items() if name in svc.consumes)
+
+
+def _own_folders(bs: BranchState) -> list[Path]:
+    """The distinct folders that hold the worktrees wt created for `bs`, in repo order.
+
+    A checkout wt did not create (`created` false) is the repo's own folder, never the wt's.
+    """
+    return list(dict.fromkeys(Path(rs.path).parent for rs in bs.repos.values() if rs.created))
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:

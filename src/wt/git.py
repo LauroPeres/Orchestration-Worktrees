@@ -97,6 +97,20 @@ def remove_worktree(repo: Path, path: Path, *, force: bool) -> None:
     _git(repo, "worktree", "prune")
 
 
+def move_worktree(repo: Path, old: Path, new: Path) -> None:
+    """`git worktree move`: keeps files, branch and git's own bookkeeping."""
+    if new.exists():
+        raise WtError(f"{new} already exists; move or remove it first")
+    if not old.exists():
+        raise WtError(f"{old} does not exist")
+    new.parent.mkdir(parents=True, exist_ok=True)
+    result = _git(repo, "worktree", "move", str(old), str(new), check=False)
+    if not result.ok:
+        reason = (result.stderr or result.stdout).strip().splitlines()
+        raise WtError(f"cannot move {old} to {new}: {reason[0] if reason else 'git failed'}")
+    _git(repo, "worktree", "prune")
+
+
 def branch_exists(repo: Path, branch: str) -> bool:
     return _has_ref(repo, f"refs/heads/{branch}")
 

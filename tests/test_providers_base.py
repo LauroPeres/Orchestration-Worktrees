@@ -248,3 +248,64 @@ def test_recorded_names_return_only_the_asked_providers_names(isolated_home: Pat
         )
     assert recorded_names(ctx, "redis") == ["shop:feat-cart:"]
     assert recorded_names(ctx, "keycloak") == []
+
+
+def fake_statuses(monkeypatch: pytest.MonkeyPatch, statuses: dict[str, str]) -> list[str]:
+    asked: list[str] = []
+
+    def container_status(name: str) -> str:
+        asked.append(name)
+        return statuses.get(name, "missing")
+
+    monkeypatch.setattr(server, "container_status", container_status)
+    return asked
+
+
+def test_infra_rows_cover_the_configured_builtins_in_config_order(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = fake_statuses(
+        monkeypatch, {postgres.container(): "running", kafka.container(): "unhealthy"}
+    )
+    config = cfg(redis={}, postgres={"databases": ["shop"]}, kafka={"groups": ["g"]})
+    rows = providers.infra_rows(
+        config, {"postgres": ["shop__feat_x", "other"], "redis": ["shop:feat-x:"]}
+    )
+    assert rows == [
+        providers.InfraRow("postgres", "running", postgres.host_port(), "shop__feat_x, other"),
+        providers.InfraRow("kafka", "unhealthy", kafka.host_port(), "-"),
+        providers.InfraRow("redis", "missing", redis.host_port(), "shop:feat-x:"),
+    ]
+    assert asked == [postgres.container(), kafka.container(), redis.container()]
+
+
+def test_infra_rows_skip_a_provider_that_is_not_configured(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_statuses(monkeypatch, {})
+    rows = providers.infra_rows(cfg(redis={}), {"postgres": ["shop__feat_x"]})
+    assert [row.name for row in rows] == ["redis"]
+    assert providers.infra_rows(cfg(), {}) == []
+
+
+def test_infra_rows_use_the_ports_from_the_environment(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_statuses(monkeypatch, {})
+    monkeypatch.setenv("WT_POSTGRES_PORT", "6543")
+    rows = providers.infra_rows(cfg(postgres={"databases": ["shop"]}), {})
+    assert rows[0].port == 6543
+
+
+def test_infra_rows_show_a_plugin_by_its_recorded_slice(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = fake_statuses(monkeypatch, {redis.container(): "stopped"})
+    config = cfg(redis={}, zeta={}, alpha={})
+    rows = providers.infra_rows(config, {"alpha": ["a1", "a2"]})
+    assert rows == [
+        providers.InfraRow("redis", "stopped", redis.host_port(), "-"),
+        providers.InfraRow("alpha", "running", None, "a1, a2"),
+        providers.InfraRow("zeta", "-", None, "-"),
+    ]
+    assert asked == [redis.container()]
