@@ -113,6 +113,26 @@ def check_tls(fix: bool) -> Check:
     return Check("mkcert", "ok", f"CA at {tls.caroot()}", hint)
 
 
+def check_ca_trusted() -> Check | None:
+    """A CA that exists but was never installed makes browsers reject every branch certificate.
+
+    None when there is no CA to be trusted (mkcert missing or no CA yet): `check_tls` says that.
+    """
+    if not (tls.available() and tls.ca_ready()):
+        return None
+    trusted = tls.ca_trusted()
+    if trusted is None:
+        return Check("ca trusted", "info", "could not tell whether the mkcert CA is trusted")
+    if trusted:
+        return Check("ca trusted", "ok", "mkcert CA is installed in a trust store")
+    return Check(
+        "ca trusted",
+        "warn",
+        "mkcert CA is not installed: browsers will show ERR_CERT_AUTHORITY_INVALID",
+        "run `mkcert -install` once, then restart the browser",
+    )
+
+
 def check_cache() -> Check:
     """The caches grow on their own: say how big, and warn when the disk is low."""
     used = cache.total_bytes()
@@ -467,6 +487,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
     checks += docker
     docker_ok = all(c.level == "ok" for c in docker)
     checks.append(check_tls(fix))
+    if (ca_check := check_ca_trusted()) is not None:
+        checks.append(ca_check)
     checks.append(check_cache())
     checks += check_plugins()
     if docker_ok:

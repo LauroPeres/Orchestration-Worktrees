@@ -657,7 +657,23 @@ class Orchestrator:
     def infra(self, branch: str) -> list[registry.InfraRow]:
         """The shared servers `branch` uses and the state of each, for the services view."""
         bs = self.store.load().branches.get(branch)
-        return registry.infra_rows(self._for(branch).cfg, bs.providers if bs else {})
+        cfg = self._for(branch).cfg
+        return [
+            self._router_row(cfg),
+            *registry.infra_rows(cfg, bs.providers if bs else {}),
+        ]
+
+    @staticmethod
+    def _router_row(cfg: Any) -> registry.InfraRow:
+        """The shared Traefik: always there, whatever providers the project configures."""
+        count = sum(1 for svc in cfg.services.values() if svc.subdomain is not None)
+        detail = "no routes" if count == 0 else f"{count} route{'s' if count > 1 else ''}"
+        return registry.InfraRow(
+            name="traefik",
+            status=registry.server.container_status(router.container()),
+            port=router.https_port(),
+            detail=detail,
+        )
 
     def _stop_services(
         self, branch: str, names: Names, bs: BranchState | None, *, volumes: bool

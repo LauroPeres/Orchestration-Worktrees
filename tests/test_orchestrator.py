@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -4692,7 +4693,55 @@ def test_infra_asks_the_providers_for_the_rows_of_the_branch_selection(
         return rows
 
     monkeypatch.setattr(providers, "infra_rows", fake_rows)
-    assert o.infra("feat/x") == rows
+    assert o.infra("feat/x")[1:] == rows
     assert seen == [(["back"], {"postgres": ["shop__feat_x"]})]
     o.infra("feat/unknown")
     assert seen[-1][1] == {}  # no state: nothing recorded
+
+
+def _stub_router_and_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(providers.server, "container_status", lambda name: f"status of {name}")
+    monkeypatch.setattr(router, "https_port", lambda: 8443)
+    monkeypatch.setattr(providers, "infra_rows", lambda cfg, recorded: [])
+
+
+@pytest.mark.parametrize(("uses", "detail"), [(["back"], "1 route"), (["back", "web"], "2 routes")])
+def test_infra_starts_with_the_shared_router_and_counts_the_selection_routes(
+    make_repo,
+    tmp_path: Path,
+    docker: FakeDocker,
+    monkeypatch: pytest.MonkeyPatch,
+    uses: list[str],
+    detail: str,
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    o.add("feat/x", uses=uses)
+    _stub_router_and_providers(monkeypatch)
+    assert o.infra("feat/x") == [
+        providers.InfraRow(
+            name="traefik", status=f"status of {router.container()}", port=8443, detail=detail
+        )
+    ]
+
+
+def test_infra_says_no_routes_when_nothing_in_the_selection_has_a_subdomain(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    _stub_router_and_providers(monkeypatch)
+    quiet = SimpleNamespace(cfg=SimpleNamespace(services={"job": SimpleNamespace(subdomain=None)}))
+    monkeypatch.setattr(o, "_for", lambda branch: quiet)
+    assert [row.detail for row in o.infra("feat/x")] == ["no routes"]
+
+
+def test_infra_keeps_the_router_first_for_a_branch_that_does_not_exist(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    monkeypatch.setattr(providers.server, "container_status", lambda name: "running")
+    monkeypatch.setattr(
+        providers,
+        "infra_rows",
+        lambda cfg, recorded: [providers.InfraRow("redis", "running", 6379, "-")],
+    )
+    assert [row.name for row in o.infra("feat/unknown")] == ["traefik", "redis"]
