@@ -357,14 +357,15 @@ process.
 
 ### DBeaver connections
 
-Add `dbeaver: true` to the catalog (or `dbeaver: /path/to/data-sources.json`) and every wt database of
-the shared Postgres gets a DBeaver connection by itself, in a folder named `wt`: `<repo>-<wt>` for
-each database (`music-back-testt1`) and one `<repo>` connection for the whole server with "Show all
-databases". They appear after `wt up`, disappear after `wt down` or `wt remove`, and
-`wt dbeaver sync` rebuilds them from the current state. wt also keeps one managed line for the shared
-server in `~/.pgpass` (mode 0600), which the connections use, so DBeaver never asks for a password.
-It only ever changes connections it created (their ids start with `wt-pg-`); close DBeaver before the
-first sync and refresh or restart it afterwards, because an open DBeaver can overwrite its file.
+Add `dbeaver: true` to the catalog (or `dbeaver: /path/to/data-sources.json`) and every wt
+database of the shared Postgres gets a DBeaver connection by itself, in a folder named `wt`:
+`<repo>-<wt>` for each database (`music-back-testt1`) and one `<repo>` connection for the whole
+server with "Show all databases". They appear after `wt up`, disappear after `wt down` or `wt
+remove`, and `wt dbeaver sync` rebuilds them from the current state. wt also keeps one managed
+line for the shared server in `~/.pgpass` (mode 0600), which the connections use, so DBeaver never
+asks for a password. It only ever changes connections it created (their ids start with `wt-pg-`);
+close DBeaver before the first sync and refresh or restart it afterwards, because an open DBeaver
+can overwrite its file.
 
 ## Names on the shared servers
 
