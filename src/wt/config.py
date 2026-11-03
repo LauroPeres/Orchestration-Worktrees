@@ -274,6 +274,8 @@ class LoadedConfig:
     service_order: tuple[str, ...] = ()  # catalog order: the port index
     warnings: tuple[str, ...] = ()  # non-fatal notes from loading, for the caller to show
     worktrees_dir: Path | None = None  # the catalog's `worktrees` folder, resolved; None = default
+    dbeaver_enabled: bool = False  # the catalog's `dbeaver` key is true or a path (SPEC section 27)
+    dbeaver_file: Path | None = None  # `dbeaver: <path>` resolved; None = DBeaver's default file
 
     @property
     def root(self) -> Path:

@@ -713,6 +713,61 @@ def test_with_uses_keeps_the_worktrees_folder(tmp_path: Path) -> None:
     assert other.worktrees_dir == loaded.worktrees_dir == tmp_path / "trees"
 
 
+# --- the optional `dbeaver` key (SPEC section 27) ---
+def test_dbeaver_is_off_when_absent(tmp_path: Path) -> None:
+    assert Catalog.model_validate(yaml.safe_load(GOOD)).dbeaver is None
+    loaded = load_project(project_catalog(tmp_path))
+    assert (loaded.dbeaver_enabled, loaded.dbeaver_file) == (False, None)
+
+
+def test_dbeaver_true_enables_the_default_file(tmp_path: Path) -> None:
+    loaded = load_project(project_catalog(tmp_path, header=PROJECT_HEADER + "dbeaver: true\n"))
+    assert (loaded.dbeaver_enabled, loaded.dbeaver_file) == (True, None)
+
+
+def test_dbeaver_false_is_off(tmp_path: Path) -> None:
+    loaded = load_project(project_catalog(tmp_path, header=PROJECT_HEADER + "dbeaver: false\n"))
+    assert (loaded.dbeaver_enabled, loaded.dbeaver_file) == (False, None)
+
+
+def test_dbeaver_string_is_the_file_and_need_not_exist(tmp_path: Path) -> None:
+    target = tmp_path / "ds" / "data-sources.json"
+    header = f"{PROJECT_HEADER}dbeaver: {target}\n"
+    loaded = load_project(project_catalog(tmp_path, header=header))
+    assert (loaded.dbeaver_enabled, loaded.dbeaver_file) == (True, target)
+    assert not target.parent.exists()
+
+
+def test_dbeaver_home_is_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    header = PROJECT_HEADER + "dbeaver: ~/ds/data-sources.json\n"
+    loaded = load_project(project_catalog(tmp_path, header=header))
+    assert loaded.dbeaver_file == tmp_path / "home" / "ds" / "data-sources.json"
+
+
+def test_dbeaver_relative_path_is_read_against_the_catalog_folder(tmp_path: Path) -> None:
+    catalog_dir = tmp_path / "conf"
+    catalog_dir.mkdir()
+    header = PROJECT_HEADER + "dbeaver: ../ds/data-sources.json\n"
+    loaded = load_project(project_catalog(catalog_dir, header=header))
+    assert loaded.dbeaver_file == tmp_path / "ds" / "data-sources.json"
+
+
+@pytest.mark.parametrize("value", ['""', '"   "'])
+def test_blank_dbeaver_is_an_error(tmp_path: Path, value: str) -> None:
+    path = project_catalog(tmp_path, header=f"{PROJECT_HEADER}dbeaver: {value}\n")
+    with pytest.raises(WtError, match=r"invalid catalog\.yaml:\n  dbeaver: must not be empty"):
+        load_project(path)
+
+
+def test_with_uses_keeps_the_dbeaver_settings(tmp_path: Path) -> None:
+    header = PROJECT_HEADER + "dbeaver: ./ds.json\n"
+    loaded = load_project(project_catalog(tmp_path, header=header), ["back"])
+    other = loaded.with_uses(["front"])
+    assert other.uses == ("front",)
+    assert (other.dbeaver_enabled, other.dbeaver_file) == (True, tmp_path / "ds.json")
+
+
 # --- wt migrate: read_legacy and merge_legacy (pure) ---
 SHOP = """\
 project: shop
@@ -1086,6 +1141,18 @@ def test_merge_keeps_the_worktrees_key_when_it_adds_services(tmp_path: Path) -> 
     result = merge_legacy(existing, other, tmp_path)
     assert result.added == ("cron",)
     assert result.catalog["worktrees"] == "./trees"
+
+
+@pytest.mark.parametrize("value", [True, "~/ds/data-sources.json"])
+def test_merge_keeps_the_dbeaver_key_as_written(tmp_path: Path, value: bool | str) -> None:
+    existing = {**merge_legacy(None, legacy_dict(), tmp_path).catalog, "dbeaver": value}
+    result = merge_legacy(existing, legacy_dict(), tmp_path)
+    assert result.catalog["dbeaver"] == value
+    assert merge_legacy(result.catalog, legacy_dict(), tmp_path).catalog == result.catalog
+
+
+def test_merge_never_adds_a_dbeaver_key(tmp_path: Path) -> None:
+    assert "dbeaver" not in merge_legacy(None, legacy_dict(), tmp_path).catalog
 
 
 def test_merge_never_adds_a_worktrees_key(tmp_path: Path) -> None:

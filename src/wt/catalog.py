@@ -69,12 +69,19 @@ class Catalog(Strict):
         default=None,
         description="folder for the worktrees (~ expanded, relative to this file); optional",
     )
+    dbeaver: bool | str | None = Field(
+        default=None,
+        description=(
+            "true syncs each wt's databases to DBeaver's default data-sources.json; a path "
+            "(~ expanded, relative to this file) names the file; false or absent = off"
+        ),
+    )
     services: dict[str, CatalogService] = Field(min_length=1)
 
-    @field_validator("worktrees")
+    @field_validator("worktrees", "dbeaver")
     @classmethod
-    def _worktrees_not_blank(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
+    def _path_not_blank(cls, value: bool | str | None) -> bool | str | None:
+        if isinstance(value, str) and not value.strip():
             raise ValueError("must not be empty")
         return value
 
@@ -241,8 +248,20 @@ def worktrees_folder(catalog: Catalog, catalog_file: Path) -> Path | None:
     """
     if catalog.worktrees is None:
         return None
-    folder = Path(catalog.worktrees.strip()).expanduser()
-    return folder if folder.is_absolute() else (catalog_file.parent / folder).resolve()
+    return _catalog_path(catalog.worktrees, catalog_file)
+
+
+def dbeaver_file(catalog: Catalog, catalog_file: Path) -> Path | None:
+    """The `dbeaver: <path>` file, resolved like `worktrees`; None when the key is not a path."""
+    if not isinstance(catalog.dbeaver, str):
+        return None
+    return _catalog_path(catalog.dbeaver, catalog_file)
+
+
+def _catalog_path(value: str, catalog_file: Path) -> Path:
+    """A path written in the catalog: `~` expanded, relative to the catalog's folder."""
+    path = Path(value.strip()).expanduser()
+    return path if path.is_absolute() else (catalog_file.parent / path).resolve()
 
 
 def _infra_settings(infra: Shared, provider: str) -> dict[str, Any]:
@@ -423,6 +442,8 @@ def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
         service_order=selected.order,
         warnings=selected.warnings,
         worktrees_dir=worktrees_folder(catalog, path),
+        dbeaver_enabled=catalog.dbeaver is not None and catalog.dbeaver is not False,
+        dbeaver_file=dbeaver_file(catalog, path),
     )
 
 

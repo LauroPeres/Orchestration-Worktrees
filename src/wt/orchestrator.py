@@ -6,13 +6,14 @@ import json
 import os
 import shutil
 import time
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from wt import cache, compose, git, health, host, naming, proc, router, tls
+from wt import cache, compose, dbeaver, git, health, host, naming, pgpass, proc, router, tls
 from wt import providers as registry
 from wt.catalog import CatalogService, load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
@@ -20,6 +21,7 @@ from wt.errors import WtError
 from wt.messages import no_services_message
 from wt.naming import Names
 from wt.paths import project_dir
+from wt.providers import postgres
 from wt.providers.base import BranchContext, Kind, Provider
 from wt.state import (
     BranchState,
@@ -40,6 +42,7 @@ _REASON_ELLIPSIS = "..."
 _REASON_HEAD_CHARS = 50
 _REASON_TAIL_CHARS = _REASON_MAX_CHARS - _REASON_HEAD_CHARS - len(_REASON_ELLIPSIS)
 _NOT_RUNNING_STATUSES = ("stopped", "removing")
+DBEAVER_HOST = "127.0.0.1"  # the shared Postgres publishes on loopback only
 ROUTE_WAIT_SECONDS = 5  # the default wait of router.wait_unrouted
 
 Log = Callable[[str], None]
@@ -389,7 +392,9 @@ class Orchestrator:
         timeout: int = 120,
     ) -> list[ServiceReport]:
         git.check_branch_name(branch)
-        return self._for_creating(branch, uses)._up(branch, build=build, timeout=timeout)
+        reports = self._for_creating(branch, uses)._up(branch, build=build, timeout=timeout)
+        self._sync_dbeaver_quietly()
+        return reports
 
     def _up(self, branch: str, *, build: bool, timeout: int) -> list[ServiceReport]:
         """`up` on the orchestrator that owns the branch's selection."""
@@ -1136,6 +1141,58 @@ class Orchestrator:
             return report("ok", f"running (pid {ps.pid})")
         return report("fail", f"exited; see {ps.log}")
 
+    # ---- DBeaver (SPEC section 27) ---------------------------------------------------------
+
+    def dbeaver_connections(self) -> list[dbeaver.DbConnection]:
+        """The connections DBeaver should list: one per recorded wt database, one per server."""
+        services = load_catalog(self.loaded.catalog).catalog.services
+        project = self.cfg.project
+        connections: list[dbeaver.DbConnection] = []
+        repos: dict[str, None] = {}  # insertion-ordered set
+        for bs in self.store.load().branches.values():
+            names = self.names(bs.branch)
+            located = [
+                (_database_repo(services, database, names, project), database)
+                for database in bs.providers.get("postgres", [])
+            ]
+            connections += _database_connections(project, bs.slug, located)
+            repos.update(dict.fromkeys(repo for repo, _ in located))
+        return [*connections, *(_server_connection(project, repo) for repo in repos)]
+
+    def sync_dbeaver(self) -> dbeaver.DbeaverChange:
+        """Make DBeaver's file match the databases in state; fails when the key is off."""
+        if not self.loaded.dbeaver_enabled:
+            raise WtError("dbeaver sync is off: add dbeaver: true to the catalog")
+        path = self.loaded.dbeaver_file or dbeaver.default_data_sources_path()
+        if path is None:
+            raise WtError("no default DBeaver location on this system; set dbeaver: <path>")
+        # Two branches syncing at once would each rewrite the whole file from their own view.
+        with file_lock("dbeaver"):
+            connections = self.dbeaver_connections()
+            if connections:
+                pgpass.ensure(
+                    host=DBEAVER_HOST,
+                    port=postgres.host_port(),
+                    user=postgres.USER,
+                    password=postgres.password(),
+                )
+            return dbeaver.apply(path, connections)
+
+    def _sync_dbeaver_quietly(self) -> None:
+        """The sync after `up`/`down`/`remove`: a failure is a note, never an error of them."""
+        if not self.loaded.dbeaver_enabled:
+            return
+        try:
+            change = self.sync_dbeaver()
+        except WtError as exc:
+            self.log(f"[yellow]note:[/] DBeaver sync failed: {exc}")
+            return
+        if change.changed:
+            self.log(
+                f"DBeaver: +{len(change.added)} ~{len(change.updated)} -{len(change.removed)} "
+                "connection(s); refresh the list or restart DBeaver"
+            )
+
     # ---- down -----------------------------------------------------------------------------
 
     def down(self, branch: str, *, force: bool = False) -> bool:
@@ -1146,7 +1203,8 @@ class Orchestrator:
             if self._down_locked(branch, force=force) is None:
                 self._log_nothing_to_remove(branch)
                 return False
-            return True
+        self._sync_dbeaver_quietly()
+        return True
 
     def remove(self, branch: str, *, force: bool = False) -> bool:
         """`down`, then delete the git branch in every repo, except protected ones.
@@ -1164,7 +1222,9 @@ class Orchestrator:
             found, deleted = self._delete_branch_in_repos(branch, sources)
             if not known and not found:
                 self._log_nothing_to_remove(branch)
-            return known or deleted > 0
+        if known:
+            self._sync_dbeaver_quietly()
+        return known or deleted > 0
 
     def _catalog_repo_paths(self) -> dict[str, Path]:
         """Every repo of the catalog (not only those of the selected services) -> its folder."""
@@ -1603,6 +1663,50 @@ class Orchestrator:
                     b.compose_projects.pop(repo, None)
 
         self._record(branch, cleared)
+
+
+def _database_repo(
+    services: dict[str, CatalogService], recorded: str, names: Names, fallback: str
+) -> str:
+    """Repo of the first catalog service whose Postgres database became `recorded` on this branch.
+
+    Matches by naming the logical databases again instead of parsing the recorded name.
+    """
+    for svc in services.values():
+        pg = svc.infra.postgres
+        if pg is not None and any(postgres.db_name(db, names) == recorded for db in pg.databases):
+            return svc.repo
+    return fallback
+
+
+def _database_connections(
+    project: str, slug: str, located: list[tuple[str, str]]
+) -> list[dbeaver.DbConnection]:
+    """One connection per database of a wt; the name adds the database when a repo has several."""
+    per_repo = Counter(repo for repo, _ in located)
+    return [
+        dbeaver.DbConnection(
+            id=f"wt-pg-{project}-{slug}-{database}",
+            name=f"{repo}-{slug}" if per_repo[repo] == 1 else f"{repo}-{database}-{slug}",
+            host=DBEAVER_HOST,
+            port=postgres.host_port(),
+            database=database,
+            user=postgres.USER,
+        )
+        for repo, database in located
+    ]
+
+
+def _server_connection(project: str, repo: str) -> dbeaver.DbConnection:
+    return dbeaver.DbConnection(
+        id=f"wt-pg-{project}-server-{repo}",
+        name=repo,
+        host=DBEAVER_HOST,
+        port=postgres.host_port(),
+        database="postgres",
+        user=postgres.USER,
+        show_all_databases=True,
+    )
 
 
 def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:

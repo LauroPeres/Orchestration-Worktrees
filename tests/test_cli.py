@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from tests.conftest import COMPOSE, SHARED, SHOP_CATALOG, FakeDocker
 from tests.test_catalog_edit import EDIT_CATALOG
-from wt import __version__, cache, catalog_edit, cli, compose, doctor, host, proc
+from wt import __version__, cache, catalog_edit, cli, compose, dbeaver, doctor, host, proc
 from wt.catalog import load_project
 from wt.cli import app
 from wt.errors import WtError
@@ -2196,3 +2196,90 @@ def test_cache_errors_are_one_liners_and_json_documents(
         "schema": 1,
         "error": "cannot read the cache at /x: denied",
     }
+
+
+# --- wt dbeaver sync (SPEC §27) ----------------------------------------------------------------
+# What a sync writes is tested in test_dbeaver.py: here only the printed text and the JSON document,
+# with Orchestrator.sync_dbeaver faked.
+
+DBEAVER_FILE = Path(
+    "/home/u/.local/share/DBeaverData/workspace6/General/.dbeaver/data-sources.json"
+)
+DBEAVER_REFRESH_HINT = "refresh the connection list or restart DBeaver"
+
+
+def _fake_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    added: list[str] | None = None,
+    updated: list[str] | None = None,
+    removed: list[str] | None = None,
+) -> None:
+    change = dbeaver.DbeaverChange(
+        file=DBEAVER_FILE, added=added or [], updated=updated or [], removed=removed or []
+    )
+    monkeypatch.setattr(Orchestrator, "sync_dbeaver", lambda self: change)
+
+
+def test_dbeaver_sync_prints_only_the_non_empty_lines_the_file_and_the_hint(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_sync(monkeypatch, added=["shop-api-cart", "shop-api-menu"], removed=["shop-api-old"])
+    result = runner.invoke(app, ["dbeaver", "sync"])
+    assert result.exit_code == 0, result.output
+    assert "DBeaver: added shop-api-cart, shop-api-menu" in result.output
+    assert "DBeaver: removed shop-api-old" in result.output
+    assert "updated" not in result.output
+    assert str(DBEAVER_FILE) in result.output
+    assert DBEAVER_REFRESH_HINT in result.output
+
+
+def test_dbeaver_sync_says_when_nothing_changed(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_sync(monkeypatch)
+    result = runner.invoke(app, ["dbeaver", "sync"])
+    assert result.exit_code == 0, result.output
+    assert f"DBeaver is already in sync ({DBEAVER_FILE})" in result.output
+    assert DBEAVER_REFRESH_HINT in result.output
+
+
+def test_dbeaver_sync_json(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_sync(monkeypatch, added=["shop-api-cart"], updated=["shop-api"])
+    result = runner.invoke(app, ["dbeaver", "sync", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "changed": True,
+        "added": ["shop-api-cart"],
+        "updated": ["shop-api"],
+        "removed": [],
+        "file": str(DBEAVER_FILE),
+    }
+
+
+def test_dbeaver_sync_json_when_nothing_changed(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_sync(monkeypatch)
+    result = runner.invoke(app, ["dbeaver", "sync", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result)["changed"] is False
+
+
+def test_dbeaver_sync_errors_are_a_one_liner_and_a_json_document(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    message = "dbeaver sync is off: add dbeaver: true to the catalog"
+
+    def off(self: Orchestrator) -> dbeaver.DbeaverChange:
+        raise WtError(message)
+
+    monkeypatch.setattr(Orchestrator, "sync_dbeaver", off)
+    plain = runner.invoke(app, ["dbeaver", "sync"])
+    assert plain.exit_code == 1, plain.output
+    assert str(plain.exception) == message
+    as_json = runner.invoke(app, ["dbeaver", "sync", "--json"])
+    assert as_json.exit_code == 1, as_json.output
+    assert _document(as_json) == {"schema": 1, "error": message}

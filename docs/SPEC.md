@@ -168,7 +168,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.8.1 ✔ (§25) | Keycloak dev users (`infra.keycloak.users`) |
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
-| v0.10.0 (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
+| v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
