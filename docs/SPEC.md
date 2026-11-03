@@ -168,6 +168,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.8.1 ✔ (§25) | Keycloak dev users (`infra.keycloak.users`) |
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
+| v0.10.0 (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1269,3 +1270,44 @@ needs the user's sudo password once, so wt never runs it by itself. `tls.ca_trus
 whether the CA is installed (Linux: `trust list`, the usual anchor folders, the Chrome/NSS database through
 `certutil`; macOS: the keychains; `None` when it cannot be told). `wt doctor` adds a `ca trusted` line: `ok`
 when installed, `warn` with `run mkcert -install once, then restart the browser` when not, `info` when unknown.
+
+## 27. v0.10.0: DBeaver sync
+
+Decided 2026-11-03 (the user asked that a new wt's database shows up in DBeaver by itself). Everything not named
+here is unchanged.
+
+**Opt-in.** Catalog key `dbeaver: true | "<path>"` (default off). `true` means DBeaver's default
+`data-sources.json`: Linux `$XDG_DATA_HOME/DBeaverData/workspace6/General/.dbeaver/data-sources.json` (default
+`~/.local/share/...`), macOS `~/Library/DBeaverData/workspace6/General/.dbeaver/data-sources.json`; other systems
+need an explicit path. A string is the path of a `data-sources.json` (`~` expanded, relative = relative to the
+catalog file). Without the key wt never touches DBeaver's files or `~/.pgpass`.
+
+**What appears.** For every wt (branch in state) that has Postgres databases recorded, in a DBeaver folder named
+`wt`:
+- one connection per database: name `<repo>-<slug>` (`music-back-testt1`; `<repo>-<db>-<slug>` when the wt has
+  more than one database of that repo), host `127.0.0.1`, the shared server's port, the wt's database
+  (`music__testt1`), user `wt`. `<repo>` is the repo of the first catalog service whose `infra.postgres.databases`
+  lists the database.
+- one server connection per such repo: name `<repo>`, database `postgres`, with 'Show all databases', so every
+  database of the server is browsable.
+All use DBeaver's pgpass authentication ("Use .pgpass"); no password is written into DBeaver's files.
+
+**Ownership of what wt writes.** Every connection wt creates has an id starting `wt-pg-` and the custom property
+`wt.managed=true`. A sync adds the missing ones, updates changed ones, removes managed connections that no longer
+match a wt, and leaves every other connection, folder and key of the file untouched (unknown keys are preserved).
+The file is written atomically and only when something changed. If the workspace file or its folder does not exist:
+`WtError("DBeaver workspace not found at <path>; start DBeaver once, or set dbeaver: <path>")`; wt never creates
+DBeaver's folders.
+
+**`~/.pgpass`.** One managed entry for the shared server, `127.0.0.1:<port>:*:wt:<password>` preceded by the
+comment `# wt: shared Postgres (managed by wt)`, in `$PGPASSFILE` or `~/.pgpass` (mode 0600, other lines untouched;
+an existing managed entry is updated in place when the port or password changed).
+
+**When it runs.** After `up` (the databases now exist) and after `down`/`remove` (they are gone), and with
+`wt dbeaver sync [--json]` (full resync from state; JSON `{"schema":1,"changed":bool,"added":[…],"updated":[…],
+"removed":[…],"file":"…"}`). A failure while syncing is a yellow note in `up`/`down`/`remove`, never an error of
+them; `wt dbeaver sync` itself fails with the message. With the key off it fails with
+`dbeaver sync is off: add dbeaver: true to the catalog`.
+
+**DBeaver running.** DBeaver may not reload the file while it is open, and a running DBeaver can overwrite it on
+exit. After a sync, refresh the connection list or restart DBeaver; to be safe, close DBeaver before the first sync.
