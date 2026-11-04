@@ -37,7 +37,17 @@ ATTEMPT_PAUSE = 0.05
 LS_KEYS = {"schema", "project", "branches"}
 BRANCH_KEYS = {"branch", "status", "services"}
 SERVICE_KEYS = {"name", "kind", "status", "health", "url", "port"}
-ACTION_KEYS = {"schema", "branch", "action", "changed", "status", "urls", "warnings"}
+ACTION_KEYS = {
+    "schema",
+    "branch",
+    "action",
+    "changed",
+    "status",
+    "folder",
+    "repos",
+    "urls",
+    "warnings",
+}
 
 
 def free_port() -> int:
