@@ -70,12 +70,13 @@ wt remove my-branch     # down + deletes the git branch in every repo of the pro
                         # (asks first; --yes, --force); also works after a `wt down`
 ```
 
-When wt has to create a branch (it does not exist locally or on `origin`), it runs `git fetch origin` in
-that repo and starts the branch from the latest `origin/<default branch>` (`origin/HEAD`, else
-`origin/main` or `origin/master`), without an upstream so a plain `git push` cannot reach the default
-branch. Your own checkout and its local `main` are never changed. If the fetch fails (offline), wt says
-so and uses the last known `origin`; with no remote it starts from the current `HEAD`.
-`WT_NO_FETCH=1` skips the fetch. A branch that already exists locally is used as it is.
+When wt has to create a branch (it does not exist locally or on `origin`), it runs `git fetch
+origin` in that repo and starts the branch from the latest `origin/<default branch>`
+(`origin/HEAD`, else `origin/main` or `origin/master`), without an upstream so a plain `git push`
+cannot reach the default branch. Your own checkout and its local `main` are never changed. If the
+fetch fails (offline), wt says so and uses the last known `origin`; with no remote it starts from
+the current `HEAD`. `WT_NO_FETCH=1` skips the fetch. A branch that already exists locally is used
+as it is.
 
 Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
 your main checkout.
