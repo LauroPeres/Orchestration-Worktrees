@@ -88,6 +88,58 @@ def test_up_twice_is_safe(orch, docker: FakeDocker) -> None:
     assert docker.ups == ["wt-shop-feat-cart-api"] * 2
 
 
+def up_logs_with_ensure_result(
+    orch, monkeypatch: pytest.MonkeyPatch, **ensure_fields: str | None
+) -> list[str]:
+    """Runs `up` while `git.ensure_worktree` reports `ensure_fields` as where the branch started."""
+    real = git.ensure_worktree
+
+    def fake(repo: Path, branch: str, target: Path) -> SimpleNamespace:
+        res = real(repo, branch, target)
+        return SimpleNamespace(
+            path=res.path, created=res.created, branch_created=res.branch_created, **ensure_fields
+        )
+
+    monkeypatch.setattr(git, "ensure_worktree", fake)
+    o = orch()
+    logs: list[str] = []
+    o.log = logs.append
+    o.up("feat/cart", uses=selection(o))
+    return logs
+
+
+def test_up_logs_the_origin_a_new_branch_started_from(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = up_logs_with_ensure_result(
+        orch, monkeypatch, base="origin/main (a1b2c3d)", fetch_note=None
+    )
+    assert "created branch 'feat/cart' in repo 'api' from origin/main (a1b2c3d)" in logs
+    assert not any("note:" in m for m in logs)
+
+
+def test_up_logs_the_current_head_when_the_branch_did_not_start_from_origin(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = up_logs_with_ensure_result(orch, monkeypatch, base="HEAD", fetch_note=None)
+    assert "created branch 'feat/cart' in repo 'api' from its current HEAD" in logs
+
+
+def test_up_logs_the_current_head_when_the_start_point_is_unknown(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = up_logs_with_ensure_result(orch, monkeypatch, base=None, fetch_note=None)
+    assert "created branch 'feat/cart' in repo 'api' from its current HEAD" in logs
+
+
+def test_up_logs_why_origin_could_not_be_fetched(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    note = "could not fetch origin (no route to host); using the last known origin state"
+    logs = up_logs_with_ensure_result(orch, monkeypatch, base="HEAD", fetch_note=note)
+    assert f"[yellow]note:[/] repo 'api': {note}" in logs
+
+
 def route_for_another_project(project: str, branch: str, domain: str, host_name: str) -> Path:
     """A route file another project wrote, so its hosts count as taken."""
     other = naming.Names(project, branch, domain)

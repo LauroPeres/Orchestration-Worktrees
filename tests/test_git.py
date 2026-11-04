@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ def test_creates_new_branch_from_head(make_repo, tmp_path: Path) -> None:
     repo = make_repo()
     target = tmp_path / "wt" / "feat"
     res = git.ensure_worktree(repo, "feat/x", target)
-    assert res == git.EnsureResult(target, created=True, branch_created=True)
+    assert res == git.EnsureResult(target, created=True, branch_created=True, base="HEAD")
     assert (target / "README.md").exists()
     assert "feat/x" in branches(repo)
 
@@ -155,3 +156,116 @@ def test_move_worktree_refuses_main_checkout(make_repo, tmp_path: Path) -> None:
         git.move_worktree(repo, repo, new)
     assert "\n" not in str(excinfo.value)
     assert repo.is_dir() and not new.exists()
+
+
+def _origin_with_stale_clone(make_repo, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A bare origin, a clone (`app`) and a second clone (`other`) that pushes a newer commit."""
+    run_git(tmp_path, "init", "-q", "--bare", "-b", "main", "origin.git")
+    bare = tmp_path / "origin.git"
+    seed = make_repo("seed")
+    run_git(seed, "push", "-q", str(bare), "main")
+    app, other = tmp_path / "app", tmp_path / "other"
+    run_git(tmp_path, "clone", "-q", str(bare), str(app))
+    run_git(tmp_path, "clone", "-q", str(bare), str(other))
+    return bare, app, other
+
+
+def _push_commit(other: Path, name: str) -> str:
+    (other / name).write_text(name)
+    run_git(other, "add", ".")
+    run_git(other, "commit", "-qm", name)
+    run_git(other, "push", "-q", "origin", "main")
+    return run_git(other, "rev-parse", "HEAD").strip()
+
+
+def test_new_branch_starts_at_latest_origin_main(make_repo, tmp_path: Path) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    local_main = run_git(app, "rev-parse", "main").strip()
+    tip = _push_commit(other, "newer.txt")
+    target = tmp_path / "wt" / "feat"
+    res = git.ensure_worktree(app, "feat/x", target)
+    head = run_git(target, "rev-parse", "HEAD").strip()
+    assert head == tip != local_main
+    assert run_git(app, "rev-parse", "main").strip() == local_main  # never moved
+    assert res.base == f"origin/main ({tip[:7]})"
+    assert res.fetch_note is None and res.branch_created
+
+
+def test_new_branch_has_no_upstream(make_repo, tmp_path: Path) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    git.ensure_worktree(app, "feat/x", tmp_path / "t")
+    with pytest.raises(subprocess.CalledProcessError):
+        run_git(app, "rev-parse", "--abbrev-ref", "feat/x@{upstream}")
+
+
+def test_branch_only_on_origin_is_tracked_after_fetch(make_repo, tmp_path: Path) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    run_git(other, "push", "-q", "origin", "main:feat/remote")
+    assert "origin/feat/remote" not in run_git(app, "branch", "-r")
+    target = tmp_path / "t"
+    res = git.ensure_worktree(app, "feat/remote", target)
+    assert res.created and res.base is None
+    assert (
+        run_git(target, "rev-parse", "--abbrev-ref", "@{upstream}").strip() == "origin/feat/remote"
+    )
+
+
+def test_fetch_failure_uses_last_known_origin_and_reports(make_repo, tmp_path: Path) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    known = run_git(app, "rev-parse", "origin/main").strip()
+    run_git(app, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    target = tmp_path / "t"
+    res = git.ensure_worktree(app, "feat/x", target)
+    assert run_git(target, "rev-parse", "HEAD").strip() == known
+    assert res.base == f"origin/main ({known[:7]})"
+    assert res.fetch_note is not None
+    assert res.fetch_note.startswith("could not fetch origin (")
+    assert res.fetch_note.endswith("); using the last known origin state")
+
+
+def test_fetch_failure_without_known_origin_branch_falls_back_to_head(
+    make_repo, tmp_path: Path
+) -> None:
+    repo = make_repo()
+    run_git(repo, "remote", "add", "origin", str(tmp_path / "gone.git"))
+    res = git.ensure_worktree(repo, "feat/x", tmp_path / "t")
+    assert res.base == "HEAD" and res.branch_created
+    assert res.fetch_note is not None
+
+
+def test_no_remote_branches_from_head_without_note(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    res = git.ensure_worktree(repo, "feat/x", tmp_path / "t")
+    assert res.base == "HEAD" and res.fetch_note is None
+
+
+def test_wt_no_fetch_skips_the_fetch(make_repo, tmp_path: Path, monkeypatch) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    stale = run_git(app, "rev-parse", "origin/main").strip()
+    _push_commit(other, "newer.txt")
+    monkeypatch.setenv("WT_NO_FETCH", "1")
+    target = tmp_path / "t"
+    res = git.ensure_worktree(app, "feat/x", target)
+    assert run_git(target, "rev-parse", "HEAD").strip() == stale
+    assert res.base == f"origin/main ({stale[:7]})" and res.fetch_note is None
+
+
+def test_existing_local_branch_is_not_fetched_or_moved(make_repo, tmp_path: Path) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    local = run_git(app, "rev-parse", "main").strip()
+    run_git(app, "branch", "feat/y")
+    _push_commit(other, "newer.txt")
+    target = tmp_path / "t"
+    res = git.ensure_worktree(app, "feat/y", target)
+    assert res.base is None and res.fetch_note is None and not res.branch_created
+    assert run_git(target, "rev-parse", "HEAD").strip() == local
+    assert run_git(app, "rev-parse", "origin/main").strip() == local  # no fetch happened
+
+
+def test_origin_head_decides_the_base(make_repo, tmp_path: Path) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    run_git(other, "push", "-q", "origin", "main:trunk")
+    run_git(app, "fetch", "-q", "origin")
+    run_git(app, "remote", "set-head", "origin", "trunk")
+    res = git.ensure_worktree(app, "feat/x", tmp_path / "t")
+    assert res.base is not None and res.base.startswith("origin/trunk (")

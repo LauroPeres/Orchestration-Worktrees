@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.10.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.10.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -69,6 +69,13 @@ wt down my-branch       # --force also removes worktrees with uncommitted change
 wt remove my-branch     # down + deletes the git branch in every repo of the project where it exists
                         # (asks first; --yes, --force); also works after a `wt down`
 ```
+
+When wt has to create a branch (it does not exist locally or on `origin`), it runs `git fetch origin` in
+that repo and starts the branch from the latest `origin/<default branch>` (`origin/HEAD`, else
+`origin/main` or `origin/master`), without an upstream so a plain `git push` cannot reach the default
+branch. Your own checkout and its local `main` are never changed. If the fetch fails (offline), wt says
+so and uses the last known `origin`; with no remote it starts from the current `HEAD`.
+`WT_NO_FETCH=1` skips the fetch. A branch that already exists locally is used as it is.
 
 Running `wt up` again for a branch that is already up changes nothing. `wt down main` keeps
 your main checkout.
@@ -681,6 +688,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.9.0 ✔ | Windows CI job (report only) and `docs/windows.md`; Windows stays unsupported |
 | v0.9.1 ✔ | One folder per wt (`wt move`), infra rows, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ | DBeaver sync: a connection per wt database (`dbeaver:` in the catalog) |
+| v0.10.1 ✔ | A new branch starts from the latest `origin/<default branch>` |
 | later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

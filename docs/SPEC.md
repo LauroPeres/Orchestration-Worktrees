@@ -169,7 +169,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
-| v0.10.1 (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
+| v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1328,7 +1328,7 @@ When wt must **create** the git branch of a wt in a repo (it exists neither loca
    `git push` can never push to the default branch by accident).
 4. No remote or no usable base: the branch starts from the repo's current `HEAD`, as before.
 The log line says where it started: `created branch 'x' in repo 'r' from origin/main (a1b2c3d)` or
-`created branch 'x' in repo 'r' from its current HEAD (no origin/main)`.
+`created branch 'x' in repo 'r' from its current HEAD`.
 
 Unchanged: a branch that already exists locally is used as it is (never moved or updated); a branch that exists only
 as `origin/<branch>` is created tracking it, now after the fetch, so it is the latest; the user's own checkout and
