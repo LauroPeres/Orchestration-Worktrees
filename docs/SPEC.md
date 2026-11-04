@@ -171,6 +171,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
 | v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
 | v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
+| v0.12.0 ✔ (§30) | `--json` branch rows and actions say where the worktrees are (`folder`, `repos` with paths) |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1425,3 +1426,22 @@ inside its repo folder`. JSON (SPEC §21 style): `{"schema":1,"branch":…,"chan
 
 **Catalog key.** `claude: bool` (default true). Unknown here: `claude: false` only disables the automatic runs and
 `wt claude sync` (it then says `claude is off in the catalog`).
+
+## 30. v0.12.0: where a wt's worktrees are, in the JSON
+
+Decided 2026-11-04 for the task software (Orchestration-Tasks `docs/SPEC.md` §9), which creates a wt with
+`wt add --json` and then starts Claude sessions in its worktrees. Amends §21 (JSON output).
+
+- **Branch rows and action documents gain two keys**, after `status`: `"folder"` and `"repos"`.
+  - `folder`: the one folder holding the worktrees wt created for the branch (§26), as an absolute path; `null`
+    when it has none (only the repos' own checkouts) or they are spread over several folders (`wt move`).
+  - `repos`: `[{"repo": "<repo>", "path": "<absolute path>"}]`, one entry per repo of the branch in state order
+    (the recorded path, so a repo's own checkout appears with its own path); `[]` when the branch is not in state.
+- `ls` (and every project of `ls --all`): each branch row is `{"branch","status","folder","repos","services"}`.
+- `add`, `up`, `stop`: the location after the action. `down`, `remove`: `"folder": null, "repos": []` (the branch is
+  gone). Example: `{"schema":1,"branch":"feat/x","action":"add","changed":true,"status":"stopped",
+  "folder":"/home/u/wt/feat-x","repos":[{"repo":"notes-back","path":"/home/u/wt/feat-x/notes-back"}],"urls":{…},
+  "warnings":[]}`.
+- `"schema"` stays `1`: keys are only added, so existing readers keep working.
+- No `--base` option: §28 already starts a new branch from the fetched `origin/<default branch>`, which is the base
+  the task software needs.

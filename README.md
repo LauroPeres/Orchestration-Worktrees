@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.11.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.12.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -719,6 +719,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.10.0 ✔ | DBeaver sync: a connection per wt database (`dbeaver:` in the catalog) |
 | v0.10.1 ✔ | A new branch starts from the latest `origin/<default branch>` |
 | v0.11.0 ✔ | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
+| v0.12.0 ✔ | `--json` says where each wt's worktrees are (`folder`, `repos` with paths) |
 | later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

@@ -5,7 +5,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -212,11 +212,17 @@ def _service_health(report: ServiceReport, *, probed: bool) -> str | None:
     return report.outcome if probed and report.outcome != "skipped" else None
 
 
+def _repos_json(worktrees: dict[str, str]) -> list[JsonDocument]:
+    return [{"repo": repo, "path": path} for repo, path in worktrees.items()]
+
+
 def _branches_json(statuses: list[BranchStatus], *, probed: bool) -> list[JsonDocument]:
     return [
         {
             "branch": branch.branch,
             "status": branch.status,
+            "folder": branch.folder,
+            "repos": _repos_json(branch.worktrees),
             "services": [
                 {
                     "name": report.service,
@@ -294,10 +300,15 @@ def catalog_document(cat: Catalog) -> JsonDocument:
 
 @dataclass(frozen=True)
 class ActionOutcome:
-    """What an action left behind. `changed` is False for a no-op; `status` None: branch is gone."""
+    """What an action left behind. `changed` is False for a no-op; `status` None: branch is gone.
+
+    `folder` and `worktrees` (repo -> path) say where the branch's worktrees are (SPEC §30).
+    """
 
     changed: bool = True
     status: str | None = None
+    folder: str | None = None
+    worktrees: dict[str, str] = field(default_factory=dict)
     urls: dict[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
 
@@ -312,6 +323,8 @@ def action_document(
         "action": action,
         "changed": outcome.changed,
         "status": outcome.status,
+        "folder": outcome.folder,
+        "repos": _repos_json(outcome.worktrees),
         "urls": outcome.urls,
         "warnings": list(outcome.warnings),
     }
@@ -346,24 +359,28 @@ def _failed(report: ServiceReport) -> bool:
     return report.outcome == "fail"
 
 
-def up_document(
-    branch: str,
-    reports: list[ServiceReport],
-    urls: dict[str, str],
-    load_warnings: tuple[str, ...],
-) -> JsonDocument:
+def up_document(branch: str, reports: list[ServiceReport], now: ActionOutcome) -> JsonDocument:
+    """`now` carries the urls, location and load warnings; the reports decide the status."""
     unhealthy = tuple(f"{r.service} is not healthy: {r.detail}" for r in reports if _failed(r))
-    outcome = ActionOutcome(
+    outcome = replace(
+        now,
         status="degraded" if unhealthy else "up",
-        urls=urls,
-        warnings=(*load_warnings, *unhealthy),
+        warnings=(*now.warnings, *unhealthy),
     )
     return action_document(branch, "up", outcome)
 
 
-def _status_of(orch: Orchestrator, branch: str) -> str | None:
-    """The branch's status as `ls` reports it now; None when it is not in state."""
-    return next((row.status for row in orch.ls(probe=False) if row.branch == branch), None)
+def _now(orch: Orchestrator, branch: str, outcome: ActionOutcome) -> ActionOutcome:
+    """`outcome` with the branch's location (and status, unless set) as `ls` reports it now."""
+    row = next((r for r in orch.ls(probe=False) if r.branch == branch), None)
+    if row is None:  # not in state: nothing to locate
+        return outcome
+    return replace(
+        outcome,
+        status=outcome.status or row.status,
+        folder=row.folder,
+        worktrees=dict(row.worktrees),
+    )
 
 
 def _version(value: bool) -> None:
@@ -496,7 +513,8 @@ def up(  # noqa: PLR0913  (six CLI options; typer needs them as parameters)
         if not json_output:
             _print_up(branch, reports)
             return
-        _emit(up_document(branch, reports, orch.urls(branch), loaded.warnings))
+        now = ActionOutcome(urls=orch.urls(branch), warnings=loaded.warnings)
+        _emit(up_document(branch, reports, _now(orch, branch, now)))
         if any(_failed(r) for r in reports):
             raise typer.Exit(1)  # same exit code as the table output: up but not healthy
 
@@ -535,13 +553,8 @@ def add(
             chosen = _ask_services(orch)
         added = orch.add(branch, chosen)
         if json_output:
-            outcome = ActionOutcome(
-                changed=added,
-                status=_status_of(orch, branch),
-                urls=orch.urls(branch),
-                warnings=loaded.warnings,
-            )
-            _emit(action_document(branch, "add", outcome))
+            outcome = ActionOutcome(changed=added, urls=orch.urls(branch), warnings=loaded.warnings)
+            _emit(action_document(branch, "add", _now(orch, branch, outcome)))
         elif added:
             console.print(f"[green]{branch} is added (stopped).[/] Start it with `wt up {branch}`.")
 
@@ -557,7 +570,7 @@ def stop(
         orch = Orchestrator(_load(ctx), log=_progress(json_output))
         orch.stop(branch)
         if json_output:
-            outcome = ActionOutcome(status=_status_of(orch, branch), urls=orch.urls(branch))
+            outcome = _now(orch, branch, ActionOutcome(urls=orch.urls(branch)))
             _emit(action_document(branch, "stop", outcome))
         else:
             console.print(f"[green]{branch} is stopped.[/]")

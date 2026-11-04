@@ -108,6 +108,7 @@ class BranchStatus:
     total: int
     services: list[ServiceReport] = field(default_factory=list)
     worktrees: dict[str, str] = field(default_factory=dict)
+    folder: str | None = None  # the one folder of the worktrees wt created (wt_folder)
     databases: list[str] = field(default_factory=list)
     ports: list[int] = field(default_factory=list)
     docker_ok: bool = True
@@ -1509,6 +1510,7 @@ class Orchestrator:
                 + sum(host.alive(ps) for ps in bs.processes.values()),
                 total=len(containers) + len(bs.processes),
                 worktrees={r: s.path for r, s in bs.repos.items()},
+                folder=wt_folder(bs),
                 databases=list(bs.providers.get("postgres", [])),
                 ports=sorted(bs.ports.values()),
                 docker_ok=docker_ok,
@@ -1787,6 +1789,12 @@ def _server_connection(project: str, repo: str) -> dbeaver.DbConnection:
 def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:
     """The catalog services that consume `name` directly, in catalog order."""
     return tuple(other for other, svc in services.items() if name in svc.consumes)
+
+
+def wt_folder(bs: BranchState) -> str | None:
+    """The folder holding the worktrees wt created; None when there are none or several."""
+    folders = _own_folders(bs)
+    return str(folders[0]) if len(folders) == 1 else None
 
 
 def _own_folders(bs: BranchState) -> list[Path]:
