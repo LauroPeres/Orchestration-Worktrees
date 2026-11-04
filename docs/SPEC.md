@@ -170,7 +170,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
 | v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
-| v0.11.0 (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
+| v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules

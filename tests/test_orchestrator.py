@@ -23,6 +23,7 @@ from tests.conftest import (
     SHARED,
     SHOP_CATALOG,
     WINDOW_TRIES,
+    FakeClaudegen,
     FakeDocker,
     FakePluginFactory,
     FakeProvider,
@@ -5040,3 +5041,244 @@ def test_an_unchanged_dbeaver_file_is_not_reported(
     logs = _logged(o)
     o.up("feat/cart", uses=selection(o))
     assert not any("DBeaver" in m for m in logs)
+
+
+# ---- merged .claude (SPEC section 29) -----------------------------------------------------
+
+
+@pytest.fixture
+def ordered_removals(
+    fake_claudegen: FakeClaudegen, monkeypatch: pytest.MonkeyPatch
+) -> FakeClaudegen:
+    """`fake_claudegen` whose events also list each worktree removal, to assert the order."""
+    real_remove_worktree = git.remove_worktree
+
+    def recording_remove_worktree(source: Path, path: Path, *, force: bool = False) -> None:
+        fake_claudegen.events.append("remove worktree")
+        real_remove_worktree(source, path, force=force)
+
+    monkeypatch.setattr(git, "remove_worktree", recording_remove_worktree)
+    return fake_claudegen
+
+
+def _claude_orch(make_repo, tmp_path: Path, *, enabled: bool = True) -> Orchestrator:
+    # loaded for BOTH_REPOS so that `add`/`up` with that selection keep this very config
+    loaded = _trees_orch(make_repo, tmp_path, None).loaded.with_uses(BOTH_REPOS)
+    return Orchestrator(replace(loaded, claude_enabled=enabled), log=lambda m: None)
+
+
+def test_claude_sync_passes_the_created_repos_in_catalog_order(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    make_repo("zed-src", {"docker-compose.yml": COMPOSE})
+    make_repo("alpha-src", {"docker-compose.yml": COMPOSE})
+    # the services are sorted by name, so the first one uses the catalog's last repo
+    catalog = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"zed": "./zed-src", "alpha": "./alpha-src"},
+        "services": {
+            "a-svc": {"repo": "zed", "compose": "docker-compose.yml", "compose_service": "db"},
+            "b-svc": {"repo": "alpha", "compose": "docker-compose.yml", "compose_service": "api"},
+        },
+    }
+    o = Orchestrator(write_global_catalog(tmp_path, catalog), log=lambda m: None)
+    o.add("feat/x", uses=["a-svc", "b-svc"])
+    fake_claudegen.synced.clear()
+    result = o.claude_sync("feat/x")
+    folder = o.worktree_dir("feat/x")
+    assert folder is not None and result.folder == folder
+    assert fake_claudegen.synced == [
+        (folder, "feat/x", {"alpha": folder / "alpha", "zed": folder / "zed"})
+    ]
+    assert list(fake_claudegen.synced[0][2]) == ["alpha", "zed"]
+
+
+def test_claude_sync_leaves_out_a_checkout_wt_did_not_create(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.add("feat/x", uses=BOTH_REPOS)
+
+    def borrowed(bs: state.BranchState) -> None:
+        bs.repos["web"].created = False
+
+    o._record("feat/x", borrowed)
+    fake_claudegen.synced.clear()
+    o.claude_sync("feat/x")
+    folder = o.worktree_dir("feat/x")
+    assert folder is not None
+    assert fake_claudegen.synced == [(folder, "feat/x", {"api": folder / "api"})]
+
+
+def test_claude_sync_is_an_error_when_the_catalog_turns_it_off(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path, enabled=False)
+    o.add("feat/x", uses=BOTH_REPOS)
+    with pytest.raises(WtError, match=r"^claude is off in the catalog$"):
+        o.claude_sync("feat/x")
+    assert fake_claudegen.synced == []
+
+
+def test_claude_sync_of_a_branch_without_a_folder_is_an_error(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    with pytest.raises(WtError, match=r"^feat/none has no worktree folder of its own$"):
+        o.claude_sync("feat/none")
+    assert fake_claudegen.synced == []
+
+
+def test_add_generates_the_claude_files_and_says_so(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    logs = _logged(o)
+    fake_claudegen.conflicts = ["model", "env"]
+    assert o.add("feat/x", uses=BOTH_REPOS) is True
+    folder = o.worktree_dir("feat/x")
+    assert [call[:2] for call in fake_claudegen.synced] == [(folder, "feat/x")]
+    assert (
+        f"Claude: merged .claude + CLAUDE.md in {folder} "
+        "(2 agents, 1 skills); conflicts: model, env"
+    ) in logs
+    assert o.add("feat/x", uses=BOTH_REPOS) is False  # already known: nothing new to merge
+    assert len(fake_claudegen.synced) == 1
+
+
+def test_claude_a_sync_that_changed_nothing_is_not_reported(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    fake_claudegen.changed = False
+    o = _claude_orch(make_repo, tmp_path)
+    logs = _logged(o)
+    o.add("feat/x", uses=BOTH_REPOS)
+    assert len(fake_claudegen.synced) == 1
+    assert not any("Claude" in m for m in logs)
+
+
+def test_the_claude_line_says_none_without_conflicts(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    logs = _logged(o)
+    o.up("feat/x", uses=BOTH_REPOS)
+    assert len(fake_claudegen.synced) == 1
+    assert next(m for m in logs if m.startswith("Claude:")).endswith("conflicts: none")
+
+
+def test_claude_up_after_add_syncs_again_and_up_twice_is_safe(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.add("feat/x", uses=BOTH_REPOS)
+    o.up("feat/x", uses=BOTH_REPOS)
+    o.up("feat/x", uses=BOTH_REPOS)
+    assert len(fake_claudegen.synced) == 3  # add, then each up (the sync itself is idempotent)
+
+
+def test_claude_a_failed_up_does_not_sync(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    docker.fail_up = True
+    o = _claude_orch(make_repo, tmp_path)
+    with pytest.raises(WtError):
+        o.up("feat/x", uses=BOTH_REPOS)
+    assert fake_claudegen.synced == []
+
+
+def test_claude_a_wt_with_fewer_than_two_repos_is_not_synced(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.add("feat/one", uses=["back"])
+    o.up("feat/one", uses=["back"])
+    assert fake_claudegen.synced == []
+
+
+def test_claude_add_and_up_do_not_sync_when_the_catalog_turns_it_off(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path, enabled=False)
+    logs = _logged(o)
+    o.add("feat/x", uses=BOTH_REPOS)
+    o.up("feat/x", uses=BOTH_REPOS)
+    assert fake_claudegen.synced == []
+    assert not any("Claude" in m for m in logs)
+
+
+def test_claude_a_failing_sync_is_a_note_and_up_still_succeeds(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    fake_claudegen.sync_error = "/w/.claude exists and was not generated by wt"
+    o = _claude_orch(make_repo, tmp_path)
+    logs = _logged(o)
+    assert o.add("feat/a", uses=BOTH_REPOS) is True
+    reports = o.up("feat/x", uses=BOTH_REPOS)
+    assert reports and o.store.load().branches["feat/x"].status == "up"
+    notes = [m for m in logs if "Claude files not generated" in m]
+    assert (
+        notes
+        == [
+            "[yellow]note:[/] Claude files not generated: "
+            "/w/.claude exists and was not generated by wt"
+        ]
+        * 2
+    )
+
+
+def test_down_removes_the_claude_files_before_the_worktrees(
+    make_repo, tmp_path: Path, docker: FakeDocker, ordered_removals: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.up("feat/x", uses=BOTH_REPOS)
+    folder = o.worktree_dir("feat/x")
+    assert o.down("feat/x") is True
+    assert ordered_removals.removed == [folder]
+    assert ordered_removals.events == [
+        "claude remove (folder exists: True)",
+        "remove worktree",
+        "remove worktree",
+    ]
+
+
+def test_remove_removes_the_claude_files_before_the_worktrees(
+    make_repo, tmp_path: Path, docker: FakeDocker, ordered_removals: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.add("feat/x", uses=BOTH_REPOS)
+    folder = o.worktree_dir("feat/x")
+    assert o.remove("feat/x") is True
+    assert ordered_removals.removed == [folder]
+    assert ordered_removals.events[0] == "claude remove (folder exists: True)"
+    assert ordered_removals.events[1:] == ["remove worktree"] * 2
+
+
+def test_down_of_a_branch_without_a_folder_removes_no_claude_files(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    assert o.down("feat/none") is False
+    assert fake_claudegen.removed == []
+
+
+def test_down_works_when_the_claude_files_cannot_be_removed(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    fake_claudegen.remove_error = "cannot read the manifest"
+    o = _claude_orch(make_repo, tmp_path)
+    logs = _logged(o)
+    o.add("feat/x", uses=BOTH_REPOS)
+    assert o.down("feat/x") is True
+    assert "[yellow]note:[/] Claude files not removed: cannot read the manifest" in logs
+    assert o.store.load().branches == {}
+
+
+def test_stop_keeps_the_claude_files(
+    make_repo, tmp_path: Path, docker: FakeDocker, fake_claudegen: FakeClaudegen
+) -> None:
+    o = _claude_orch(make_repo, tmp_path)
+    o.up("feat/x", uses=BOTH_REPOS)
+    o.stop("feat/x")
+    assert fake_claudegen.removed == [] and fake_claudegen.events == []

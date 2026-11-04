@@ -13,7 +13,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from wt import cache, compose, dbeaver, git, health, host, naming, pgpass, proc, router, tls
+from wt import (
+    cache,
+    claudegen,
+    compose,
+    dbeaver,
+    git,
+    health,
+    host,
+    naming,
+    pgpass,
+    proc,
+    router,
+    tls,
+)
 from wt import providers as registry
 from wt.catalog import CatalogService, load_catalog
 from wt.config import LoadedConfig, Service, find_cycle
@@ -392,8 +405,10 @@ class Orchestrator:
         timeout: int = 120,
     ) -> list[ServiceReport]:
         git.check_branch_name(branch)
-        reports = self._for_creating(branch, uses)._up(branch, build=build, timeout=timeout)
+        creator = self._for_creating(branch, uses)
+        reports = creator._up(branch, build=build, timeout=timeout)
         self._sync_dbeaver_quietly()
+        creator._claude_sync_quietly(branch)
         return reports
 
     def _up(self, branch: str, *, build: bool, timeout: int) -> list[ServiceReport]:
@@ -582,7 +597,11 @@ class Orchestrator:
     def add(self, branch: str, uses: list[str] | None = None) -> bool:
         """Worktrees and reserved ports only, status `stopped`. False when already known."""
         git.check_branch_name(branch)
-        return self._for_creating(branch, uses)._add(branch)
+        creator = self._for_creating(branch, uses)
+        created = creator._add(branch)
+        if created:
+            creator._claude_sync_quietly(branch)
+        return created
 
     def _add(self, branch: str) -> bool:
         """`add` on the orchestrator that owns the branch's selection."""
@@ -1200,6 +1219,54 @@ class Orchestrator:
                 "connection(s); refresh the list or restart DBeaver"
             )
 
+    # ---- merged .claude (SPEC section 29) --------------------------------------------------
+
+    def claude_sync(self, branch: str) -> claudegen.ClaudeSyncResult:
+        """Generate the merged `.claude/` and `CLAUDE.md` in the folder of `branch`'s worktrees."""
+        if not self.loaded.claude_enabled:
+            raise WtError("claude is off in the catalog")
+        folder = self.worktree_dir(branch)
+        if folder is None:
+            raise WtError(f"{branch} has no worktree folder of its own")
+        return claudegen.sync(folder, branch, self._created_repo_paths(branch))
+
+    def _created_repo_paths(self, branch: str) -> dict[str, Path]:
+        """The worktrees wt created for `branch`, repo -> folder, in catalog order."""
+        bs = self.store.load().branches.get(branch)
+        if bs is None:
+            return {}
+        return {
+            repo: Path(bs.repos[repo].path)
+            for repo in self._catalog_repo_paths()
+            if repo in bs.repos and bs.repos[repo].created
+        }
+
+    def _claude_sync_quietly(self, branch: str) -> None:
+        """The sync after `add`/`up`: a failure is a note, never an error of them."""
+        try:
+            if not self.loaded.claude_enabled or len(self._created_repo_paths(branch)) < 2:
+                return
+            result = self.claude_sync(branch)
+        except WtError as exc:
+            self.log(f"[yellow]note:[/] Claude files not generated: {exc}")
+            return
+        if result.changed:
+            conflicts = ", ".join(c.key for c in result.conflicts) or "none"
+            self.log(
+                f"Claude: merged .claude + CLAUDE.md in {result.folder} "
+                f"({len(result.agents)} agents, {len(result.skills)} skills); "
+                f"conflicts: {conflicts}"
+            )
+
+    def _remove_claude_files(self, branch: str) -> None:
+        """Delete the generated files while the worktrees exist; a failure is only a note."""
+        try:
+            folder = self.worktree_dir(branch)
+            if folder is not None:
+                claudegen.remove(folder)
+        except WtError as exc:
+            self.log(f"[yellow]note:[/] Claude files not removed: {exc}")
+
     # ---- down -----------------------------------------------------------------------------
 
     def down(self, branch: str, *, force: bool = False) -> bool:
@@ -1339,6 +1406,7 @@ class Orchestrator:
         self._down_providers(branch, names, bs)
         shutil.rmtree(self.branch_dir(names), ignore_errors=True)
 
+        self._remove_claude_files(branch)
         for source, path in removals:
             self.log(f"removing worktree {path}")
             git.remove_worktree(source, path, force=force)

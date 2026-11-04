@@ -768,6 +768,35 @@ def test_with_uses_keeps_the_dbeaver_settings(tmp_path: Path) -> None:
     assert (other.dbeaver_enabled, other.dbeaver_file) == (True, tmp_path / "ds.json")
 
 
+# --- the optional `claude` key (SPEC section 29) ---
+def test_claude_is_on_when_absent(tmp_path: Path) -> None:
+    assert Catalog.model_validate(yaml.safe_load(GOOD)).claude is True
+    assert load_project(project_catalog(tmp_path)).claude_enabled is True
+
+
+@pytest.mark.parametrize(("value", "enabled"), [("true", True), ("false", False)])
+def test_claude_key_is_read(tmp_path: Path, value: str, enabled: bool) -> None:
+    loaded = load_project(project_catalog(tmp_path, header=f"{PROJECT_HEADER}claude: {value}\n"))
+    assert loaded.claude_enabled is enabled
+
+
+def test_claude_must_be_a_boolean(tmp_path: Path) -> None:
+    path = project_catalog(tmp_path, header=f"{PROJECT_HEADER}claude: maybe\n")
+    with pytest.raises(WtError, match=r"invalid catalog\.yaml:\n  claude: "):
+        load_project(path)
+
+
+def test_claude_key_describes_itself() -> None:
+    assert Catalog.model_fields["claude"].description
+
+
+def test_with_uses_keeps_claude_off(tmp_path: Path) -> None:
+    loaded = load_project(
+        project_catalog(tmp_path, header=f"{PROJECT_HEADER}claude: false\n"), ["back"]
+    )
+    assert loaded.with_uses(["front"]).claude_enabled is False
+
+
 # --- wt migrate: read_legacy and merge_legacy (pure) ---
 SHOP = """\
 project: shop
@@ -1149,6 +1178,18 @@ def test_merge_keeps_the_dbeaver_key_as_written(tmp_path: Path, value: bool | st
     result = merge_legacy(existing, legacy_dict(), tmp_path)
     assert result.catalog["dbeaver"] == value
     assert merge_legacy(result.catalog, legacy_dict(), tmp_path).catalog == result.catalog
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_merge_keeps_the_claude_key_as_written(tmp_path: Path, value: bool) -> None:
+    existing = {**merge_legacy(None, legacy_dict(), tmp_path).catalog, "claude": value}
+    result = merge_legacy(existing, legacy_dict(), tmp_path)
+    assert result.catalog["claude"] is value
+    assert merge_legacy(result.catalog, legacy_dict(), tmp_path).catalog == result.catalog
+
+
+def test_merge_never_adds_a_claude_key(tmp_path: Path) -> None:
+    assert "claude" not in merge_legacy(None, legacy_dict(), tmp_path).catalog
 
 
 def test_merge_never_adds_a_dbeaver_key(tmp_path: Path) -> None:
