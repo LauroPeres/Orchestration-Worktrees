@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.10.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.11.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -375,6 +375,34 @@ asks for a password. It only ever changes connections it created (their ids star
 close DBeaver before the first sync and refresh or restart it afterwards, because an open DBeaver
 can overwrite its file.
 
+### One Claude Code session for the whole wt
+
+A wt folder (`~/Projects/Code/wt/<name>/`) holds one worktree per repo, and Claude Code only reads
+`.claude/` from the folder a session starts in. So for a wt with two or more repos, wt generates a
+merged `.claude/` and a `CLAUDE.md` next to the repos (`claude: false` in the catalog turns it off):
+
+```
+wt/test1/
+├── music-front/  music-back/      the worktrees, untouched
+├── CLAUDE.md                      @music-front/CLAUDE.md, @music-back/CLAUDE.md
+└── .claude/                       agents, skills, settings and hooks of both repos, merged
+```
+
+- **Agents** are copies named `<repo>-<agent>` (the name inside the file is rewritten too), with a
+  line saying the agent works in `./<repo>/`; references to the same repo's other agents and skills
+  are rewritten.
+- **Skills** are symlinks to the repo's skill folders, named `<repo>-<skill>`, so an edit shows up
+  at once.
+- **Permissions** are the union of the repos' (deny always wins), with path rules prefixed by the
+  repo folder (`Read(./.env)` becomes `Read(./music-back/.env)`). Other settings that differ between
+  repos are left out and listed in the report.
+- **Hooks** of every repo run, each only for files of its own repo and from its own repo folder.
+
+It is rebuilt after `wt add` and `wt up`, by hand with `wt claude sync NAME`, and removed by
+`wt down` and `wt remove`. wt never overwrites a `.claude/` or `CLAUDE.md` it did not generate.
+Start `claude` inside the wt folder; the first time, Claude Code asks you to trust the folder
+(until then it ignores `allow` rules).
+
 ## Names on the shared servers
 
 Redis, Kafka and Keycloak are shared by every project, so each per-branch name carries the project
@@ -690,6 +718,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.9.1 ✔ | One folder per wt (`wt move`), infra rows, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ | DBeaver sync: a connection per wt database (`dbeaver:` in the catalog) |
 | v0.10.1 ✔ | A new branch starts from the latest `origin/<default branch>` |
+| v0.11.0 ✔ | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

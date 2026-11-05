@@ -170,6 +170,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
 | v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
+| v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1334,3 +1335,93 @@ Unchanged: a branch that already exists locally is used as it is (never moved or
 as `origin/<branch>` is created tracking it, now after the fetch, so it is the latest; the user's own checkout and
 its local `main` are never fetched into, merged or changed. Local unpushed commits on the local default branch are
 not part of a new branch (the base is the remote).
+
+## 29. v0.11.0: a merged `.claude` for every wt folder
+
+Decided 2026-11-03 from `.claude/plans/merged-claude/BRIEF.md` and the user's answers; design sources:
+`~/.claude/docs/personal-claude-plan.md` §9.1 and §9.4, `~/.claude/docs/claude-repo-setup.md` §4.
+
+**Why.** Claude Code reads `.claude/` only from the folder a session starts in. A session started in
+`wt/<name>/` (one worktree folder per repo) sees none of the repos' agents, skills, settings or hooks. wt
+therefore generates, next to the repos, a merged `.claude/` and a `CLAUDE.md`:
+```
+wt/<name>/
+├── music-front/ music-back/     worktrees (untouched)
+├── CLAUDE.md                    GENERATED
+└── .claude/                     GENERATED (+ .wt-generated.json, the manifest)
+```
+
+**Decisions (user, 2026-11-03).**
+- On by default for a wt with **two or more repos** (with fewer, nothing is generated: start the session inside the
+  single repo). Catalog key `claude: false` turns it off.
+- Command: `wt claude sync NAME [--json]`; it also runs automatically (below).
+- Settings keys other than permissions/plugins/hooks that differ between repos are **left out** and listed in the
+  report.
+- Skills are links when the spikes allow, otherwise copies (spikes below: links).
+- The task's plan lives in `<first repo>/.claude/plans/<task>/` (git-ignored), as `~/Projects/Code/CLAUDE.md` says.
+- Afterwards, `workspace/CLAUDE.md` of `code-framework` is updated in its own PR (its "no generated files" line).
+
+**Spike results (Claude Code 2.1.318, 2026-11-03, throwaway projects).**
+1. **Skills take their name from the folder**, not the frontmatter `name:`: a symlink named `music-back-linked` to a skill
+   whose frontmatter says `real-skill` loaded as `music-back-linked`. So skills are **symlinks** to the repo's skill
+   folders, named `<repo>-<skill>` (edits show up at once).
+2. **Agents take their name from the frontmatter**, not the file name. A symlinked agent loads, but under its original
+   name, so a link would keep the unprefixed name. Agents are **generated copies** with `name:` rewritten.
+3. In a session started in a generated folder: the merged `permissions.deny` with a repo-prefixed path
+   (`Read(./music-back/secret.txt)`) is enforced; `@music-back/CLAUDE.md` imports load; the parent
+   `~/Projects/Code/CLAUDE.md` still applies; a hook given as `$CLAUDE_PROJECT_DIR/music-back/.claude/hooks/x.sh`
+   runs, but **with the wt folder as working directory and as `CLAUDE_PROJECT_DIR`**, not the repo's. `allow` entries
+   are ignored until the folder is trusted once (Claude Code's trust dialog); `deny` applies regardless.
+
+**What `wt claude sync NAME` generates** (pure merge logic in the model layer, `wt.claudemerge`; file, link and
+manifest writing in the runtime layer, `wt.claudegen`; trigger in the core; command in the interface). The wt's repos
+are the repos of its recorded worktrees (`worktree_dir`, §26), in catalog order; `<repo>` is the catalog repo name.
+1. **Agents:** each `<repo>/.claude/agents/<a>.md` becomes `.claude/agents/<repo>-<a>.md` (copy) with the frontmatter
+   `name:` set to `<repo>-<a>` and, right after the frontmatter, the line `You work in ./<repo>/. Every path in your
+   instructions is relative to that folder.`. References to the same repo's agents or skills inside the text and the
+   frontmatter (`skills:` list, "use the `checker` agent") are rewritten to the prefixed names (whole-word,
+   backtick-quoted or listed names only, so ordinary words are not touched).
+2. **Skills:** each skill folder `<repo>/.claude/skills/<s>/` becomes the symlink `.claude/skills/<repo>-<s>` -> the
+   absolute path of that folder. If a link cannot be created, a copy with the frontmatter name rewritten is written and
+   listed in the report.
+3. **Settings (`.claude/settings.json`, generated):**
+   - `permissions.allow`, `.ask`, `.deny`: union over the repos (order: repo order, first occurrence); a path rule
+     (`Read(./.env)`, `Edit(./src/**)`) gets the repo folder in front (`Read(./music-back/.env)`); rules that start
+     with `**/` or `/`, `~`, or have no path (`Bash(npm test:*)`) stay as they are. Deny always wins (Claude Code's
+     rule); an entry that is in both `allow` and `deny` is dropped from `allow`.
+   - `enabledPlugins`: union (`true` wins over `false` only if every repo that mentions it says `true`; otherwise the
+     key is a conflict).
+   - `hooks`: see 4.
+   - Any other top-level key (and other `permissions` keys such as `defaultMode`) with different values in two
+     repos is a conflict: it is omitted and listed; with the same value in every repo that sets it, it is kept.
+4. **Hooks:** the union of the repos' hook groups (same event/matcher groups concatenated in repo order). Every
+   command is wrapped so that it behaves as it does in its own repo: `bash "$CLAUDE_PROJECT_DIR/.claude/wt-hook.sh"
+   <repo> '<original command>'`. The generated, executable `.claude/wt-hook.sh` reads the hook's JSON from stdin; if
+   `tool_input.file_path` (or `notebook_path`) is present and is **not** under `$CLAUDE_PROJECT_DIR/<repo>/`, it exits 0
+   without running anything (a repo's edit check must not run on another repo's files); otherwise it sets
+   `CLAUDE_PROJECT_DIR=$CLAUDE_PROJECT_DIR/<repo>`, `cd`s there and runs the original command with the same stdin,
+   passing its stdout, stderr and exit code through. Hook entries without a `command` string are kept as they are.
+5. **`CLAUDE.md`:** first line `<!-- Generated by wt. Do not edit; run wt claude sync <name>. -->`, a title, one
+   `@<repo>/CLAUDE.md` line per repo that has one, and `Plans live in <first repo>/.claude/plans/<task>/.`.
+6. **Manifest** `.claude/.wt-generated.json`: `{"version":1,"wt":"<name>","repos":[…],"files":{"<relative path>":
+   {"kind":"copy|link|file","sha256":"…","source":"<repo>/…"}},"conflicts":[…],"notes":[…]}`.
+
+**Safety and idempotence.**
+- Syncing twice gives byte-identical files and an unchanged manifest (`changed: false`).
+- A `.claude/` or `CLAUDE.md` in the wt folder **without** a manifest (or a manifest for another wt) is never
+  overwritten: `WtError("<path> exists and was not generated by wt; move it away or set claude: false")`.
+- Files listed in the manifest whose repo left the wt (or whose source disappeared) are removed; a generated file
+  that was edited by hand (hash differs from the manifest) is replaced and the report says so.
+- `wt down` and `wt remove` delete exactly the manifest's files (then the manifest, then `.claude/` and `CLAUDE.md`
+  if they are empty/generated). `wt stop` keeps them.
+- The runtime layer never follows a symlink out of the wt folder when deleting.
+
+**When it runs.** After `wt add` and `wt up` when the wt has two or more repos and `claude` is not false; after a repo is
+added to a wt (`configure`, services page); on demand with `wt claude sync NAME`. A failure in the automatic run is a
+yellow note (`[yellow]note:[/] Claude files not generated: <reason>`), never an error of `add`/`up`; the command itself
+fails with the message. `wt claude sync` with fewer than two repos: `<name> has fewer than two repos; start Claude
+inside its repo folder`. JSON (SPEC §21 style): `{"schema":1,"branch":…,"changed":bool,"folder":"…","repos":[…],
+"agents":[…],"skills":[…],"conflicts":[{"key":…,"repos":[…]}],"notes":[…]}`.
+
+**Catalog key.** `claude: bool` (default true). Unknown here: `claude: false` only disables the automatic runs and
+`wt claude sync` (it then says `claude is off in the catalog`).

@@ -76,6 +76,13 @@ class Catalog(Strict):
             "(~ expanded, relative to this file) names the file; false or absent = off"
         ),
     )
+    claude: bool = Field(
+        default=True,
+        description=(
+            "false stops wt from generating a merged .claude and CLAUDE.md in a wt folder "
+            "with two or more repos (wt claude sync then refuses)"
+        ),
+    )
     services: dict[str, CatalogService] = Field(min_length=1)
 
     @field_validator("worktrees", "dbeaver")
@@ -444,6 +451,7 @@ def load_project(path: Path, uses: list[str] | None = None) -> LoadedConfig:
         worktrees_dir=worktrees_folder(catalog, path),
         dbeaver_enabled=catalog.dbeaver is not None and catalog.dbeaver is not False,
         dbeaver_file=dbeaver_file(catalog, path),
+        claude_enabled=catalog.claude,
     )
 
 

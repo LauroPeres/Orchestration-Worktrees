@@ -11,7 +11,18 @@ import pytest
 import yaml
 from pydantic import BaseModel, ConfigDict
 
-from wt import compose, health, host, naming, providers, router, tls
+from wt import (
+    claudegen,
+    claudemerge,
+    compose,
+    health,
+    host,
+    naming,
+    orchestrator,
+    providers,
+    router,
+    tls,
+)
 from wt.catalog import load_project
 from wt.config import Config, LoadedConfig
 from wt.errors import WtError
@@ -386,4 +397,49 @@ def fake_provider(monkeypatch: pytest.MonkeyPatch, docker: FakeDocker) -> FakePr
 
     monkeypatch.setattr(compose, "up", up)
     monkeypatch.setattr(compose, "down", down)
+    return fake
+
+
+@dataclass
+class FakeClaudegen:
+    """Stands in for `wt.claudegen` inside the orchestrator: nothing is written to disk."""
+
+    synced: list[tuple[Path, str, dict[str, Path]]] = field(default_factory=list)
+    removed: list[Path] = field(default_factory=list)
+    events: list[str] = field(default_factory=list)
+    changed: bool = True
+    conflicts: list[str] = field(default_factory=list)
+    sync_error: str | None = None
+    remove_error: str | None = None
+
+    def sync(
+        self, folder: Path, name: str, repos: Mapping[str, Path]
+    ) -> claudegen.ClaudeSyncResult:
+        if self.sync_error:
+            raise WtError(self.sync_error)
+        self.synced.append((folder, name, dict(repos)))
+        return claudegen.ClaudeSyncResult(
+            self.changed,
+            folder,
+            list(repos),
+            ["api-checker", "web-coder"],
+            ["api-checks"],
+            [claudemerge.Conflict(key, ("api", "web")) for key in self.conflicts],
+            [],
+        )
+
+    def remove(self, folder: Path) -> list[str]:
+        self.events.append(f"claude remove (folder exists: {folder.is_dir()})")
+        if self.remove_error:
+            raise WtError(self.remove_error)
+        self.removed.append(folder)
+        return []
+
+
+@pytest.fixture(autouse=True)
+def fake_claudegen(monkeypatch: pytest.MonkeyPatch) -> FakeClaudegen:
+    """Every orchestrator test runs with a fake `claudegen`: a two-repo wt would otherwise get
+    real `.claude` files in its folder. `tests/test_claudegen.py` uses the real module."""
+    fake = FakeClaudegen()
+    monkeypatch.setattr(orchestrator, "claudegen", fake)
     return fake

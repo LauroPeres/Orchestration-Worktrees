@@ -66,6 +66,12 @@ def test_loads_spec_example(tmp_path: Path) -> None:
     assert loaded.repo_path("api") == (tmp_path / "../shop-api").resolve()
 
 
+def test_loaded_config_has_claude_enabled_by_default(tmp_path: Path) -> None:
+    loaded = load(tmp_path, BASE)
+    assert loaded.claude_enabled is True
+    assert LoadedConfig(loaded.config, loaded.path, loaded.catalog, ()).claude_enabled is True
+
+
 @pytest.mark.parametrize(
     ("data", "message"),
     [

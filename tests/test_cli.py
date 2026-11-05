@@ -14,6 +14,8 @@ from tests.conftest import COMPOSE, SHARED, SHOP_CATALOG, FakeDocker
 from tests.test_catalog_edit import EDIT_CATALOG
 from wt import __version__, cache, catalog_edit, cli, compose, dbeaver, doctor, host, proc
 from wt.catalog import load_project
+from wt.claudegen import ClaudeSyncResult
+from wt.claudemerge import Conflict
 from wt.cli import app
 from wt.errors import WtError
 from wt.orchestrator import BranchStatus, MoveResult, Orchestrator, ServiceReport
@@ -2283,3 +2285,137 @@ def test_dbeaver_sync_errors_are_a_one_liner_and_a_json_document(
     as_json = runner.invoke(app, ["dbeaver", "sync", "--json"])
     assert as_json.exit_code == 1, as_json.output
     assert _document(as_json) == {"schema": 1, "error": message}
+
+
+# ---- wt claude sync (SPEC section 29) -----------------------------------------------------------
+
+CLAUDE_FOLDER = Path("/trees/feat-cart")
+
+
+def _claude_result(**changes: Any) -> ClaudeSyncResult:
+    fields: dict[str, Any] = {
+        "changed": True,
+        "folder": CLAUDE_FOLDER,
+        "repos": ["api", "web"],
+        "agents": ["api-coder", "web-coder"],
+        "skills": ["api-checks"],
+        "conflicts": [],
+        "notes": [],
+    }
+    return ClaudeSyncResult(**{**fields, **changes})
+
+
+def _fake_claude_sync(monkeypatch: pytest.MonkeyPatch, result: ClaudeSyncResult) -> list[str]:
+    calls: list[str] = []
+
+    def claude_sync(self: Any, branch: str) -> ClaudeSyncResult:
+        calls.append(branch)
+        return result
+
+    monkeypatch.setattr(Orchestrator, "claude_sync", claude_sync)
+    return calls
+
+
+def test_claude_sync_lists_what_was_merged(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    calls = _fake_claude_sync(monkeypatch, _claude_result())
+    result = runner.invoke(app, ["claude", "sync", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["feat/cart"]
+    assert result.output.splitlines()[-3:] == [
+        "feat/cart: merged .claude + CLAUDE.md in /trees/feat-cart",
+        "  agents (2): api-coder, web-coder",
+        "  skills (1): api-checks",
+    ]
+
+
+def test_claude_sync_reports_conflicts_and_notes(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    conflicts = [Conflict("defaultMode", ("api", "web"))]
+    _fake_claude_sync(
+        monkeypatch,
+        _claude_result(agents=[], skills=[], conflicts=conflicts, notes=["api-x: copied, no link"]),
+    )
+    result = runner.invoke(app, ["claude", "sync", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-3:] == [
+        "feat/cart: merged .claude + CLAUDE.md in /trees/feat-cart",
+        "  not merged (differ between repos): defaultMode (api, web)",
+        "  note: api-x: copied, no link",
+    ]
+
+
+def test_claude_sync_unchanged_says_it_is_up_to_date(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_claude_sync(monkeypatch, _claude_result(changed=False))
+    result = runner.invoke(app, ["claude", "sync", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "feat/cart is already up to date (/trees/feat-cart)"
+
+
+def test_claude_sync_json(shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    conflicts = [Conflict("defaultMode", ("api", "web"))]
+    _fake_claude_sync(monkeypatch, _claude_result(conflicts=conflicts, notes=["n"]))
+    result = runner.invoke(app, ["claude", "sync", "feat/cart", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "branch": "feat/cart",
+        "changed": True,
+        "folder": "/trees/feat-cart",
+        "repos": ["api", "web"],
+        "agents": ["api-coder", "web-coder"],
+        "skills": ["api-checks"],
+        "conflicts": [{"key": "defaultMode", "repos": ["api", "web"]}],
+        "notes": ["n"],
+    }
+
+
+def test_claude_sync_json_error_is_the_error_document(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+
+    def refuse(self: Any, branch: str) -> ClaudeSyncResult:
+        raise WtError(f"{branch} has fewer than two repos; start Claude inside its repo folder")
+
+    monkeypatch.setattr(Orchestrator, "claude_sync", refuse)
+    result = runner.invoke(app, ["claude", "sync", "feat/cart", "--json"])
+    assert result.exit_code == 1
+    assert _document(result) == {
+        "schema": 1,
+        "error": "feat/cart has fewer than two repos; start Claude inside its repo folder",
+    }
+
+
+def test_claude_sync_error_propagates_without_json(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+
+    def refuse(self: Any, branch: str) -> ClaudeSyncResult:
+        raise WtError("claude is off in the catalog")
+
+    monkeypatch.setattr(Orchestrator, "claude_sync", refuse)
+    result = runner.invoke(app, ["claude", "sync", "feat/cart"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, WtError)
+
+
+def test_the_starter_mentions_the_claude_key_as_a_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _init_with(tmp_path, monkeypatch).exit_code == 0
+    path = tmp_path / "wt-home" / "catalog.yaml"
+    assert (
+        "# claude: false   # do not generate the merged .claude for wts with two or more repos"
+        in path.read_text()
+    )
+    assert load_project(path).config.repos

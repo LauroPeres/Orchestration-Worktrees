@@ -28,6 +28,7 @@ from wt.catalog import (
     render_check,
     rows,
 )
+from wt.claudegen import ClaudeSyncResult
 from wt.config import LoadedConfig
 from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
@@ -104,6 +105,7 @@ STARTER = """\
 project: {project}
 domain: {project}.localhost      # *.localhost resolves to 127.0.0.1 in browsers
 # dbeaver: true   # keep a DBeaver connection per wt database (needs the Postgres infra)
+# claude: false   # do not generate the merged .claude for wts with two or more repos
 
 repos:                           # each gets a git worktree per branch; relative paths start here
   app: {repo}
@@ -323,6 +325,20 @@ def move_document(branch: str, result: MoveResult) -> JsonDocument:
         "changed": result.changed,
         "folder": str(result.folder) if result.folder else None,
         "moved": result.moved,
+    }
+
+
+def claude_sync_document(branch: str, result: ClaudeSyncResult) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "branch": branch,
+        "changed": result.changed,
+        "folder": str(result.folder),
+        "repos": result.repos,
+        "agents": result.agents,
+        "skills": result.skills,
+        "conflicts": [{"key": c.key, "repos": list(c.repos)} for c in result.conflicts],
+        "notes": result.notes,
     }
 
 
@@ -567,6 +583,48 @@ def move(
             console.print(f"[green]{branch} now lives in {escape(str(result.folder))}[/]")
         else:
             console.print(f"{branch} is already in {escape(str(result.folder))}")
+
+
+claude_app = typer.Typer(
+    help="Manage the merged .claude + CLAUDE.md generated for a wt with several repos.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(claude_app, name="claude")
+
+
+def _print_claude_sync(name: str, result: ClaudeSyncResult) -> None:
+    folder = escape(str(result.folder))
+    if not result.changed:
+        console.print(f"{escape(name)} is already up to date ({folder})")
+        return
+    console.print(f"[green]{escape(name)}: merged .claude + CLAUDE.md in {folder}[/]")
+    for label, names in (("agents", result.agents), ("skills", result.skills)):
+        if names:
+            console.print(f"  {label} ({len(names)}): {escape(', '.join(names))}")
+    for conflict in result.conflicts:
+        repos = ", ".join(conflict.repos)
+        console.print(
+            f"  not merged (differ between repos): {escape(conflict.key)} ({escape(repos)})"
+        )
+    for note in result.notes:
+        console.print(f"  note: {escape(note)}")
+
+
+@claude_app.command("sync")
+def claude_sync(
+    ctx: typer.Context,
+    name: Annotated[str, typer.Argument(help="Git branch (the wt's name).")],
+    json_output: JsonOption = False,
+) -> None:
+    """Generate NAME's merged .claude and CLAUDE.md next to its repos (two or more repos)."""
+    with _json_errors(json_output):
+        result = Orchestrator(_load(ctx), log=_progress(json_output)).claude_sync(name)
+        if json_output:
+            _emit(claude_sync_document(name, result))
+        else:
+            _print_claude_sync(name, result)
 
 
 @app.command()
