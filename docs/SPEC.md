@@ -169,6 +169,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
 | v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.10.0 ✔ (§27) | DBeaver sync: each wt's Postgres database appears as a DBeaver connection (opt-in `dbeaver:` catalog key), `wt dbeaver sync` |
+| v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1311,3 +1312,25 @@ them; `wt dbeaver sync` itself fails with the message. With the key off it fails
 
 **DBeaver running.** DBeaver may not reload the file while it is open, and a running DBeaver can overwrite it on
 exit. After a sync, refresh the connection list or restart DBeaver; to be safe, close DBeaver before the first sync.
+
+## 28. v0.10.1: new branches start from the latest origin
+
+Decided 2026-11-03 (a wt created while the local `main` was behind got old code). Amends §13 (worktrees).
+
+When wt must **create** the git branch of a wt in a repo (it exists neither locally nor as `origin/<branch>`):
+1. If the repo has a remote `origin`, run `git fetch origin` (30 s timeout, `check=False`) once for that repo. A
+   failure is not an error: wt continues with what it has and says why
+   (`[yellow]note:[/] repo 'x': could not fetch origin (<first line>); using the last known origin state`).
+   `WT_NO_FETCH=1` skips the fetch (offline work, tests).
+2. The base is `origin/HEAD` (the remote's default branch, `git symbolic-ref --short refs/remotes/origin/HEAD`);
+   when that is not set, the first of `origin/main`, `origin/master` that exists.
+3. The branch is created with `git worktree add --no-track -b <branch> <target> <base>` (no upstream, so a plain
+   `git push` can never push to the default branch by accident).
+4. No remote or no usable base: the branch starts from the repo's current `HEAD`, as before.
+The log line says where it started: `created branch 'x' in repo 'r' from origin/main (a1b2c3d)` or
+`created branch 'x' in repo 'r' from its current HEAD`.
+
+Unchanged: a branch that already exists locally is used as it is (never moved or updated); a branch that exists only
+as `origin/<branch>` is created tracking it, now after the fetch, so it is the latest; the user's own checkout and
+its local `main` are never fetched into, merged or changed. Local unpushed commits on the local default branch are
+not part of a new branch (the base is the remote).

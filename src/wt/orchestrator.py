@@ -991,6 +991,14 @@ class Orchestrator:
             router.remove_routes(Path(recorded))
         self._record(branch, lambda bs: setattr(bs, "route_file", None))
 
+    def _log_branch_start(self, branch: str, repo: str, res: git.EnsureResult) -> None:
+        """Say where a newly created git branch started, and why origin was not fetched."""
+        if res.fetch_note:
+            self.log(f"[yellow]note:[/] repo {repo!r}: {res.fetch_note}")
+        if res.branch_created:
+            start = res.base if res.base and res.base.startswith("origin/") else "its current HEAD"
+            self.log(f"created branch {branch!r} in repo {repo!r} from {start}")
+
     def _up_worktrees(self, branch: str, names: Names) -> dict[str, Path]:
         worktrees: dict[str, Path] = {}
         for repo in self.cfg.repos:
@@ -999,8 +1007,7 @@ class Orchestrator:
             with file_lock(f"repo-{key}"):
                 res = git.ensure_worktree(source, branch, self.worktree_target(names, repo))
             worktrees[repo] = res.path
-            if res.branch_created:
-                self.log(f"created branch {branch!r} in repo {repo!r} from its current HEAD")
+            self._log_branch_start(branch, repo, res)
             if not res.created:
                 self.log(
                     f"repo {repo!r}: {branch!r} is already checked out at {res.path}; using it"

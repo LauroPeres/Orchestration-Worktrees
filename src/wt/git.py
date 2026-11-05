@@ -1,5 +1,6 @@
 """git worktree add/remove, one repo at a time."""
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,60 @@ class EnsureResult:
     path: Path
     created: bool
     branch_created: bool
+    base: str | None = None  # where a created branch started: "origin/main (a1b2c3d)" or "HEAD"
+    fetch_note: str | None = None  # why `git fetch origin` did not happen or failed
+
+
+FETCH_TIMEOUT_SECONDS = 30
+NO_FETCH_ENV = "WT_NO_FETCH"
+FALLBACK_BASES = ("origin/main", "origin/master")
+
+
+def _has_origin(repo: Path) -> bool:
+    return "origin" in _git(repo, "remote").stdout.split()
+
+
+def _fetch_origin(repo: Path) -> str | None:
+    """`git fetch origin` when there is an origin and fetching is not disabled.
+
+    Returns a note when the fetch failed (the caller carries on with the last known state).
+    """
+    if os.environ.get(NO_FETCH_ENV) == "1" or not _has_origin(repo):
+        return None
+    try:
+        result = _git_with_timeout(repo, "fetch", "origin")
+    except WtError as err:
+        reason = str(err).splitlines()[0]
+    else:
+        if result.ok:
+            return None
+        lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+        reason = lines[0].removeprefix("fatal: ") if lines else "git fetch failed"
+    return f"could not fetch origin ({reason}); using the last known origin state"
+
+
+def _git_with_timeout(repo: Path, *args: str) -> proc.Result:
+    return proc.run(["git", "-C", str(repo), *args], check=False, timeout=FETCH_TIMEOUT_SECONDS)
+
+
+def _origin_base(repo: Path) -> str | None:
+    """The remote's default branch (`origin/HEAD`), else the first of origin/main, origin/master."""
+    head = _git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    candidates = [head.stdout.strip()] if head.ok and head.stdout.strip() else []
+    for base in [*candidates, *FALLBACK_BASES]:
+        if _has_ref(repo, f"refs/remotes/{base}"):
+            return base
+    return None
+
+
+def _create_branch(repo: Path, branch: str, target: Path) -> str:
+    """Create `branch` in a new worktree from the origin default branch, else HEAD; no upstream."""
+    base = _origin_base(repo)
+    start = base or "HEAD"
+    _git(repo, "worktree", "add", "--no-track", "-b", branch, str(target), start)
+    if base is None:
+        return "HEAD"
+    return f"{base} ({_git(repo, 'rev-parse', '--short', base).stdout.strip()})"
 
 
 def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
@@ -63,7 +118,10 @@ def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
     - already checked out (main repo or another worktree): reuse it, wt does not own it
     - local branch exists: add a worktree for it
     - only origin/<branch> exists: add a worktree with a tracking branch
-    - neither: create the branch from the repo's HEAD
+    - neither: create the branch from origin's default branch (no upstream), else from HEAD
+
+    Origin is fetched once, only when the branch is not local (SPEC section 28); a failed fetch
+    is reported in `fetch_note`, never raised.
     """
     check_repo(repo)
     _git(repo, "worktree", "prune")
@@ -77,11 +135,12 @@ def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
     if _has_ref(repo, f"refs/heads/{branch}"):
         _git(repo, "worktree", "add", str(target), branch)
         return EnsureResult(target, created=True, branch_created=False)
+    fetch_note = _fetch_origin(repo)
     if _has_ref(repo, f"refs/remotes/origin/{branch}"):
         _git(repo, "worktree", "add", "--track", "-b", branch, str(target), f"origin/{branch}")
-        return EnsureResult(target, created=True, branch_created=True)
-    _git(repo, "worktree", "add", "-b", branch, str(target), "HEAD")
-    return EnsureResult(target, created=True, branch_created=True)
+        return EnsureResult(target, created=True, branch_created=True, fetch_note=fetch_note)
+    base = _create_branch(repo, branch, target)
+    return EnsureResult(target, created=True, branch_created=True, base=base, fetch_note=fetch_note)
 
 
 def is_dirty(path: Path) -> bool:
