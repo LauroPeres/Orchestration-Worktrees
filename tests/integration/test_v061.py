@@ -35,7 +35,7 @@ SIGINT_EXIT_CODES = (130, -signal.SIGINT)
 FIRST_ATTEMPTS = 20
 ATTEMPT_PAUSE = 0.05
 LS_KEYS = {"schema", "project", "branches"}
-BRANCH_KEYS = {"branch", "status", "services"}
+BRANCH_KEYS = {"branch", "status", "folder", "repos", "services"}
 SERVICE_KEYS = {"name", "kind", "status", "health", "url", "port"}
 ACTION_KEYS = {
     "schema",
