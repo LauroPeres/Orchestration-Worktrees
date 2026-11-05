@@ -1452,3 +1452,13 @@ compose services of a repo still share one line (one compose project). `RepoRow`
 the `run:` service of the line (None for a repo's compose line). `name` is the repo when it has a single line, else the
 service name (`discord_web`, `discord_backend`). PORT, URL and status are those of that service. `l` follows the log of
 the line's own `service`.
+
+**Groups in the services picker.** Decided 2026-11-05. A catalog service may set `group: <name>` (1 to 40 characters), a
+folder it is listed under when picking services. It only changes the picker: the resolved service does not carry it.
+- `Choice` gains `group: str | None = None`.
+- The configure/add page lists, for each group in order of first appearance, a folder line `<name>/` and then its services
+  indented, in catalog order; services without a group follow, unindented.
+- The folder line has a check box. Checking it checks every service of the group; unchecking it unchecks them all,
+  except a service that a checked consumer still requires (it stays checked, locked). The folder shows checked exactly
+  while all of its services are. Confirming returns only services, never folder lines.
+- The plain `wt add` prompt (no TUI) is unchanged.

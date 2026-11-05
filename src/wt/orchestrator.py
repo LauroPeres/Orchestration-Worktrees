@@ -187,6 +187,7 @@ class Choice:
     repo: str
     selected: bool  # in the stack: chosen, or pulled in by a chosen consumer
     required_by: tuple[str, ...] = ()  # the stack services that consume it; () when chosen
+    group: str | None = None  # the catalog `group:` folder it is listed under
 
 
 class Orchestrator:
@@ -1646,7 +1647,7 @@ class Orchestrator:
         if branch is None:
             catalog = load_catalog(self.loaded.catalog).catalog
             return [
-                Choice(name, svc.repo, False, _consumers(catalog.services, name))
+                Choice(name, svc.repo, False, _consumers(catalog.services, name), svc.group)
                 for name, svc in catalog.services.items()
             ]
         if self.store.load().branches.get(branch) is None:
@@ -1662,7 +1663,7 @@ class Orchestrator:
             return tuple(s for s in stack if name in catalog.services[s].consumes)
 
         return [
-            Choice(name, svc.repo, name in stack, required_by(name))
+            Choice(name, svc.repo, name in stack, required_by(name), svc.group)
             for name, svc in catalog.services.items()
         ]
 
