@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.9.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.10.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -355,6 +355,18 @@ are shared by all branches and `down` never deletes them, like the realm. The pa
 development value: wt keeps it out of logs, errors, `--json` output and the argument list of every
 process.
 
+### DBeaver connections
+
+Add `dbeaver: true` to the catalog (or `dbeaver: /path/to/data-sources.json`) and every wt
+database of the shared Postgres gets a DBeaver connection by itself, in a folder named `wt`:
+`<repo>-<wt>` for each database (`music-back-testt1`) and one `<repo>` connection for the whole
+server with "Show all databases". They appear after `wt up`, disappear after `wt down` or `wt
+remove`, and `wt dbeaver sync` rebuilds them from the current state. wt also keeps one managed
+line for the shared server in `~/.pgpass` (mode 0600), which the connections use, so DBeaver never
+asks for a password. It only ever changes connections it created (their ids start with `wt-pg-`);
+close DBeaver before the first sync and refresh or restart it afterwards, because an open DBeaver
+can overwrite its file.
+
 ## Names on the shared servers
 
 Redis, Kafka and Keycloak are shared by every project, so each per-branch name carries the project
@@ -668,6 +680,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.8.1 ✔ | Keycloak dev users (`infra.keycloak.users`) |
 | v0.9.0 ✔ | Windows CI job (report only) and `docs/windows.md`; Windows stays unsupported |
 | v0.9.1 ✔ | One folder per wt (`wt move`), infra rows, `u: url`, `n: new terminal` |
+| v0.10.0 ✔ | DBeaver sync: a connection per wt database (`dbeaver:` in the catalog) |
 | later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).

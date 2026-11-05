@@ -6,7 +6,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -36,11 +36,13 @@ from tests.conftest import git as git_run
 from wt import (
     cache,
     compose,
+    dbeaver,
     git,
     health,
     host,
     naming,
     orchestrator,
+    pgpass,
     proc,
     providers,
     router,
@@ -50,6 +52,7 @@ from wt import (
 from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
+from wt.providers import postgres
 from wt.providers.base import Check
 from wt.state import ProcessState
 
@@ -4745,3 +4748,243 @@ def test_infra_keeps_the_router_first_for_a_branch_that_does_not_exist(
         lambda cfg, recorded: [providers.InfraRow("redis", "running", 6379, "-")],
     )
     assert [row.name for row in o.infra("feat/unknown")] == ["traefik", "redis"]
+
+
+# ---- DBeaver sync (SPEC section 27) -------------------------------------------------------
+
+
+@dataclass
+class FakeDbeaver:
+    """Stands in for `wt.dbeaver` and `wt.pgpass`: nothing touches DBeaver or ~/.pgpass."""
+
+    file: Path
+    applied: list[list[dbeaver.DbConnection]] = field(default_factory=list)
+    pgpass_calls: list[dict[str, Any]] = field(default_factory=list)
+    change: dbeaver.DbeaverChange | None = None
+    fail_apply: bool = False
+
+    def apply(self, path: Path, desired: list[dbeaver.DbConnection]) -> dbeaver.DbeaverChange:
+        assert path == self.file
+        if self.fail_apply:
+            raise WtError(f"DBeaver workspace not found at {path}")
+        self.applied.append(list(desired))
+        return self.change or dbeaver.DbeaverChange(path, [], [], [])
+
+    def ensure(self, **kwargs: Any) -> bool:
+        self.pgpass_calls.append(kwargs)
+        return True
+
+
+@pytest.fixture
+def fake_dbeaver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDbeaver:
+    fake = FakeDbeaver(tmp_path / "data-sources.json")
+    monkeypatch.setattr(dbeaver, "apply", fake.apply)
+    monkeypatch.setattr(pgpass, "ensure", fake.ensure)
+    monkeypatch.setattr(dbeaver, "default_data_sources_path", lambda: None)
+    monkeypatch.setattr(postgres, "password", lambda: "s3cret")
+    return fake
+
+
+def _synced(o: Orchestrator, fake: FakeDbeaver, *, enabled: bool = True) -> Orchestrator:
+    loaded = replace(o.loaded, dbeaver_enabled=enabled, dbeaver_file=fake.file)
+    return Orchestrator(loaded, log=o.log, out=o.out)
+
+
+def _with_databases(o: Orchestrator, branch: str, *databases: str) -> None:
+    """A branch with `databases` recorded as its Postgres slice, as `up` would leave it."""
+    o.add(branch, uses=selection(o))
+    with o.store.edit() as state:
+        state.branches[branch].providers["postgres"] = list(databases)
+
+
+def _db(o: Orchestrator, logical: str, branch: str) -> str:
+    return postgres.db_name(logical, o.names(branch))
+
+
+def test_dbeaver_connections_for_two_branches(orch, fake_dbeaver: FakeDbeaver) -> None:
+    o = _synced(orch(shared={"postgres": {"databases": ["shop"]}}), fake_dbeaver)
+    _with_databases(o, "feat/cart", _db(o, "shop", "feat/cart"))
+    _with_databases(o, "feat/pay", _db(o, "shop", "feat/pay"))
+    connections = o.dbeaver_connections()
+    assert [(c.id, c.name, c.database) for c in connections] == [
+        ("wt-pg-shop-feat-cart-shop__feat_cart", "api-feat-cart", "shop__feat_cart"),
+        ("wt-pg-shop-feat-pay-shop__feat_pay", "api-feat-pay", "shop__feat_pay"),
+        ("wt-pg-shop-server-api", "api", "postgres"),
+    ]
+    assert {(c.host, c.port, c.user) for c in connections} == {
+        ("127.0.0.1", postgres.host_port(), postgres.USER)
+    }
+    assert [c.show_all_databases for c in connections] == [False, False, True]
+
+
+def test_dbeaver_connection_names_carry_the_database_when_a_repo_has_several(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared={"postgres": {"databases": ["shop", "audit"]}}), fake_dbeaver)
+    shop, audit = _db(o, "shop", "feat/cart"), _db(o, "audit", "feat/cart")
+    _with_databases(o, "feat/cart", shop, audit)
+    names = [c.name for c in o.dbeaver_connections()]
+    assert names == [f"api-{shop}-feat-cart", f"api-{audit}-feat-cart", "api"]
+
+
+def test_dbeaver_connection_uses_the_repo_of_the_first_service_listing_the_database(
+    make_repo, tmp_path: Path, fake_dbeaver: FakeDbeaver
+) -> None:
+    make_repo("music-back")
+    make_repo("music-admin")
+    infra = {"postgres": {"databases": ["music"]}}
+    catalog = {
+        "project": "shop",
+        "domain": "shop.localhost",
+        "repos": {"back": "./music-back", "admin": "./music-admin"},
+        "services": {
+            # the helper dumps the catalog with sorted keys, so the names fix the catalog order
+            "a-first": {"repo": "back", "run": "true", "infra": infra},
+            "b-second": {"repo": "admin", "run": "true", "infra": infra},
+        },
+    }
+    o = _synced(
+        Orchestrator(write_global_catalog(tmp_path, catalog, uses=["a-first", "b-second"])),
+        fake_dbeaver,
+    )
+    _with_databases(o, "feat/cart", _db(o, "music", "feat/cart"))
+    assert [c.name for c in o.dbeaver_connections()] == ["back-feat-cart", "back"]
+
+
+def test_dbeaver_connection_falls_back_to_the_project_when_no_service_lists_the_database(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(), fake_dbeaver)
+    _with_databases(o, "feat/cart", "legacy__feat_cart")
+    connections = o.dbeaver_connections()
+    assert [(c.id, c.name) for c in connections] == [
+        ("wt-pg-shop-feat-cart-legacy__feat_cart", "shop-feat-cart"),
+        ("wt-pg-shop-server-shop", "shop"),
+    ]
+
+
+def test_dbeaver_connections_skip_branches_without_databases_and_keep_failed_ones(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared={"postgres": {"databases": ["shop"]}}), fake_dbeaver)
+    o.add("feat/none", uses=selection(o))
+    _with_databases(o, "feat/half", _db(o, "shop", "feat/half"))
+    with o.store.edit() as state:
+        state.branches["feat/half"].status = "failed"
+    assert [c.name for c in o.dbeaver_connections()] == ["api-feat-half", "api"]
+
+
+def test_sync_dbeaver_writes_pgpass_then_applies_the_connections(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared={"postgres": {"databases": ["shop"]}}), fake_dbeaver)
+    _with_databases(o, "feat/cart", _db(o, "shop", "feat/cart"))
+    change = o.sync_dbeaver()
+    assert change.file == fake_dbeaver.file
+    assert fake_dbeaver.pgpass_calls == [
+        {"host": "127.0.0.1", "port": postgres.host_port(), "user": "wt", "password": "s3cret"}
+    ]
+    assert [c.name for c in fake_dbeaver.applied[0]] == ["api-feat-cart", "api"]
+
+
+def test_sync_dbeaver_without_connections_removes_stale_ones_but_writes_no_pgpass(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(), fake_dbeaver)
+    o.sync_dbeaver()
+    assert fake_dbeaver.applied == [[]]
+    assert fake_dbeaver.pgpass_calls == []
+
+
+def test_sync_dbeaver_is_off_without_the_catalog_key(orch, fake_dbeaver: FakeDbeaver) -> None:
+    o = _synced(orch(), fake_dbeaver, enabled=False)
+    with pytest.raises(WtError, match="dbeaver sync is off: add dbeaver: true to the catalog"):
+        o.sync_dbeaver()
+    assert fake_dbeaver.applied == [] and fake_dbeaver.pgpass_calls == []
+
+
+def test_sync_dbeaver_needs_a_path_where_there_is_no_default(
+    orch, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = orch()
+    o = Orchestrator(replace(o.loaded, dbeaver_enabled=True), log=o.log)
+    with pytest.raises(WtError, match="no default DBeaver location on this system"):
+        o.sync_dbeaver()
+
+
+def test_sync_dbeaver_uses_the_default_location_when_no_path_is_set(
+    orch, fake_dbeaver: FakeDbeaver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dbeaver, "default_data_sources_path", lambda: fake_dbeaver.file)
+    o = orch()
+    o = Orchestrator(replace(o.loaded, dbeaver_enabled=True), log=o.log)
+    o.sync_dbeaver()
+    assert fake_dbeaver.applied == [[]]
+
+
+def test_up_down_and_remove_sync_dbeaver_when_it_is_on(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared=SHARED), fake_dbeaver)
+    o.up("feat/cart", uses=selection(o))
+    assert len(fake_dbeaver.applied) == 1
+    o.down("feat/cart")
+    assert len(fake_dbeaver.applied) == 2
+    o.up("feat/pay", uses=selection(o))
+    o.remove("feat/pay")
+    assert len(fake_dbeaver.applied) == 4
+    assert fake_dbeaver.applied[-1] == []
+
+
+def test_up_syncs_the_databases_it_created(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared=SHARED), fake_dbeaver)
+    fake_provider.resource_names = [_db(o, "shop", "feat/cart")]
+    o.up("feat/cart", uses=selection(o))
+    assert [c.database for c in fake_dbeaver.applied[0]] == ["shop__feat_cart", "postgres"]
+
+
+def test_nothing_touches_dbeaver_when_it_is_off(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared=SHARED), fake_dbeaver, enabled=False)
+    o.up("feat/cart", uses=selection(o))
+    o.down("feat/cart")
+    o.up("feat/pay", uses=selection(o))
+    o.remove("feat/pay")
+    assert fake_dbeaver.applied == [] and fake_dbeaver.pgpass_calls == []
+
+
+def test_a_dbeaver_failure_is_a_note_not_an_error_of_up_down_or_remove(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    fake_dbeaver.fail_apply = True
+    o = _synced(orch(shared=SHARED), fake_dbeaver)
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert o.down("feat/cart") is True
+    o.up("feat/pay", uses=selection(o))
+    assert o.remove("feat/pay") is True
+    notes = [m for m in logs if "DBeaver sync failed: DBeaver workspace not found" in m]
+    assert len(notes) == 4 and all(m.startswith("[yellow]note:[/]") for m in notes)
+    assert o.store.load().branches == {}
+
+
+def test_a_changed_dbeaver_file_is_reported_with_the_counts(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    fake_dbeaver.change = dbeaver.DbeaverChange(fake_dbeaver.file, ["a", "b"], ["c"], [])
+    o = _synced(orch(shared=SHARED), fake_dbeaver)
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert "DBeaver: +2 ~1 -0 connection(s); refresh the list or restart DBeaver" in logs
+
+
+def test_an_unchanged_dbeaver_file_is_not_reported(
+    orch, fake_provider: FakeProvider, fake_dbeaver: FakeDbeaver
+) -> None:
+    o = _synced(orch(shared=SHARED), fake_dbeaver)
+    logs = _logged(o)
+    o.up("feat/cart", uses=selection(o))
+    assert not any("DBeaver" in m for m in logs)

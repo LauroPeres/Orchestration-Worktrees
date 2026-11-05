@@ -103,6 +103,7 @@ STARTER = """\
 # catalog.yaml - every service of this project; `wt add <branch> --uses a,b` picks some per branch.
 project: {project}
 domain: {project}.localhost      # *.localhost resolves to 127.0.0.1 in browsers
+# dbeaver: true   # keep a DBeaver connection per wt database (needs the Postgres infra)
 
 repos:                           # each gets a git worktree per branch; relative paths start here
   app: {repo}
@@ -1234,6 +1235,50 @@ def cache_prune(
                 f"[green]removed {len(installs)} {noun}{extra}, "
                 f"freed {human_size(result.bytes_freed)}[/]"
             )
+
+
+# ---- wt dbeaver sync (SPEC section 27) --------------------------------------------------------
+
+dbeaver_app = typer.Typer(
+    help="Keep DBeaver's connection list in step with the wt databases.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(dbeaver_app, name="dbeaver")
+
+DBEAVER_REFRESH_HINT = "refresh the connection list or restart DBeaver"
+
+
+@dbeaver_app.command("sync")
+def dbeaver_sync(ctx: typer.Context, json_output: JsonOption = False) -> None:
+    """Add, update and remove the DBeaver connections wt manages, from the recorded state."""
+    with _json_errors(json_output):
+        change = Orchestrator(_load(ctx), log=_log).sync_dbeaver()
+        if json_output:
+            _emit(
+                {
+                    "schema": JSON_SCHEMA,
+                    "changed": change.changed,
+                    "added": change.added,
+                    "updated": change.updated,
+                    "removed": change.removed,
+                    "file": str(change.file),
+                }
+            )
+            return
+        if not change.changed:
+            console.print(f"DBeaver is already in sync ({escape(str(change.file))})")
+        else:
+            for verb, names in (
+                ("added", change.added),
+                ("updated", change.updated),
+                ("removed", change.removed),
+            ):
+                if names:
+                    console.print(f"DBeaver: {verb} {escape(', '.join(names))}")
+            console.print(escape(str(change.file)))
+        console.print(DBEAVER_REFRESH_HINT)
 
 
 def main() -> None:
