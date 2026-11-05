@@ -1275,7 +1275,17 @@ def test_catalog_check_needs_a_project_and_a_domain(
 BACK_URL = "https://back.feat-cart.shop.localhost"
 FRONT_URL = "https://front.feat-cart.shop.localhost"
 SERVICE_KEYS = {"name", "kind", "status", "health", "url", "port"}
-ACTION_KEYS = ["schema", "branch", "action", "changed", "status", "urls", "warnings"]
+ACTION_KEYS = [
+    "schema",
+    "branch",
+    "action",
+    "changed",
+    "status",
+    "folder",
+    "repos",
+    "urls",
+    "warnings",
+]
 NO_CATALOG_COMMANDS = [
     ["ls"],
     ["catalog"],
@@ -1306,8 +1316,9 @@ def test_ls_json_of_a_running_branch(shop, docker: FakeDocker) -> None:
     assert list(document) == ["schema", "project", "branches"]
     assert document["schema"] == 1 and document["project"] == "shop"
     [branch] = document["branches"]
-    assert list(branch) == ["branch", "status", "services"]
+    assert list(branch) == ["branch", "status", "folder", "repos", "services"]
     assert branch["branch"] == "feat/cart" and branch["status"] == "up"
+    _assert_located(branch)
     services = {svc["name"]: svc for svc in branch["services"]}
     assert set(services) == {"back", "front"}  # the dependency came along
     assert all(set(svc) == SERVICE_KEYS for svc in services.values())
@@ -1545,6 +1556,16 @@ def test_catalog_json_refuses_check(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert list(document) == ["schema", "error"] and "--check" in document["error"]
 
 
+def _assert_located(document: dict[str, Any]) -> None:
+    """The branch's worktrees: one folder, one subfolder per repo, in catalog repo order."""
+    folder = Path(document["folder"])
+    assert folder.is_dir() and folder.name == "feat-cart"
+    repos = document["repos"]
+    assert [r["repo"] for r in repos] and all(set(r) == {"repo", "path"} for r in repos)
+    assert all(r["path"] == str(folder / r["repo"]) for r in repos)
+    assert all(Path(r["path"]).is_dir() for r in repos)
+
+
 def test_up_json_reports_status_urls_and_warnings(shop, docker: FakeDocker) -> None:
     shop()
     result = runner.invoke(app, ["up", "feat/cart", "--uses", "front", "--json"])
@@ -1558,6 +1579,7 @@ def test_up_json_reports_status_urls_and_warnings(shop, docker: FakeDocker) -> N
         "up",
     )
     assert document["changed"] is True
+    _assert_located(document)
     assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
     assert document["warnings"] == []
     assert docker.ups == ["wt-shop-feat-cart-api"]
@@ -1589,6 +1611,7 @@ def test_add_json(shop, docker: FakeDocker) -> None:
         "stopped",
     )
     assert document["changed"] is True
+    _assert_located(document)
     assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
     assert document["warnings"] == []
     assert docker.ups == []
@@ -1631,6 +1654,7 @@ def test_stop_json(shop, docker: FakeDocker) -> None:
         True,
         "stopped",
     )
+    _assert_located(document)  # stop keeps the worktrees
     assert document["urls"] == {"back": BACK_URL, "front": FRONT_URL}
     assert document["warnings"] == []
     assert docker.kept_downs == ["wt-shop-feat-cart-api"]
@@ -1649,6 +1673,7 @@ def test_down_json(shop, docker: FakeDocker) -> None:
         None,
     )
     assert document["changed"] is True and document["urls"] == {}
+    assert (document["folder"], document["repos"]) == (None, [])  # nothing left to locate
     assert docker.downs == ["wt-shop-feat-cart-api"]
 
 
@@ -1731,6 +1756,8 @@ def test_action_document_defaults() -> None:
         "action": "down",
         "changed": True,
         "status": None,
+        "folder": None,
+        "repos": [],
         "urls": {},
         "warnings": [],
     }

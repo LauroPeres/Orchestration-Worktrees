@@ -108,6 +108,7 @@ class BranchStatus:
     total: int
     services: list[ServiceReport] = field(default_factory=list)
     worktrees: dict[str, str] = field(default_factory=dict)
+    folder: str | None = None  # the one folder of the worktrees wt created (wt_folder)
     databases: list[str] = field(default_factory=list)
     ports: list[int] = field(default_factory=list)
     docker_ok: bool = True
@@ -158,12 +159,15 @@ class InstallCache:
 
 @dataclass(frozen=True)
 class RepoRow:
-    """One repo of a branch's selected services, as shown in the services view."""
+    """One line of a branch's services view: a `run:` service, or the compose services of a repo."""
 
     name: str
     status: Literal["healthy", "unhealthy", "starting", "stopped"]
     port: int | None
     url: str | None
+    service: str | None = (
+        None  # the `run:` service this line is; None for a repo's compose services
+    )
 
 
 @dataclass(frozen=True)
@@ -1509,6 +1513,7 @@ class Orchestrator:
                 + sum(host.alive(ps) for ps in bs.processes.values()),
                 total=len(containers) + len(bs.processes),
                 worktrees={r: s.path for r, s in bs.repos.items()},
+                folder=wt_folder(bs),
                 databases=list(bs.providers.get("postgres", [])),
                 ports=sorted(bs.ports.values()),
                 docker_ok=docker_ok,
@@ -1578,11 +1583,14 @@ class Orchestrator:
         me = self._for(branch)
         bs = self.store.load().branches.get(branch)
         names = me.names(branch)
-        repos: dict[str, list[str]] = {}
+        # A `run:` service is a process of its own (port, URL, log), so it gets its own line; the
+        # compose services of a repo share one compose project and stay together on the repo's line.
+        lines: dict[tuple[str, str | None], list[str]] = {}
         for name, svc in me.cfg.services.items():
-            repos.setdefault(svc.repo, []).append(name)
+            lines.setdefault((svc.repo, name if svc.run is not None else None), []).append(name)
+        per_repo = Counter(repo for repo, _ in lines)
         rows: list[RepoRow] = []
-        for repo, members in repos.items():
+        for (repo, run_service), members in lines.items():
             shown = [(n, me.cfg.services[n]) for n in members]
             pick = next((n for n, s in shown if s.subdomain is not None), None)
             routed = pick is not None
@@ -1591,7 +1599,8 @@ class Orchestrator:
             port = bs.ports.get(pick) if bs is not None and pick is not None else None
             url = me.service_url(names, me.cfg.services[pick]) if routed and pick else None
             status = me._repo_status(bs, repo, [n for n, s in shown if s.run is not None])
-            rows.append(RepoRow(repo, status, port, url))
+            label = run_service if run_service is not None and per_repo[repo] > 1 else repo
+            rows.append(RepoRow(label, status, port, url, run_service))
         return rows
 
     def _repo_status(
@@ -1787,6 +1796,12 @@ def _server_connection(project: str, repo: str) -> dbeaver.DbConnection:
 def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:
     """The catalog services that consume `name` directly, in catalog order."""
     return tuple(other for other, svc in services.items() if name in svc.consumes)
+
+
+def wt_folder(bs: BranchState) -> str | None:
+    """The folder holding the worktrees wt created; None when there are none or several."""
+    folders = _own_folders(bs)
+    return str(folders[0]) if len(folders) == 1 else None
 
 
 def _own_folders(bs: BranchState) -> list[Path]:

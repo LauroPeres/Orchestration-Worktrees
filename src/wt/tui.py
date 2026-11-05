@@ -217,12 +217,18 @@ def tail_lines(path: Path, count: int = LOG_LINES) -> list[str] | None:
     return lines[-count:]
 
 
-def log_target(orch: OrchestratorLike, branch: str, repo: str) -> tuple[str, Path]:
-    """The service of `repo` whose log to follow and its file.
+def log_target(
+    orch: OrchestratorLike, branch: str, repo: str, service: str | None = None
+) -> tuple[str, Path]:
+    """The service whose log to follow and its file: `service` when the line is one service.
 
-    A repo can hold several services; the first one that already has a log file wins.
+    A repo line (compose services) can hold several; the first one that already has a log wins.
     """
-    services = [c.service for c in orch.catalog_choices(branch) if c.repo == repo and c.selected]
+    services = (
+        [service]
+        if service is not None
+        else [c.service for c in orch.catalog_choices(branch) if c.repo == repo and c.selected]
+    )
     if not services:
         raise WtError(f"{repo} has no service in {branch}")
     names = orch.names(branch)
@@ -232,7 +238,7 @@ def log_target(orch: OrchestratorLike, branch: str, repo: str) -> tuple[str, Pat
 
 
 class ServicesScreen(Screen[None]):
-    """Repos of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
+    """Services of one worktree: NAME, STATUS, PORT, URL, refreshed every 2 s (SPEC §17)."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "app.pop_screen", "Back", show=False),
@@ -319,7 +325,7 @@ class ServicesScreen(Screen[None]):
         if repo is None:
             return
         try:
-            service, path = log_target(self._orch(), self.branch, repo.name)
+            service, path = log_target(self._orch(), self.branch, repo.name, repo.service)
         except Exception as exc:  # keep the app open whatever the orchestrator raises
             self.say(error_text(exc))
             return

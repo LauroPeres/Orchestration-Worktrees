@@ -23,6 +23,7 @@ from wt.tui import (
     LogScreen,
     ProjectEntry,
     WtApp,
+    log_target,
     status_style,
 )
 
@@ -1716,3 +1717,10 @@ def test_n_does_nothing_on_a_page_that_asks_something(monkeypatch: pytest.Monkey
             assert opened == [] and orch.dir_calls == []
 
     asyncio.run(scenario())
+
+
+def test_log_target_of_a_run_service_line_is_that_service(tmp_path: Path) -> None:
+    orch = log_orch(tmp_path)
+    service, path = log_target(orch, "feat-a", "web", "back")
+    assert service == "back"
+    assert path == orch.log_path(orch.names("feat-a"), "back")
