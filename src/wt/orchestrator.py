@@ -159,12 +159,15 @@ class InstallCache:
 
 @dataclass(frozen=True)
 class RepoRow:
-    """One repo of a branch's selected services, as shown in the services view."""
+    """One line of a branch's services view: a `run:` service, or the compose services of a repo."""
 
     name: str
     status: Literal["healthy", "unhealthy", "starting", "stopped"]
     port: int | None
     url: str | None
+    service: str | None = (
+        None  # the `run:` service this line is; None for a repo's compose services
+    )
 
 
 @dataclass(frozen=True)
@@ -1580,11 +1583,14 @@ class Orchestrator:
         me = self._for(branch)
         bs = self.store.load().branches.get(branch)
         names = me.names(branch)
-        repos: dict[str, list[str]] = {}
+        # A `run:` service is a process of its own (port, URL, log), so it gets its own line; the
+        # compose services of a repo share one compose project and stay together on the repo's line.
+        lines: dict[tuple[str, str | None], list[str]] = {}
         for name, svc in me.cfg.services.items():
-            repos.setdefault(svc.repo, []).append(name)
+            lines.setdefault((svc.repo, name if svc.run is not None else None), []).append(name)
+        per_repo = Counter(repo for repo, _ in lines)
         rows: list[RepoRow] = []
-        for repo, members in repos.items():
+        for (repo, run_service), members in lines.items():
             shown = [(n, me.cfg.services[n]) for n in members]
             pick = next((n for n, s in shown if s.subdomain is not None), None)
             routed = pick is not None
@@ -1593,7 +1599,8 @@ class Orchestrator:
             port = bs.ports.get(pick) if bs is not None and pick is not None else None
             url = me.service_url(names, me.cfg.services[pick]) if routed and pick else None
             status = me._repo_status(bs, repo, [n for n, s in shown if s.run is not None])
-            rows.append(RepoRow(repo, status, port, url))
+            label = run_service if run_service is not None and per_repo[repo] > 1 else repo
+            rows.append(RepoRow(label, status, port, url, run_service))
         return rows
 
     def _repo_status(

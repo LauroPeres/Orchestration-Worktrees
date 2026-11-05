@@ -1445,3 +1445,10 @@ Decided 2026-11-04 for the task software (Orchestration-Tasks `docs/SPEC.md` §9
 - `"schema"` stays `1`: keys are only added, so existing readers keep working.
 - No `--base` option: §28 already starts a new branch from the fetched `origin/<default branch>`, which is the base
   the task software needs.
+
+**Services view: one line per `run:` service.** Amends §17 item 6, decided 2026-11-05. A `run:` service is a process of
+its own (port, URL, log), so `services()` gives it its own line instead of merging it into its repo's line; the
+compose services of a repo still share one line (one compose project). `RepoRow` gains `service: str | None = None`,
+the `run:` service of the line (None for a repo's compose line). `name` is the repo when it has a single line, else the
+service name (`discord_web`, `discord_backend`). PORT, URL and status are those of that service. `l` follows the log of
+the line's own `service`.

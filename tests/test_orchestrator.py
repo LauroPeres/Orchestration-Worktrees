@@ -2720,6 +2720,21 @@ def test_services_follow_the_branch_selection(cfg_orch: Orchestrator, monkeypatc
     assert [r.name for r in o.services("feat/x")] == ["api"]
 
 
+def test_services_one_row_per_run_service_of_a_repo(orch) -> None:
+    run = {"repo": "api", "run": "true", "port": "auto"}
+    o = orch(
+        extra_services={
+            "web": {**run, "subdomain": "web"},
+            "worker": {**run, "subdomain": "worker"},
+        }
+    )
+    o.add("feat/x", uses=["web", "worker"])
+    rows = o.services("feat/x")
+    assert [(r.name, r.service) for r in rows] == [("web", "web"), ("worker", "worker")]
+    assert rows[0].url == "https://web.feat-x.shop.localhost"
+    assert rows[1].url == "https://worker.feat-x.shop.localhost"
+
+
 def test_ls_marks_the_repos_own_checkout(orch, docker: FakeDocker) -> None:
     o = orch()
     o.up(
