@@ -1432,3 +1432,20 @@ def test_catalog_rejects_duplicate_usernames_in_one_service(tmp_path: Path) -> N
     with pytest.raises(WtError, match="duplicate keycloak user 'alice'") as caught:
         load_catalog(write(tmp_path, text))
     assert "pw-one" not in str(caught.value)
+
+
+def test_group_names_a_picker_folder_and_does_not_reach_the_running_service(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "  front:\n    repo: notes-front\n", "  front:\n    group: notes\n    repo: notes-front\n"
+    )
+    assert load_catalog(write(tmp_path, text)).catalog.services["front"].group == "notes"
+    loaded = load_project(project_catalog(tmp_path, text), ["front"])
+    assert "group" not in loaded.config.services["front"].model_dump(exclude_unset=True)
+
+
+def test_group_must_not_be_empty(tmp_path: Path) -> None:
+    text = GOOD.replace(
+        "  front:\n    repo: notes-front\n", "  front:\n    group: ''\n    repo: notes-front\n"
+    )
+    with pytest.raises(WtError, match="group"):
+        load_catalog(write(tmp_path, text))

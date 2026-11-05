@@ -428,6 +428,8 @@ wt add feat/x --uses front       # back comes in because front consumes it
 - A selected service brings the services it consumes, transitively: `--uses front` runs `front`
   and `back`, `back` first. `down` and `stop` handle both.
 - `consumes: {back: API_URL}` sets `API_URL` to the back's own URL in that branch.
+- `group: music` lists the service under a `music/` folder in the services picker. Checking the folder line
+  checks all its services; it changes nothing else.
 - `remote:` (an `http://` or `https://` URL) is optional. A service that has to run locally ignores
   it (wt warns once); it only gives the URL of a service nobody selected and nobody consumes.
   There is no staging fallback: a dependency always runs next to its consumer.

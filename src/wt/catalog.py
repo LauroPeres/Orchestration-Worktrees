@@ -44,6 +44,12 @@ class CatalogService(Service):
     remote: str | None = Field(
         default=None, description="URL of this service when it is not in the stack (optional)"
     )
+    group: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=40,
+        description="folder this service is listed under when picking services (optional)",
+    )
 
     @model_validator(mode="after")
     def _check_consumes(self) -> Self:
@@ -368,7 +374,7 @@ def _ignored_remotes(chosen: dict[str, CatalogService], explicit: list[str]) -> 
 def _service_data(
     name: str, svc: CatalogService, chosen: dict[str, CatalogService]
 ) -> dict[str, Any]:
-    data = svc.model_dump(exclude={"infra", "consumes", "remote"}, exclude_unset=True)
+    data = svc.model_dump(exclude={"infra", "consumes", "remote", "group"}, exclude_unset=True)
     env = dict(data.get("env", {}))
     needs = list(data.get("needs", []))
     for dep, var in svc.consumes.items():

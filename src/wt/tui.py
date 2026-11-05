@@ -142,6 +142,9 @@ OPENED_TERMINAL = "opened a terminal in {path}"
 OPENED_URL = "opened {url}"
 COULD_NOT_OPEN = "could not open {url}"
 NO_ROW_VALUE = "no {what} for {name}"  # `u` and `l` on a row that has none, e.g. an infra row
+GROUP_PREFIX = "group:"  # a folder line's value; a service name cannot hold a colon
+GROUP_SUFFIX = "/"
+GROUP_INDENT = "    "
 MARKER_CHECKED = "[x] "
 MARKER_UNCHECKED = "[ ] "
 # Textual draws a checkbox as 4 segments (left, inner, right, space) before the option text.
@@ -183,9 +186,28 @@ def keys_text(line: str) -> Text:
     return text
 
 
-def choice_label(choice: Choice, holders: tuple[str, ...] = ()) -> Text:
+def group_value(group: str) -> str:
+    return GROUP_PREFIX + group
+
+
+def list_entries(choices: list[Choice]) -> list[Choice | str]:
+    """The picker lines: a folder line before the services of each `group:`, then the rest.
+
+    Folders come in order of first appearance and keep the catalog order inside; services
+    without a group follow, unindented.
+    """
+    groups = list(dict.fromkeys(c.group for c in choices if c.group is not None))
+    entries: list[Choice | str] = []
+    for group in groups:
+        entries.append(group)
+        entries.extend(c for c in choices if c.group == group)
+    entries.extend(c for c in choices if c.group is None)
+    return entries
+
+
+def choice_label(choice: Choice, holders: tuple[str, ...] = (), *, indent: bool = False) -> Text:
     """`service (repo)`, plus `(required by x, y)` while checked consumers `holders` need it."""
-    label = f"{choice.service} ({choice.repo})"
+    label = f"{GROUP_INDENT if indent else ''}{choice.service} ({choice.repo})"
     if holders:
         label += f" (required by {', '.join(holders)})"
     return Text(label)
@@ -509,12 +531,26 @@ class ChoiceList(SelectionList[str]):
             self.holders = holders
 
     def __init__(self, choices: list[Choice]) -> None:
+        self._entries = list_entries(choices)
         super().__init__(
-            *[Selection(choice_label(c), c.service, c.selected) for c in choices],
+            *[self._selection(entry, choices) for entry in self._entries],
             id="choices",
             compact=True,
         )
         self._choices = choices
+
+    @staticmethod
+    def _selection(entry: Choice | str, choices: list[Choice]) -> Selection[str]:
+        if isinstance(entry, Choice):
+            return Selection(
+                choice_label(entry, indent=entry.group is not None), entry.service, entry.selected
+            )
+        members = [c for c in choices if c.group == entry]
+        return Selection(
+            Text(entry + GROUP_SUFFIX, style="bold"),
+            group_value(entry),
+            all(c.selected for c in members),
+        )
 
     def holders(self, choice: Choice) -> tuple[str, ...]:
         """The consumers of `choice` that are checked right now: they lock it."""
@@ -542,8 +578,34 @@ class ChoiceList(SelectionList[str]):
 
     def relabel(self) -> None:
         """Show `(required by ...)` only for the consumers that are still checked."""
-        for index, choice in enumerate(self._choices):
-            self.replace_option_prompt_at_index(index, choice_label(choice, self.holders(choice)))
+        for index, entry in enumerate(self._entries):
+            if isinstance(entry, Choice):
+                label = choice_label(entry, self.holders(entry), indent=entry.group is not None)
+                self.replace_option_prompt_at_index(index, label)
+
+    def sync_groups(self) -> None:
+        """A group folder is checked exactly while all of its services are."""
+        for group in {c.group for c in self._choices if c.group is not None}:
+            everyone = all(c.service in self.selected for c in self._choices if c.group == group)
+            (self.select if everyone else self.deselect)(group_value(group))
+
+    def _toggle_group(self, group: str) -> None:
+        """Check every service of the folder, or uncheck them all when all are checked.
+
+        A service a checked consumer still requires stays checked (it is locked).
+        """
+        members = [c for c in self._choices if c.group == group]
+        if not all(c.service in self.selected for c in members):
+            for member in members:
+                self.select(member.service)
+            return
+        changed = True
+        while changed:  # a consumer unchecked in one pass frees what it required in the next
+            changed = False
+            for member in members:
+                if member.service in self.selected and not self.holders(member):
+                    self.deselect(member.service)
+                    changed = True
 
     def render_line(self, y: int) -> Strip:
         """Draw `[x]`/`[ ]` in place of Textual's colored checkbox: the state shows as text."""
@@ -560,6 +622,9 @@ class ChoiceList(SelectionList[str]):
 
     def toggle(self, selection: Selection[str] | str) -> Self:
         value = selection.value if isinstance(selection, Selection) else selection
+        if value.startswith(GROUP_PREFIX):
+            self._toggle_group(value.removeprefix(GROUP_PREFIX))
+            return self
         for choice in self._choices:
             if choice.service == value and (holders := self.holders(choice)):
                 self.post_message(self.Refused(value, holders))
@@ -607,6 +672,7 @@ class ConfigureScreen(PageScreen[list[str] | None]):
     @on(SelectionList.SelectedChanged)
     def _selection_changed(self) -> None:
         self._options.check_dependencies()
+        self._options.sync_groups()
         self._options.relabel()
         self._say("")  # a note about the previous selection no longer applies
 

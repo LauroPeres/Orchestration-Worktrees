@@ -1724,3 +1724,72 @@ def test_log_target_of_a_run_service_line_is_that_service(tmp_path: Path) -> Non
     service, path = log_target(orch, "feat-a", "web", "back")
     assert service == "back"
     assert path == orch.log_path(orch.names("feat-a"), "back")
+
+
+def grouped_choices() -> list[Choice]:
+    return [
+        Choice("solo", "tool", False),
+        Choice("music_back", "music-back", False, required_by=("music_front",), group="music"),
+        Choice("music_front", "music-front", False, group="music"),
+        Choice("tudo_back", "tudo-back", False, group="tudo"),
+    ]
+
+
+def test_services_are_listed_under_their_group_folder() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = grouped_choices()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            options = app.screen.query_one("#choices", SelectionList)
+            labels = [
+                str(options.get_option_at_index(i).prompt) for i in range(options.option_count)
+            ]
+            assert labels == [
+                "music/",
+                "    music_back (music-back)",
+                "    music_front (music-front)",
+                "tudo/",
+                "    tudo_back (tudo-back)",
+                "solo (tool)",
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_checking_a_folder_checks_all_its_services_and_unchecking_clears_them() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = grouped_choices()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            await pilot.press("space")  # the music/ folder line
+            await settle(pilot)
+            assert sorted(checked(app)) == ["group:music", "music_back", "music_front"]
+            await pilot.press("space")
+            await settle(pilot)
+            assert checked(app) == []
+
+    asyncio.run(scenario())
+
+
+def test_folder_follows_its_services_and_confirm_returns_only_services() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.choices = grouped_choices()
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_configure(pilot)
+            await pilot.press("down", "space", "down", "space")  # both music services
+            await settle(pilot)
+            assert "group:music" in checked(app)
+            await pilot.press("space")  # music_front off: the folder is no longer complete
+            await settle(pilot)
+            assert "group:music" not in checked(app)
+            await pilot.press("enter")
+            await settle(pilot)
+            assert orch.calls == [("configure", "feat-a", ["music_back"])]
+
+    asyncio.run(scenario())
