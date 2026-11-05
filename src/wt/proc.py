@@ -154,5 +154,24 @@ def _run_streaming(  # noqa: C901
     return Result(child.returncode, "".join(f"{line}\n" for line in lines), "")
 
 
+def spawn_detached(args: Sequence[str], *, cwd: Path | None = None) -> None:
+    """Start a program the user asked for (e.g. a terminal) and do not wait for it."""
+    if cwd is not None and not cwd.is_dir():
+        raise WtError(f"folder does not exist: {cwd}")
+    try:
+        subprocess.Popen(
+            list(args),
+            cwd=cwd,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise WtError(f"'{args[0]}' was not found on PATH") from exc
+    except OSError as exc:
+        raise WtError(f"could not start {args[0]}: {exc}") from exc
+
+
 def which(name: str) -> str | None:
     return shutil.which(name)

@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -32,7 +33,20 @@ from tests.conftest import (
     write_global_catalog,
 )
 from tests.conftest import git as git_run
-from wt import cache, compose, git, health, host, naming, orchestrator, proc, router, state, tls
+from wt import (
+    cache,
+    compose,
+    git,
+    health,
+    host,
+    naming,
+    orchestrator,
+    proc,
+    providers,
+    router,
+    state,
+    tls,
+)
 from wt.catalog import load_project
 from wt.errors import WtError
 from wt.orchestrator import Orchestrator, ServiceReport
@@ -4445,3 +4459,289 @@ def test_stop_does_not_wait_when_the_branch_routes_nothing(
     o.stop("feat/x")
     o.down("feat/x")
     assert waits == []
+
+
+# --- one folder per wt (§26): a repo added later lands next to the repos the wt already has ---
+def _git_worktree_paths(repo: Path) -> list[Path]:
+    """The worktree folders git lists for `repo`, resolved."""
+    lines = git_run(repo, "worktree", "list", "--porcelain").splitlines()
+    return [
+        Path(line.removeprefix("worktree ")).resolve() for line in lines if line[:9] == "worktree "
+    ]
+
+
+def _move_paths(o: Orchestrator, branch: str) -> dict[str, Path]:
+    return {r: Path(s.path) for r, s in o.store.load().branches[branch].repos.items()}
+
+
+def test_a_repo_added_later_lands_next_to_the_repos_the_wt_already_has(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    _trees_orch(make_repo, tmp_path, None).add("feat/x", uses=["back"])  # no `worktrees:` yet
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")  # the key is set afterwards
+    o.configure("feat/x", BOTH_REPOS)
+    folder = isolated_home / "shop" / "worktrees" / "feat-x"
+    assert _move_paths(o, "feat/x") == {"api": folder / "api", "web": folder / "web"}
+    assert (folder / "web" / "docker-compose.yml").is_file()
+    assert not (tmp_path / "trees").exists()
+
+
+def test_a_wt_without_a_repo_of_its_own_uses_the_configured_folder(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=["back"])
+
+    def borrowed(bs: state.BranchState) -> None:
+        bs.repos["api"].created = False  # e.g. the repo's own checkout: not a folder of the wt
+
+    o._record("feat/x", borrowed)
+    assert o.worktree_target(o.names("feat/x"), "web") == trees / "feat-x" / "web"
+
+
+def test_a_foreign_folder_is_refused_in_the_folder_the_wt_already_lives_in(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    _trees_orch(make_repo, tmp_path, None).add("feat/x", uses=["back"])
+    foreign = isolated_home / "shop" / "worktrees" / "feat-x" / "web"
+    foreign.mkdir(parents=True)
+    (foreign / "notes.txt").write_text("mine")
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")
+    with pytest.raises(WtError) as err:
+        o.configure("feat/x", BOTH_REPOS)
+    assert str(err.value) == FOREIGN_MESSAGE.format(target=foreign)
+    assert (foreign / "notes.txt").read_text() == "mine"
+    assert "web" not in o.store.load().branches["feat/x"].repos
+
+
+# --- worktree_dir (§26) ---
+def test_worktree_dir_is_the_folder_all_the_repos_share(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    assert o.worktree_dir("feat/x") == trees / "feat-x"
+
+
+def test_worktree_dir_is_none_without_state_or_without_a_repo_of_its_own(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")
+    assert o.worktree_dir("feat/none") is None
+    o.add("feat/x", uses=BOTH_REPOS)
+
+    def borrowed(bs: state.BranchState) -> None:
+        for repo in bs.repos.values():
+            repo.created = False
+
+    o._record("feat/x", borrowed)
+    assert o.worktree_dir("feat/x") is None
+
+
+def _spread(make_repo, tmp_path: Path, trees: Path, elsewhere: Path) -> Orchestrator:
+    """A stopped wt whose `api` is in `trees` (the configured folder) and `web` in `elsewhere`."""
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    web = elsewhere / "feat-x" / "web"
+    git.move_worktree(tmp_path / "shop-web", trees / "feat-x" / "web", web)
+
+    def relocate(bs: state.BranchState) -> None:
+        bs.repos["web"].path = str(web)
+
+    o._record("feat/x", relocate)
+    return o
+
+
+def test_worktree_dir_of_a_spread_wt_points_to_wt_move(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    o = _spread(make_repo, tmp_path, tmp_path / "trees", tmp_path / "other")
+    with pytest.raises(WtError) as err:
+        o.worktree_dir("feat/x")
+    assert str(err.value) == (
+        "feat/x is spread over several folders; stop it and run wt move feat/x"
+    )
+
+
+# --- move (§26) ---
+def test_move_repairs_a_wt_spread_over_two_folders(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees, other = tmp_path / "trees", tmp_path / "other"
+    o = _spread(make_repo, tmp_path, trees, other)
+    result = o.move("feat/x")
+    assert result == orchestrator.MoveResult(True, trees / "feat-x", ["web"])
+    assert _move_paths(o, "feat/x") == {
+        "api": trees / "feat-x" / "api",
+        "web": trees / "feat-x" / "web",
+    }
+    assert (trees / "feat-x" / "web" / "docker-compose.yml").is_file()
+    assert trees / "feat-x" / "web" in _git_worktree_paths(tmp_path / "shop-web")
+    assert not (other / "feat-x").exists()
+    assert other.is_dir()  # only the wt's own folder is removed
+    assert o.worktree_dir("feat/x") == trees / "feat-x"
+    assert o.move("feat/x") == orchestrator.MoveResult(False, trees / "feat-x", [])
+
+
+def test_move_takes_a_wt_to_the_folder_configured_later(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    _trees_orch(make_repo, tmp_path, None).add("feat/x", uses=BOTH_REPOS)
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    result = o.move("feat/x")
+    assert result == orchestrator.MoveResult(True, trees / "feat-x", ["api", "web"])
+    assert _move_paths(o, "feat/x") == {
+        "api": trees / "feat-x" / "api",
+        "web": trees / "feat-x" / "web",
+    }
+    assert trees / "feat-x" / "api" in _git_worktree_paths(tmp_path / "shop-api")
+    assert not (isolated_home / "shop" / "worktrees" / "feat-x").exists()
+
+
+def test_move_in_place_changes_nothing(make_repo, tmp_path: Path, docker: FakeDocker) -> None:
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    o.add("feat/x", uses=BOTH_REPOS)
+    before = _move_paths(o, "feat/x")
+    assert o.move("feat/x") == orchestrator.MoveResult(False, trees / "feat-x", [])
+    assert _move_paths(o, "feat/x") == before
+
+
+def test_move_unknown_branch_is_an_error(make_repo, tmp_path: Path, docker: FakeDocker) -> None:
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")
+    with pytest.raises(WtError) as err:
+        o.move("feat/nope")
+    assert str(err.value) == "branch 'feat/nope' not found (see `wt ls`)"
+
+
+def test_move_is_refused_while_the_wt_is_running(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    trees = tmp_path / "trees"
+    _trees_orch(make_repo, tmp_path, None).up("feat/x", uses=BOTH_REPOS)
+    o = _trees_orch(make_repo, tmp_path, trees)
+    before = _move_paths(o, "feat/x")
+    with pytest.raises(WtError) as err:
+        o.move("feat/x")
+    assert str(err.value) == "feat/x is running; stop it first: wt stop feat/x"
+    assert _move_paths(o, "feat/x") == before
+    assert not trees.exists()
+
+
+def test_move_is_refused_while_a_recorded_process_is_alive(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, tmp_path / "trees")
+    o.add("feat/x", uses=BOTH_REPOS)
+    process = ProcessState(pid=1, pgid=1, command="sleep", log="x.log")
+    o._record("feat/x", lambda bs: bs.processes.update(web=process))
+    monkeypatch.setattr(host, "alive", lambda ps: True)
+    with pytest.raises(WtError, match="feat/x is running; stop it first: wt stop feat/x"):
+        o.move("feat/x")
+
+
+def test_move_leaves_a_repo_wt_did_not_create_alone(
+    make_repo, tmp_path: Path, docker: FakeDocker
+) -> None:
+    _trees_orch(make_repo, tmp_path, None).add("feat/x", uses=BOTH_REPOS)
+    trees = tmp_path / "trees"
+    o = _trees_orch(make_repo, tmp_path, trees)
+    web = _move_paths(o, "feat/x")["web"]
+    o._record("feat/x", lambda bs: setattr(bs.repos["web"], "created", False))
+    assert o.move("feat/x") == orchestrator.MoveResult(True, trees / "feat-x", ["api"])
+    assert _move_paths(o, "feat/x")["web"] == web
+    assert web.is_dir()
+
+
+def test_move_failure_keeps_the_moved_repos_recorded_and_names_the_failing_one(
+    make_repo, tmp_path: Path, docker: FakeDocker, isolated_home: Path
+) -> None:
+    _trees_orch(make_repo, tmp_path, None).add("feat/x", uses=BOTH_REPOS)
+    trees = tmp_path / "trees"
+    blocker = trees / "feat-x" / "web"
+    blocker.mkdir(parents=True)
+    (blocker / "notes.txt").write_text("mine")
+    o = _trees_orch(make_repo, tmp_path, trees)
+    with pytest.raises(WtError) as err:
+        o.move("feat/x")
+    assert str(err.value) == f"{blocker} already exists; move or remove it first"
+    old = isolated_home / "shop" / "worktrees" / "feat-x"
+    assert _move_paths(o, "feat/x") == {"api": trees / "feat-x" / "api", "web": old / "web"}
+    assert (old / "web" / "docker-compose.yml").is_file()
+    assert (blocker / "notes.txt").read_text() == "mine"
+    blocker.joinpath("notes.txt").unlink()
+    blocker.rmdir()
+    assert o.move("feat/x").moved == ["web"]  # retry finishes the job
+    assert not old.exists()
+
+
+# --- infra (§26) ---
+def test_infra_asks_the_providers_for_the_rows_of_the_branch_selection(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    o.add("feat/x", uses=["back"])
+    o._record("feat/x", lambda bs: bs.providers.update(postgres=["shop__feat_x"]))
+    seen: list[tuple[list[str], dict[str, list[str]]]] = []
+    rows = [providers.InfraRow("postgres", "running", 5432, "shop__feat_x")]
+
+    def fake_rows(cfg: Any, recorded: Mapping[str, Any]) -> list[providers.InfraRow]:
+        seen.append((list(cfg.services), {k: list(v) for k, v in recorded.items()}))
+        return rows
+
+    monkeypatch.setattr(providers, "infra_rows", fake_rows)
+    assert o.infra("feat/x")[1:] == rows
+    assert seen == [(["back"], {"postgres": ["shop__feat_x"]})]
+    o.infra("feat/unknown")
+    assert seen[-1][1] == {}  # no state: nothing recorded
+
+
+def _stub_router_and_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(providers.server, "container_status", lambda name: f"status of {name}")
+    monkeypatch.setattr(router, "https_port", lambda: 8443)
+    monkeypatch.setattr(providers, "infra_rows", lambda cfg, recorded: [])
+
+
+@pytest.mark.parametrize(("uses", "detail"), [(["back"], "1 route"), (["back", "web"], "2 routes")])
+def test_infra_starts_with_the_shared_router_and_counts_the_selection_routes(
+    make_repo,
+    tmp_path: Path,
+    docker: FakeDocker,
+    monkeypatch: pytest.MonkeyPatch,
+    uses: list[str],
+    detail: str,
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    o.add("feat/x", uses=uses)
+    _stub_router_and_providers(monkeypatch)
+    assert o.infra("feat/x") == [
+        providers.InfraRow(
+            name="traefik", status=f"status of {router.container()}", port=8443, detail=detail
+        )
+    ]
+
+
+def test_infra_says_no_routes_when_nothing_in_the_selection_has_a_subdomain(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    _stub_router_and_providers(monkeypatch)
+    quiet = SimpleNamespace(cfg=SimpleNamespace(services={"job": SimpleNamespace(subdomain=None)}))
+    monkeypatch.setattr(o, "_for", lambda branch: quiet)
+    assert [row.detail for row in o.infra("feat/x")] == ["no routes"]
+
+
+def test_infra_keeps_the_router_first_for_a_branch_that_does_not_exist(
+    make_repo, tmp_path: Path, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = _trees_orch(make_repo, tmp_path, None)
+    monkeypatch.setattr(providers.server, "container_status", lambda name: "running")
+    monkeypatch.setattr(
+        providers,
+        "infra_rows",
+        lambda cfg, recorded: [providers.InfraRow("redis", "running", 6379, "-")],
+    )
+    assert [row.name for row in o.infra("feat/unknown")] == ["traefik", "redis"]

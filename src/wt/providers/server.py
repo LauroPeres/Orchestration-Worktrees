@@ -3,7 +3,7 @@
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -12,6 +12,8 @@ from wt.errors import WtError
 from wt.state import atomic_write
 
 MIN_READY_SECONDS = 1.0  # a readiness probe always gets one real try
+ContainerStatus = Literal["running", "unhealthy", "stopped", "missing"]
+_INSPECT_STATE = "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}"
 
 
 def _host_port(entry: object) -> int | None:
@@ -101,3 +103,20 @@ def start(
 ) -> None:
     """`up`, then the provider's readiness wait with what is left of the one `timeout` deadline."""
     wait_ready(up(name, folder, doc, timeout), timeout)
+
+
+def container_status(name: str) -> ContainerStatus:
+    """State of a shared server's container from one `docker inspect`, with no network.
+
+    A container that does not exist, or no usable Docker, is `missing`: a status view must not fail.
+    """
+    try:
+        result = proc.run(["docker", "inspect", "--format", _INSPECT_STATE, name], check=False)
+    except WtError:
+        return "missing"
+    if not result.ok:
+        return "missing"
+    state, _, health = result.stdout.strip().partition("|")
+    if state != "running":
+        return "stopped"
+    return "unhealthy" if health == "unhealthy" else "running"

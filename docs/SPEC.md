@@ -167,6 +167,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.7.0 ✔ (§23) | Shared provider helpers, plugin providers (`wt.providers` entry points), `wt init --with`, TUI log pane, `wt catalog add-repo/add-service/remove-*` |
 | v0.8.1 ✔ (§25) | Keycloak dev users (`infra.keycloak.users`) |
 | v0.9.0 ✔ (§25) | Windows CI job (non-blocking) and `docs/windows.md`; native Windows is not supported |
+| v0.9.1 ✔ (§26) | One folder per wt (`wt move`), `stopped` in red, infra rows in the services view, `u: url`, `n: new terminal` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1210,3 +1211,61 @@ roles: list[str]}] = []` (usernames unique, `[A-Za-z0-9._-]{1,64}`, non-empty pa
 `continue-on-error: true`; it never blocks a merge. `docs/windows.md` lists, per area (paths and symlinks, file
 locks, host processes and signals, mkcert trust, Traefik mounts, `bash -c` scripts, git worktrees), what fails
 with the first error line from that job. The README says Windows is not supported and to use WSL2.
+
+## 26. v0.9.1: one folder per wt, infra rows, `u: url`, `n: new terminal`
+
+Decided 2026-11-02 from the user's hands-on test. Everything not named here is unchanged.
+
+**One folder per wt (bug).** A wt created before the catalog had `worktrees:` kept its repos under
+`$WT_HOME/<project>/worktrees/<slug>/`; when it later gained a repo (the services page, `configure`), the new
+repo went to `<worktrees>/<slug>/`, so one wt lived in two folders. Rules (amend §21):
+- The folder of an existing wt is `dirname(recorded path)` of any repo it already has **and that wt created**
+  (a repo checked out in its own folder, e.g. `main`, never counts: its parent would be the user's own
+  code folder). A repo added later is
+  created **next to the repos the wt already has**, whatever `worktrees:` says now. `worktrees:` decides the
+  folder of a *new* wt only.
+- `Orchestrator.worktree_dir(branch) -> Path | None`: the common folder of all recorded repo paths of the
+  branch; `None` for a branch without repos of its own (checked out in the repos' own folders); if the
+  recorded paths do not share one parent: `WtError("<branch> is spread over several folders; stop it and run
+  wt move <branch>")`.
+- `wt move NAME [--json]`: moves every worktree of the wt to `<worktrees>/<slug>/<repo>` (or the default folder
+  when the key is unset) with `git worktree move` and updates the recorded paths. Refused while the wt is
+  running (`<name> is running; stop it first: wt stop <name>`), when a target exists
+  (`<path> already exists; move or remove it first`), and for a repo that is not a worktree of wt's making
+  (`created` false). Already in place: `changed: false`, nothing touched. Empty old folders are removed.
+  A failure in the middle leaves the already moved repos recorded at their new path (the state is written per
+  repo) and names the one that failed. JSON: `{"schema":1,"branch":…,"action":"move","changed":true,
+  "folder":"/…/trees/name","moved":["repo",…]}`.
+
+**TUI.**
+- Status colors: `stopped` is red (every status cell, main and services tables). Infra statuses use the same
+  map: `running` green, `stopped` and `missing` red, `unhealthy` red.
+- **Infra rows (services view).** After the repo rows, first the shared Traefik router (always: `traefik (infra)`,
+  STATUS its container's state, PORT the HTTPS port, last column `N routes` for the routed services of the
+  wt), then one row per shared server the wt's stack uses
+  (`postgres`, `redis`, `kafka`, `keycloak`, plugin names): NAME `<provider> (infra)`, STATUS the server
+  container's state (`running`, `unhealthy`, `stopped`, `missing`; a plugin without a server shows
+  `running` when the branch has its slice recorded, else `-`), PORT the host port of the server when it has one,
+  URL column the branch's slice (`shop__feat_cart`, the Redis prefix, the Kafka group, the Keycloak client)
+  or `-`. `Orchestrator.infra(branch) -> list[InfraRow]` with `InfraRow(name, status, port, detail)`; cheap
+  (one `docker inspect` per server, no network), refreshed with the services.
+- **`u: url`** (services view): opens the URL of the selected repo row in the default browser
+  (`webbrowser.open`); a row without a URL says `no URL for <name>` on the message line; infra rows have none.
+- **`n: new terminal`** (main table): opens a terminal in the wt's folder (`worktree_dir`). A wt without a folder
+  of its own says `<name> has no worktree folder of its own`; a spread wt shows the `wt move` hint. Terminal
+  choice, first match: `WT_TERMINAL` (a command line with `{path}`), `$TERMINAL`, then on Linux the first of
+  `kitty`, `konsole`, `gnome-terminal`, `alacritty`, `wezterm`, `foot`, `xfce4-terminal`, `x-terminal-emulator`,
+  `xterm` found on PATH, on macOS `open -a Terminal <path>`. Each gets its own "start here" flag
+  (`kitty --directory`, `konsole --workdir`, `gnome-terminal --working-directory=`, `alacritty
+  --working-directory`, `wezterm start --cwd`, `foot --working-directory=`, `xfce4-terminal
+  --working-directory=`; `xterm` and any `$TERMINAL` are started with `cwd=<path>`), and is started detached
+  (new session, no wait, no output). No terminal found: `no terminal found; set WT_TERMINAL`.
+- Action lines: main `enter: services  u: up  d: stop  x: down  a: add  r: remove  n: terminal  q: quit`;
+  services `u: url  c: configure  l: logs  esc: back  q: quit`.
+
+**Certificate trust (found with a real Chrome).** `mkcert` creates the root CA on first use, but browsers reject
+the branch certificates (`ERR_CERT_AUTHORITY_INVALID`) until `mkcert -install` has put it in a trust store, which
+needs the user's sudo password once, so wt never runs it by itself. `tls.ca_trusted() -> bool | None` tells
+whether the CA is installed (Linux: `trust list`, the usual anchor folders, the Chrome/NSS database through
+`certutil`; macOS: the keychains; `None` when it cannot be told). `wt doctor` adds a `ca trusted` line: `ok`
+when installed, `warn` with `run mkcert -install once, then restart the browser` when not, `info` when unknown.

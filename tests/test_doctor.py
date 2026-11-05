@@ -1,11 +1,12 @@
 import copy
 import socket
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import pytest
 
 from tests.conftest import SHOP_CATALOG, write_global_catalog
-from wt import cache, compose, doctor, host, proc, router
+from wt import cache, compose, doctor, host, proc, router, tls
 from wt.config import LoadedConfig, Shared
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
@@ -1052,3 +1053,113 @@ def test_cache_check_runs_without_docker_and_without_a_catalog(
     _disk(monkeypatch, total=5 * MIB, free=50 * GIB)
     checks = _by_name(doctor.run_checks(None, None, fix=False))
     assert checks["cache"].detail == "5 MiB in the install and tool caches"
+
+
+# --- ca trusted (§26) ---
+@pytest.fixture
+def mkcert_with_ca(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tls, "available", lambda: True)
+    monkeypatch.setattr(tls, "ca_ready", lambda: True)
+
+
+@pytest.mark.parametrize(
+    ("trusted", "level", "detail"),
+    [
+        (True, "ok", "mkcert CA is installed in a trust store"),
+        (
+            False,
+            "warn",
+            "mkcert CA is not installed: browsers will show ERR_CERT_AUTHORITY_INVALID",
+        ),
+        (None, "info", "could not tell whether the mkcert CA is trusted"),
+    ],
+)
+def test_ca_trusted_reports_what_the_trust_stores_say(
+    monkeypatch: pytest.MonkeyPatch,
+    mkcert_with_ca: None,
+    trusted: bool | None,
+    level: str,
+    detail: str,
+) -> None:
+    monkeypatch.setattr(tls, "ca_trusted", lambda: trusted)
+    check = doctor.check_ca_trusted(fix=False)
+    assert check is not None
+    assert (check.name, check.level, check.detail) == ("ca trusted", level, detail)
+    assert ("mkcert -install" in check.hint) is (trusted is False)
+
+
+def test_ca_trusted_without_fix_points_at_doctor_fix_and_installs_nothing(
+    monkeypatch: pytest.MonkeyPatch, mkcert_with_ca: None
+) -> None:
+    monkeypatch.setattr(tls, "ca_trusted", lambda: False)
+    monkeypatch.setattr(tls, "install_ca_user", lambda: pytest.fail("only with --fix"))
+    check = doctor.check_ca_trusted(fix=False)
+    assert check is not None
+    assert check.hint == (
+        "run `wt doctor --fix` (adds the CA to your browser database without sudo), "
+        "or `mkcert -install` in a terminal for the system store"
+    )
+
+
+def test_ca_trusted_fix_adds_the_ca_to_the_browser_databases_and_turns_ok(
+    monkeypatch: pytest.MonkeyPatch, mkcert_with_ca: None, tmp_path: Path
+) -> None:
+    installed: list[bool] = []
+
+    def install_ca_user() -> list[Path]:
+        installed.append(True)
+        return [tmp_path / "a", tmp_path / "b"]
+
+    monkeypatch.setattr(tls, "ca_trusted", lambda: bool(installed))
+    monkeypatch.setattr(tls, "install_ca_user", install_ca_user)
+    monkeypatch.setattr(tls, "install_ca", lambda: pytest.fail("mkcert -install needs a TTY"))
+    check = doctor.check_ca_trusted(fix=True)
+    assert check == doctor.Check(
+        "ca trusted", "ok", "mkcert CA added to 2 browser database(s); restart the browser"
+    )
+
+
+@pytest.mark.parametrize(
+    ("added", "trusted_after"),
+    [([], False), ([Path("/db")], False), ([Path("/db")], None)],
+)
+def test_ca_trusted_fix_that_cannot_help_keeps_the_warning_with_the_sudo_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    mkcert_with_ca: None,
+    added: list[Path],
+    trusted_after: bool | None,
+) -> None:
+    answers = iter([False, trusted_after])
+    monkeypatch.setattr(tls, "ca_trusted", lambda: next(answers))
+    monkeypatch.setattr(tls, "install_ca_user", lambda: added)
+    monkeypatch.setattr(tls, "install_ca", lambda: pytest.fail("mkcert -install needs a TTY"))
+    check = doctor.check_ca_trusted(fix=True)
+    assert check is not None
+    assert check.level == "warn"
+    assert check.hint == (
+        "run `mkcert -install` once in a terminal (it needs your sudo password for the system "
+        "store), then restart the browser"
+    )
+
+
+@pytest.mark.parametrize(("available", "ready"), [(False, True), (True, False)])
+def test_ca_trusted_is_skipped_without_mkcert_or_a_ca(
+    monkeypatch: pytest.MonkeyPatch, available: bool, ready: bool
+) -> None:
+    monkeypatch.setattr(tls, "available", lambda: available)
+    monkeypatch.setattr(tls, "ca_ready", lambda: ready)
+    monkeypatch.setattr(tls, "ca_trusted", lambda: pytest.fail("no CA to look for"))
+    assert doctor.check_ca_trusted(fix=True) is None
+
+
+def test_run_checks_puts_ca_trusted_right_after_the_mkcert_check(
+    monkeypatch: pytest.MonkeyPatch, mkcert_with_ca: None
+) -> None:
+    monkeypatch.setattr(doctor, "check_git", lambda: doctor.Check("git", "ok", ""))
+    monkeypatch.setattr(doctor, "check_docker", lambda: [doctor.Check("docker", "ok", "")])
+    monkeypatch.setattr(doctor, "check_tls", lambda fix: doctor.Check("mkcert", "ok", ""))
+    monkeypatch.setattr(doctor, "check_routing", lambda fix: [])
+    monkeypatch.setattr(doctor, "check_resolution", lambda d: doctor.Check("resolver", "ok", ""))
+    monkeypatch.setattr(tls, "ca_trusted", lambda: True)
+    names = [c.name for c in doctor.run_checks(None, None, fix=False)]
+    assert names[names.index("mkcert") + 1] == "ca trusted"

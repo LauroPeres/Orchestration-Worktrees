@@ -1,4 +1,6 @@
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -136,3 +138,31 @@ def test_streaming_timeout_raises_command_timeout() -> None:
 
 def test_command_timeout_is_a_wt_error() -> None:
     assert issubclass(proc.CommandTimeout, WtError)
+
+
+def test_spawn_detached_returns_before_the_child_finishes(tmp_path: Path) -> None:
+    marker = tmp_path / "marker"
+    code = f"import time, pathlib; time.sleep(0.5); pathlib.Path({str(marker)!r}).write_text('ok')"
+    proc.spawn_detached([sys.executable, "-c", code], cwd=tmp_path)
+    assert not marker.exists()
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.read_text() == "ok"
+
+
+def test_spawn_detached_missing_command() -> None:
+    with pytest.raises(WtError, match="'wt-no-such-cmd' was not found on PATH"):
+        proc.spawn_detached(["wt-no-such-cmd"])
+
+
+def test_spawn_detached_missing_cwd(tmp_path: Path) -> None:
+    with pytest.raises(WtError, match="folder does not exist"):
+        proc.spawn_detached([sys.executable, "-c", "pass"], cwd=tmp_path / "nope")
+
+
+def test_spawn_detached_other_os_error(tmp_path: Path) -> None:
+    not_executable = tmp_path / "script"
+    not_executable.write_text("#!/bin/sh\n")
+    with pytest.raises(WtError, match="could not start"):
+        proc.spawn_detached([str(not_executable)])

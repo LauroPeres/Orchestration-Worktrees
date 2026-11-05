@@ -16,7 +16,7 @@ from wt import __version__, cache, catalog_edit, cli, compose, doctor, host, pro
 from wt.catalog import load_project
 from wt.cli import app
 from wt.errors import WtError
-from wt.orchestrator import BranchStatus, Orchestrator, ServiceReport
+from wt.orchestrator import BranchStatus, MoveResult, Orchestrator, ServiceReport
 from wt.state import BranchState, StateStore
 
 runner = CliRunner()
@@ -891,6 +891,102 @@ def test_remove_confirmed_calls_remove_once(
 def test_stop_unknown_branch_fails(shop, docker: FakeDocker) -> None:
     shop()
     assert runner.invoke(app, ["stop", "feat/nope"]).exit_code != 0
+
+
+def _fake_move(monkeypatch: pytest.MonkeyPatch, result: MoveResult) -> list[str]:
+    calls: list[str] = []
+
+    def move(self: Any, branch: str) -> MoveResult:
+        calls.append(branch)
+        return result
+
+    monkeypatch.setattr(Orchestrator, "move", move)
+    return calls
+
+
+def test_move_prints_each_moved_repo_and_the_folder(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    calls = _fake_move(monkeypatch, MoveResult(True, Path("/trees/feat-cart"), ["api", "web"]))
+    result = runner.invoke(app, ["move", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert calls == ["feat/cart"]
+    lines = result.output.splitlines()
+    assert lines[-3:] == [
+        "moved api",
+        "moved web",
+        "feat/cart now lives in /trees/feat-cart",
+    ]
+
+
+def test_move_of_a_wt_already_in_place_says_so(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_move(monkeypatch, MoveResult(False, Path("/trees/feat-cart"), []))
+    result = runner.invoke(app, ["move", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "feat/cart is already in /trees/feat-cart"
+
+
+def test_move_of_a_wt_without_folder_of_its_own_says_so(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_move(monkeypatch, MoveResult(False, None, []))
+    result = runner.invoke(app, ["move", "feat/cart"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "feat/cart has no worktree folder of its own"
+
+
+def test_move_json(shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_move(monkeypatch, MoveResult(True, Path("/trees/feat-cart"), ["api"]))
+    result = runner.invoke(app, ["move", "feat/cart", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "branch": "feat/cart",
+        "action": "move",
+        "changed": True,
+        "folder": "/trees/feat-cart",
+        "moved": ["api"],
+    }
+
+
+def test_move_json_without_folder_has_null(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_move(monkeypatch, MoveResult(False, None, []))
+    document = _document(runner.invoke(app, ["move", "feat/cart", "--json"]))
+    assert (document["changed"], document["folder"], document["moved"]) == (False, None, [])
+
+
+def test_move_of_an_unknown_branch_fails_with_the_error(shop, docker: FakeDocker) -> None:
+    shop()
+    result = runner.invoke(app, ["move", "feat/nope"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, WtError)
+    assert "feat/nope" in str(result.exception)
+
+
+def test_move_json_error_is_the_error_document(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+
+    def refuse(self: Any, branch: str) -> MoveResult:
+        raise WtError(f"{branch} is running; stop it first: wt stop {branch}")
+
+    monkeypatch.setattr(Orchestrator, "move", refuse)
+    result = runner.invoke(app, ["move", "feat/cart", "--json"])
+    assert result.exit_code == 1
+    assert _document(result) == {
+        "schema": 1,
+        "error": "feat/cart is running; stop it first: wt stop feat/cart",
+    }
 
 
 # --- wt migrate ---------------------------------------------------------------------------

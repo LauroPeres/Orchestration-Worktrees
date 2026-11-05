@@ -113,6 +113,48 @@ def check_tls(fix: bool) -> Check:
     return Check("mkcert", "ok", f"CA at {tls.caroot()}", hint)
 
 
+_CA_FIX_HINT = (
+    "run `wt doctor --fix` (adds the CA to your browser database without sudo), "
+    "or `mkcert -install` in a terminal for the system store"
+)
+_CA_SUDO_HINT = (
+    "run `mkcert -install` once in a terminal (it needs your sudo password for the system "
+    "store), then restart the browser"
+)
+
+
+def check_ca_trusted(fix: bool) -> Check | None:
+    """A CA that exists but was never installed makes browsers reject every branch certificate.
+
+    None when there is no CA to be trusted (mkcert missing or no CA yet): `check_tls` says that.
+    `--fix` only touches the user's own browser databases: `mkcert -install` may need a sudo
+    prompt, and there is no terminal to answer it in many contexts.
+    """
+    if not (tls.available() and tls.ca_ready()):
+        return None
+    trusted = tls.ca_trusted()
+    if trusted is None:
+        return Check("ca trusted", "info", "could not tell whether the mkcert CA is trusted")
+    if trusted:
+        return Check("ca trusted", "ok", "mkcert CA is installed in a trust store")
+    hint = _CA_FIX_HINT
+    if fix:
+        databases = tls.install_ca_user()
+        if databases and tls.ca_trusted():
+            return Check(
+                "ca trusted",
+                "ok",
+                f"mkcert CA added to {len(databases)} browser database(s); restart the browser",
+            )
+        hint = _CA_SUDO_HINT
+    return Check(
+        "ca trusted",
+        "warn",
+        "mkcert CA is not installed: browsers will show ERR_CERT_AUTHORITY_INVALID",
+        hint,
+    )
+
+
 def check_cache() -> Check:
     """The caches grow on their own: say how big, and warn when the disk is low."""
     used = cache.total_bytes()
@@ -467,6 +509,8 @@ def run_checks(loaded: LoadedConfig | None, config_error: str | None, *, fix: bo
     checks += docker
     docker_ok = all(c.level == "ok" for c in docker)
     checks.append(check_tls(fix))
+    if (ca_check := check_ca_trusted(fix)) is not None:
+        checks.append(ca_check)
     checks.append(check_cache())
     checks += check_plugins()
     if docker_ok:

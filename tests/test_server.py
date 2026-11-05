@@ -222,3 +222,57 @@ def test_start_gives_the_readiness_wait_what_the_up_left(
     seen: list[tuple[float, float]] = []
     server.start("t-redis", tmp_path, {}, 30, lambda left, total: seen.append((left, total)))
     assert seen == [(7.0, 30)]
+
+
+def fake_inspect(monkeypatch: pytest.MonkeyPatch, result: proc.Result | WtError) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def run(cmd: list[str], **kwargs: object) -> proc.Result:
+        calls.append(cmd)
+        assert kwargs.get("check") is False
+        if isinstance(result, WtError):
+            raise result
+        return result
+
+    monkeypatch.setattr(proc, "run", run)
+    return calls
+
+
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("running|healthy\n", "running"),
+        ("running|\n", "running"),
+        ("running|starting\n", "running"),
+        ("running|unhealthy\n", "unhealthy"),
+        ("exited|\n", "stopped"),
+        ("created|\n", "stopped"),
+        ("paused|healthy\n", "stopped"),
+    ],
+)
+def test_container_status_maps_one_docker_inspect(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, expected: str
+) -> None:
+    calls = fake_inspect(monkeypatch, proc.Result(0, stdout, ""))
+    assert server.container_status("t-redis") == expected
+    assert calls == [
+        [
+            "docker", "inspect", "--format",
+            "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+            "t-redis",
+        ]
+    ]  # fmt: skip
+
+
+def test_container_status_is_missing_when_the_container_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_inspect(monkeypatch, proc.Result(1, "", "Error: No such object: t-redis"))
+    assert server.container_status("t-redis") == "missing"
+
+
+def test_container_status_is_missing_when_docker_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_inspect(monkeypatch, WtError("'docker' was not found on PATH"))
+    assert server.container_status("t-redis") == "missing"

@@ -1,16 +1,20 @@
 import asyncio
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from rich.style import Style
 from textual.widgets import DataTable, Label, Log, SelectionList, Static
 
+from wt import tui
 from wt.errors import WtError
 from wt.messages import CONFIRM_REMOVE
 from wt.naming import Names
 from wt.orchestrator import BranchStatus, Choice, RepoRow
+from wt.providers import InfraRow
 from wt.tui import (
     CONFIRM_DOWN,
     ConfigureScreen,
@@ -63,6 +67,10 @@ class FakeOrch:
         ]
         self.choices_error: Exception | None = None
         self.logs_dir = Path("logs-not-set")
+        self.infra_rows: list[InfraRow] = []
+        self.infra_error: Exception | None = None
+        self.dirs: dict[str, Path | Exception | None] = {}
+        self.dir_calls: list[str] = []
 
     def names(self, branch: str) -> Names:
         return Names(self.cfg.project, branch, f"{self.cfg.project}.localhost")
@@ -110,6 +118,18 @@ class FakeOrch:
             raise self.services_error
         return self.service_rows
 
+    def infra(self, branch: str) -> list[InfraRow]:
+        if self.infra_error is not None:
+            raise self.infra_error
+        return self.infra_rows
+
+    def worktree_dir(self, branch: str) -> Path | None:
+        self.dir_calls.append(branch)
+        found = self.dirs.get(branch)
+        if isinstance(found, Exception):
+            raise found
+        return found
+
     def catalog_choices(self, branch: str | None = None) -> list[Choice]:
         if self.choices_error is not None:
             raise self.choices_error
@@ -136,6 +156,7 @@ def message(app: WtApp) -> str:
 
 ANSI_GREEN = 2  # Rich's number for the terminal's own green
 ANSI_BLACK = 0
+RED_ANSI = Style(color="red").color
 
 
 def is_green(style: Any) -> bool:
@@ -178,9 +199,11 @@ def test_rows_and_columns() -> None:
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
             actions: Any = app.query_one("#actions", Static).render()
             assert actions.plain == (
-                "enter: services  u: up  d: stop  x: down  a: add  r: remove  q: quit"
+                "enter: services  u: up  d: stop  x: down  a: add  r: remove  n: terminal  q: quit"
             )
-            assert green_keys(actions) == ["enter", "u", "d", "x", "a", "r", "q"]  # words are plain
+            assert green_keys(actions) == [
+                "enter", "u", "d", "x", "a", "r", "n", "q",
+            ]  # words are plain  # fmt: skip
 
     asyncio.run(scenario())
 
@@ -194,7 +217,8 @@ def test_the_table_has_a_plain_border_and_green_column_names() -> None:
             assert table.styles.border_top[0] == "solid"
             assert is_green(rendered_style(app, "NAME"))
             assert is_green(rendered_style(app, "STATUS"))
-            assert not is_green(rendered_style(app, "stopped"))  # cells keep the terminal's colors
+            assert not is_green(rendered_style(app, "stopped"))  # red, not the green of the keys
+            assert rendered_style(app, "stopped").color == RED_ANSI
             assert is_green_bar(rendered_style(app, "feat-a"))  # the selected row
             assert not is_green_bar(rendered_style(app, "stopped"))
             assert not is_green_bar(rendered_style(app, "NAME"))  # green text, not a bar
@@ -834,7 +858,7 @@ def test_the_name_is_plain_text_and_the_status_has_its_color() -> None:
                 "degraded": "yellow",
                 "creating": "yellow",
                 "removing": "yellow",
-                "stopped": None,
+                "stopped": "red",
             }
 
     asyncio.run(scenario())
@@ -842,12 +866,13 @@ def test_the_name_is_plain_text_and_the_status_has_its_color() -> None:
 
 def test_status_style_maps_each_value_to_its_color() -> None:
     colors = {"green": ["up", "healthy", "ok"], "yellow": ["degraded", "creating", "removing"]}
-    colors["red"] = ["failed", "fail", "unhealthy"]
+    colors["red"] = ["failed", "fail", "unhealthy", "stopped", "missing"]
+    colors["green"].append("running")
     for color, values in colors.items():
         for value in values:
             style = status_style(value)
             assert style is not None and style.color is not None and style.color.name == color
-    for value in ["stopped", "starting", "-", "anything else"]:
+    for value in ["starting", "-", "anything else"]:
         assert status_style(value) is None
 
 
@@ -879,11 +904,11 @@ def test_enter_opens_services_and_esc_goes_back() -> None:
                 assert not any(cell.spans or cell.style for cell in (name, port, url))
                 assert not state.spans
             assert [cell_color(table.get_row_at(i)[1]) for i in range(3)] == [
-                "green", None, None,
+                "green", None, "red",
             ]  # healthy, starting, stopped  # fmt: skip
             actions: Any = app.screen.query_one("#actions", Static).render()
-            assert actions.plain == "c: configure  l: logs  esc: back  q: quit"
-            assert green_keys(actions) == ["c", "l", "esc", "q"]
+            assert actions.plain == "u: url  c: configure  l: logs  esc: back  q: quit"
+            assert green_keys(actions) == ["u", "c", "l", "esc", "q"]
             await pilot.press("escape")
             await settle(pilot)
             assert cells(app) == [["feat-a", "up"], ["main", "stopped"]]
@@ -907,7 +932,7 @@ def test_services_status_cells_have_their_color() -> None:
             await settle(pilot)
             table = app.screen.query_one("#services", DataTable)
             colors = [cell_color(table.get_row_at(i)[1]) for i in range(table.row_count)]
-            assert colors == ["green", "red", None, None]
+            assert colors == ["green", "red", None, "red"]
             assert [str(table.get_row_at(i)[1]) for i in range(4)] == [
                 "healthy", "unhealthy", "starting", "stopped",
             ]  # fmt: skip
@@ -1472,5 +1497,222 @@ def test_the_empty_hint_shows_once_per_empty_spell() -> None:
             app.action_refresh()
             await settle(pilot)
             assert message(app) == "no worktrees yet: press a to add"  # re-armed
+
+    asyncio.run(scenario())
+
+
+def services_message(app: WtApp) -> str:
+    return str(app.screen.query_one("#message", Static).render())
+
+
+def recording_opener(opened: list[str]) -> Callable[[str], bool]:
+    def opener(url: str) -> bool:
+        opened.append(url)
+        return True
+
+    return opener
+
+
+def with_infra(orch: FakeOrch) -> FakeOrch:
+    orch.infra_rows = [
+        InfraRow("postgres", "running", 5432, "demo__feat_a"),
+        InfraRow("redis", "stopped", None, "-"),
+        InfraRow("kafka", "missing", 9092, "-"),
+    ]
+    return orch
+
+
+async def open_services(pilot: Any) -> None:
+    await settle(pilot)
+    await pilot.press("enter")
+    await settle(pilot)
+
+
+def test_services_list_the_infra_rows_after_the_repo_rows() -> None:
+    async def scenario() -> None:
+        app = WtApp(with_infra(FakeOrch()))
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            assert services_cells(app)[3:] == [
+                ["postgres (infra)", "running", "5432", "demo__feat_a"],
+                ["redis (infra)", "stopped", "-", "-"],
+                ["kafka (infra)", "missing", "9092", "-"],
+            ]
+            assert len(services_cells(app)) == 6
+            table = app.screen.query_one("#services", DataTable)
+            colors = [cell_color(table.get_row_at(i)[1]) for i in range(3, 6)]
+            assert colors == ["green", "red", "red"]
+
+    asyncio.run(scenario())
+
+
+def test_an_infra_error_is_shown_without_hiding_the_repo_rows() -> None:
+    async def scenario() -> None:
+        orch = with_infra(FakeOrch())
+        orch.infra_error = WtError("docker is not running")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            assert len(services_cells(app)) == 3
+            assert services_message(app) == "docker is not running"
+            orch.infra_error = None  # the next refresh clears the note and adds the rows
+            await pilot.pause(2.3)
+            await settle(pilot)
+            assert len(services_cells(app)) == 6
+            assert services_message(app) == ""
+
+    asyncio.run(scenario())
+
+
+def test_an_unexpected_infra_error_names_its_type() -> None:
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.infra_error = KeyError("redis")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            assert len(services_cells(app)) == 3
+            assert services_message(app).startswith("KeyError")
+
+    asyncio.run(scenario())
+
+
+def test_logs_and_url_ignore_an_infra_row_with_a_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(tui, "open_url", recording_opener(opened))
+
+    async def scenario() -> None:
+        app = WtApp(with_infra(FakeOrch()))
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            await pilot.press("down", "down", "down", "down")  # the redis row
+            await pilot.press("u")
+            assert services_message(app) == "no URL for redis"
+            await pilot.press("l")
+            await pilot.pause()
+            assert services_message(app) == "no logs for redis"
+            assert app.screen.query("#services")  # still the services screen
+            assert opened == []
+
+    asyncio.run(scenario())
+
+
+def test_u_opens_the_url_of_the_selected_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(tui, "open_url", recording_opener(opened))
+
+    async def scenario() -> None:
+        app = WtApp(with_infra(FakeOrch()))
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            await pilot.press("u")
+            assert opened == ["https://front.demo.localhost"]
+            assert services_message(app) == "opened https://front.demo.localhost"
+
+    asyncio.run(scenario())
+
+
+def test_u_on_a_repo_without_url_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(tui, "open_url", recording_opener(opened))
+
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            await pilot.press("down", "u")
+            assert services_message(app) == "no URL for back"
+            assert opened == []
+
+    asyncio.run(scenario())
+
+
+def test_u_reports_a_browser_that_does_not_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(url: str) -> bool:
+        raise OSError("no display")
+
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())
+        async with app.run_test() as pilot:
+            await open_services(pilot)
+            monkeypatch.setattr(tui, "open_url", lambda url: False)
+            await pilot.press("u")
+            assert services_message(app) == "could not open https://front.demo.localhost"
+            monkeypatch.setattr(tui, "open_url", broken)
+            await pilot.press("u")
+            assert services_message(app) == "could not open https://front.demo.localhost"
+
+    asyncio.run(scenario())
+
+
+def test_n_opens_a_terminal_in_the_worktree_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[Path] = []
+    monkeypatch.setattr(tui, "open_terminal", opened.append)
+
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.dirs["feat-a"] = Path("/trees/feat-a")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("n")
+            assert opened == [Path("/trees/feat-a")]
+            assert message(app) == "opened a terminal in /trees/feat-a"
+
+    asyncio.run(scenario())
+
+
+def test_n_on_a_worktree_without_a_folder_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[Path] = []
+    monkeypatch.setattr(tui, "open_terminal", opened.append)
+
+    async def scenario() -> None:
+        app = WtApp(FakeOrch())  # the fake knows no folder: None
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("n")
+            assert message(app) == "feat-a has no worktree folder of its own"
+            assert opened == []
+
+    asyncio.run(scenario())
+
+
+def test_n_shows_the_error_of_a_spread_worktree_or_a_missing_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_terminal(path: Path) -> None:
+        raise WtError("no terminal found; set WT_TERMINAL")
+
+    monkeypatch.setattr(tui, "open_terminal", no_terminal)
+
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.dirs["feat-a"] = WtError("feat-a is spread over several folders; run wt move feat-a")
+        orch.dirs["main"] = Path("/trees/main")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("n")
+            assert message(app) == "feat-a is spread over several folders; run wt move feat-a"
+            await pilot.press("down", "n")
+            assert message(app) == "no terminal found; set WT_TERMINAL"
+
+    asyncio.run(scenario())
+
+
+def test_n_does_nothing_on_a_page_that_asks_something(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[Path] = []
+    monkeypatch.setattr(tui, "open_terminal", opened.append)
+
+    async def scenario() -> None:
+        orch = FakeOrch()
+        orch.dirs["feat-a"] = Path("/trees/feat-a")
+        app = WtApp(orch)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            await pilot.press("a", "n")  # the name page: `n` is text there
+            await pilot.pause()
+            assert isinstance(app.screen, InputScreen)
+            assert opened == [] and orch.dir_calls == []
 
     asyncio.run(scenario())
