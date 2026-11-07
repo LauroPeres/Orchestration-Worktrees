@@ -19,6 +19,7 @@ from wt import __version__, cache, catalog_edit, doctor
 from wt.catalog import (
     LEGACY_NAME,
     Catalog,
+    LoadedCatalog,
     MergeResult,
     catalog_path,
     load_catalog,
@@ -278,11 +279,14 @@ def doctor_document(checks: list[doctor.Check]) -> JsonDocument:
     }
 
 
-def catalog_document(cat: Catalog) -> JsonDocument:
+def catalog_document(loaded: LoadedCatalog) -> JsonDocument:
+    cat = loaded.catalog
     return {
         "schema": JSON_SCHEMA,
         "project": cat.project,
         "domain": cat.domain,
+        # Resolved paths, so readers can use each repo's own checkout (SPEC §31).
+        "repos": [{"repo": name, "path": str(path)} for name, path in loaded.repos.items()],
         "services": [
             {
                 "name": row.service,
@@ -1008,11 +1012,11 @@ def catalog(
         if check:
             _check_catalog(path)
             return
-        cat = load_catalog(path).catalog
+        loaded = load_catalog(path)
         if json_output:
-            _emit(catalog_document(cat))
+            _emit(catalog_document(loaded))
         else:
-            _print_catalog(cat)
+            _print_catalog(loaded.catalog)
 
 
 # ---- wt catalog add-repo | add-service | remove-service | remove-repo (SPEC section 23) -------
