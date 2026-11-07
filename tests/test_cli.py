@@ -1524,6 +1524,10 @@ def test_catalog_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "schema": 1,
         "project": "notes",
         "domain": "notes.localhost",
+        "repos": [
+            {"repo": "notes-back", "path": str((tmp_path / "back").resolve())},
+            {"repo": "notes-front", "path": str((tmp_path / "front").resolve())},
+        ],
         "services": [
             {
                 "name": "back",
@@ -1545,6 +1549,32 @@ def test_catalog_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             },
         ],
     }
+
+
+def test_catalog_json_repos_follow_domain_in_file_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    (tmp_path / "cfg").mkdir()
+    catalog = tmp_path / "cfg" / "c.yaml"
+    catalog.write_text(
+        "project: notes\ndomain: notes.localhost\nrepos:\n"
+        "  zeta: ~/code/zeta\n  alpha: ../alpha\n  gone: /nowhere/gone\n"
+        "services:\n  web: {repo: alpha, run: serve, port: auto}\n"
+    )
+    monkeypatch.setenv("WT_CATALOG", str(catalog))
+    result = runner.invoke(app, ["catalog", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert list(document)[:4] == ["schema", "project", "domain", "repos"]
+    assert document["schema"] == 1
+    # `~` expanded, relative taken from the catalog's folder, a missing folder still listed.
+    assert document["repos"] == [
+        {"repo": "zeta", "path": str(home / "code" / "zeta")},
+        {"repo": "alpha", "path": str((tmp_path / "alpha").resolve())},
+        {"repo": "gone", "path": "/nowhere/gone"},
+    ]
 
 
 def test_catalog_json_refuses_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

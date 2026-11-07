@@ -172,6 +172,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.10.1 ✔ (§28) | A new branch starts from the latest `origin/<default branch>` (fetched), not from the local checkout |
 | v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | v0.12.0 ✔ (§30) | `--json` branch rows and actions say where the worktrees are (`folder`, `repos` with paths) |
+| v0.13.0 ✔ (§31) | `wt catalog --json` lists the catalog's repo folders (`repos` with paths) |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1462,3 +1463,17 @@ folder it is listed under when picking services. It only changes the picker: the
   except a service that a checked consumer still requires (it stays checked, locked). The folder shows checked exactly
   while all of its services are. Confirming returns only services, never folder lines.
 - The plain `wt add` prompt (no TUI) is unchanged.
+
+## 31. v0.13.0: the catalog's repo folders, in the JSON
+
+Decided 2026-11-07 for the task software (Orchestration-Tasks `docs/SPEC.md` §9), which needs each repo's own
+checkout to plan in it and to read its git history. Amends §21 (JSON output).
+
+- **The catalog document gains `"repos"`**, right after `"domain"`: `[{"repo": "<name>", "path": "<absolute path>"}]`,
+  one entry per key of the catalog's `repos:` mapping, in file order. The path is resolved as wt resolves it
+  everywhere else: `~` expanded, a relative path taken from the catalog file's folder. `[]` when the catalog has no
+  `repos:`.
+- A repo whose folder is missing or isn't a git repo is still listed with its path; `wt catalog --check` is what
+  reports it. Readers check the folder themselves.
+- `"schema"` stays `1`: a key is only added. Example: `{"schema":1,"project":"dev","domain":"dev.localhost",
+  "repos":[{"repo":"notes-back","path":"/home/u/code/notes-back"}],"services":[…]}`.
