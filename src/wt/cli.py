@@ -296,6 +296,7 @@ def catalog_document(loaded: LoadedCatalog) -> JsonDocument:
                 "consumes": dict(cat.services[row.service].consumes),
                 "consumed_by": row.consumed_by,
                 "remote": row.remote,
+                "group": row.group,  # SPEC §32
             }
             for row in rows(cat)
         ],

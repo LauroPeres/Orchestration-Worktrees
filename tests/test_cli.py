@@ -1537,6 +1537,7 @@ def test_catalog_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                 "consumes": {},
                 "consumed_by": ["front"],
                 "remote": "https://api.staging.example",
+                "group": None,
             },
             {
                 "name": "front",
@@ -1546,6 +1547,7 @@ def test_catalog_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                 "consumes": {"back": "API_URL"},
                 "consumed_by": [],
                 "remote": None,
+                "group": None,
             },
         ],
     }
@@ -1575,6 +1577,26 @@ def test_catalog_json_repos_follow_domain_in_file_order(
         {"repo": "alpha", "path": str((tmp_path / "alpha").resolve())},
         {"repo": "gone", "path": "/nowhere/gone"},
     ]
+
+
+def test_catalog_json_service_rows_say_their_group_after_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog = tmp_path / "c.yaml"
+    catalog.write_text(
+        "project: notes\ndomain: notes.localhost\nrepos:\n  r: ./r\nservices:\n"
+        "  api: {repo: r, run: serve, port: auto, group: music}\n"
+        "  web: {repo: r, run: serve, port: auto}\n"
+    )
+    monkeypatch.setenv("WT_CATALOG", str(catalog))
+    result = runner.invoke(app, ["catalog", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert document["schema"] == 1
+    api, web = document["services"]
+    assert (api["name"], api["group"]) == ("api", "music")
+    assert (web["name"], web["group"]) == ("web", None)
+    assert list(api)[-2:] == ["remote", "group"]
 
 
 def test_catalog_json_refuses_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

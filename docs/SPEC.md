@@ -173,6 +173,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | v0.12.0 ✔ (§30) | `--json` branch rows and actions say where the worktrees are (`folder`, `repos` with paths) |
 | v0.13.0 ✔ (§31) | `wt catalog --json` lists the catalog's repo folders (`repos` with paths) |
+| v0.14.0 ✔ (§32) | `wt catalog --json` service rows say each service's `group` (or `null`) |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1477,3 +1478,13 @@ checkout to plan in it and to read its git history. Amends §21 (JSON output).
   reports it. Readers check the folder themselves.
 - `"schema"` stays `1`: a key is only added. Example: `{"schema":1,"project":"dev","domain":"dev.localhost",
   "repos":[{"repo":"notes-back","path":"/home/u/code/notes-back"}],"services":[…]}`.
+
+## 32. v0.14.0: service groups, in the JSON
+
+Decided 2026-11-08 for the task software (Orchestration-Tasks `docs/SPEC.md` §9), whose services checklist shows wt's
+groups like `configure` does. Amends §21 (JSON output).
+
+- **Each service row of `wt catalog --json` gains `"group"`**, right after `"remote"`: the service's `group:` from the
+  catalog (§30), or `null` when it has none. The human `wt catalog` table is unchanged.
+- `"schema"` stays `1`: a key is only added. Example row: `{"name":"api","repo":"notes-back","kind":"compose",
+  "infra":[],"consumes":{},"consumed_by":[],"remote":null,"group":"music"}`.
