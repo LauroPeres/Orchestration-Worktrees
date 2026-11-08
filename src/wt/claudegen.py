@@ -22,6 +22,7 @@ from wt.claudemerge import (
     SettingsMerge,
     merge_agent,
     merge_settings,
+    merge_skill,
     prefixed,
     render_claude_md,
 )
@@ -36,7 +37,7 @@ MIN_REPOS = 2
 FILE_MODE = 0o644
 EXECUTABLE_MODE = 0o755
 SKILL_FILE = "SKILL.md"
-FRONTMATTER_FENCE = "---"
+SKILLS_PREFIX = f"{CLAUDE_DIR}/skills/"
 
 Kind = Literal["copy", "link", "file"]
 
@@ -116,8 +117,19 @@ def _load_owned(folder: Path, name: str) -> dict[str, str]:
     return {}
 
 
-def _refuse_foreign_paths(
+def _superseded_links(
     folder: Path, desired: Mapping[str, _Entry], old: Mapping[str, str]
+) -> list[str]:
+    """Links wt made that now must become folders (a v0.13.0 skill link, SPEC section 32)."""
+    return [
+        rel
+        for rel in old
+        if (folder / rel).is_symlink() and any(key.startswith(f"{rel}/") for key in desired)
+    ]
+
+
+def _refuse_foreign_paths(
+    folder: Path, desired: Mapping[str, _Entry], old: Mapping[str, str], superseded: list[str]
 ) -> None:
     """A path wt wants to write that exists and is not in the old manifest belongs to the user."""
 
@@ -125,6 +137,8 @@ def _refuse_foreign_paths(
         return rel in old or any(key.startswith(f"{rel}/") for key in old)
 
     for rel in desired:
+        if any(rel.startswith(f"{link}/") for link in superseded):
+            continue  # under one of wt's own links, which is removed before writing
         path = _contained(folder, rel)
         if (path.exists() or path.is_symlink()) and not ours(rel):
             raise _foreign(path)
@@ -187,10 +201,22 @@ def _repo_entries(repo: RepoClaude, path: Path) -> dict[str, _Entry]:
         rel = f"{CLAUDE_DIR}/agents/{prefixed(repo.repo, stem)}.md"
         entries[rel] = _text("copy", merged, f"{repo.repo}/{CLAUDE_DIR}/agents/{stem}.md")
     for skill in repo.skills:
-        target = (path / CLAUDE_DIR / "skills" / skill).absolute()
-        rel = f"{CLAUDE_DIR}/skills/{prefixed(repo.repo, skill)}"
-        source = f"{repo.repo}/{CLAUDE_DIR}/skills/{skill}"
-        entries[rel] = _Entry(kind="link", data=str(target).encode("utf-8"), source=source)
+        entries.update(_skill_entries(repo, skill, path))
+    return entries
+
+
+def _skill_entries(repo: RepoClaude, skill: str, path: Path) -> dict[str, _Entry]:
+    """A real skill folder: `SKILL.md` renamed (unique name), the rest linked (SPEC section 32)."""
+    source_dir = (path / CLAUDE_DIR / "skills" / skill).absolute()
+    rel_dir = f"{SKILLS_PREFIX}{prefixed(repo.repo, skill)}"
+    source = f"{repo.repo}/{CLAUDE_DIR}/skills/{skill}"
+    text = (source_dir / SKILL_FILE).read_text(encoding="utf-8")
+    merged = merge_skill(repo.repo, skill, text, list(repo.agents), list(repo.skills))
+    entries = {f"{rel_dir}/{SKILL_FILE}": _text("copy", merged, f"{source}/{SKILL_FILE}")}
+    for item in sorted(source_dir.iterdir()):
+        if item.name != SKILL_FILE:
+            target = str(item).encode("utf-8")
+            entries[f"{rel_dir}/{item.name}"] = _Entry("link", target, f"{source}/{item.name}")
     return entries
 
 
@@ -212,20 +238,6 @@ def _build_entries(
     with_md = [repo.repo for repo in claude_repos if repo.has_claude_md]
     entries[CLAUDE_MD] = _text("file", render_claude_md(name, with_md, plan_repo), "")
     return entries
-
-
-def _rename_skill(text: str, new_name: str) -> str:
-    """`text` with the frontmatter `name:` set to `new_name` (text without frontmatter as is)."""
-    lines = text.split("\n")
-    if lines[0].strip() != FRONTMATTER_FENCE:
-        return text
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == FRONTMATTER_FENCE:
-            break
-        if line.startswith("name:"):
-            lines[index] = f"name: {new_name}"
-            break
-    return "\n".join(lines)
 
 
 # --- writing -------------------------------------------------------------------------------------
@@ -298,16 +310,19 @@ class _Writer:
                 self.written[rel] = entry
                 return
             path.unlink()
-        elif path.is_dir():
+        elif path.exists():  # an earlier copy, made when symlinks failed
             if not _symlink_works(path, target):
-                self._copy_skill(rel, entry)
+                self._copy_linked(rel, entry)
                 return
-            self._remove_copied_dir(rel)
+            if path.is_dir():
+                self._remove_copied_dir(rel)
+            else:
+                path.unlink()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(target, path)
         except OSError:
-            self._copy_skill(rel, entry)
+            self._copy_linked(rel, entry)
             return
         self.changed = True
         self.written[rel] = entry
@@ -317,21 +332,25 @@ class _Writer:
         stale = [key for key in self.old if key.startswith(prefix)]
         self._remove(stale)
 
-    def _copy_skill(self, rel: str, entry: _Entry) -> None:
-        """Fallback for a link that cannot be created: copy the skill folder, renaming it.
+    def _copy_linked(self, rel: str, entry: _Entry) -> None:
+        """Fallback for a link that cannot be created: copy its target (a file or a folder).
 
         The note has no OS error text so it is the same on every run (idempotent manifest)."""
         source = Path(entry.data.decode("utf-8"))
-        self.fallback_notes.append(
-            f"{rel}: symlinks are not available here; copied the skill folder"
-        )
+        self.fallback_notes.append(f"{rel}: symlinks are not available here; copied it")
+        if source.is_file():
+            self._put_file(rel, _Entry("copy", source.read_bytes(), entry.source))
+            return
         for file in sorted(path for path in source.rglob("*") if path.is_file()):
             relative = file.relative_to(source).as_posix()
             data = file.read_bytes()
-            if relative == SKILL_FILE:
-                renamed = _rename_skill(data.decode("utf-8"), PurePosixPath(rel).name)
-                data = renamed.encode("utf-8")
             self._put_file(f"{rel}/{relative}", _Entry("copy", data, f"{entry.source}/{relative}"))
+
+    def unlink(self, rels: list[str]) -> None:
+        """Remove links wt made (never their targets) before writing in their place."""
+        for rel in rels:
+            _contained(self.folder, rel).unlink()
+            self.changed = True
 
     def _remove(self, rels: list[str]) -> None:
         removed: list[str] = []
@@ -401,9 +420,11 @@ def sync(
     claude_repos = [_read_repo(repo, path, notes) for repo, path in repos.items()]
     merged = merge_settings(claude_repos)
     desired = _build_entries(name, plan, repos, claude_repos, merged)
-    _refuse_foreign_paths(folder, desired, old)
+    superseded = _superseded_links(folder, desired, old)
+    _refuse_foreign_paths(folder, desired, old, superseded)
 
     writer = _Writer(folder, old)
+    writer.unlink(superseded)
     for rel, entry in desired.items():
         writer.put(rel, entry)
     writer.remove_stale()
@@ -418,9 +439,11 @@ def sync(
         agents=[
             Path(rel).stem for rel in writer.written if rel.startswith(f"{CLAUDE_DIR}/agents/")
         ],
-        skills=[
-            PurePosixPath(rel).name for rel in desired if rel.startswith(f"{CLAUDE_DIR}/skills/")
-        ],
+        skills=list(
+            dict.fromkeys(
+                PurePosixPath(rel).parts[2] for rel in desired if rel.startswith(SKILLS_PREFIX)
+            )
+        ),
         conflicts=conflicts,
         notes=persistent + writer.hand_edits,
     )

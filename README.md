@@ -16,7 +16,7 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 wt ships no services of its own: you describe your stack (any repos, any languages) in
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
 
-> **Status: v0.14.1.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.14.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
 > own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
 > terminal UI (`wt tui`). A complete two-branch
@@ -391,11 +391,14 @@ wt/test1/
 - **Agents** are copies named `<repo>-<agent>` (the name inside the file is rewritten too), with a
   line saying the agent works in `./<repo>/`; references to the same repo's other agents and skills
   are rewritten.
-- **Skills** are symlinks to the repo's skill folders, named `<repo>-<skill>`, so an edit shows up
-  at once.
+- **Skills** are folders named `<repo>-<skill>`: `SKILL.md` is a copy with that unique name, a line
+  saying the skill belongs to `./<repo>/` and the same renames as agents; every other file is a
+  symlink to the repo's, so an edit shows up at once (a `SKILL.md` edit on the next sync).
 - **Permissions** are the union of the repos' (deny always wins), with path rules prefixed by the
-  repo folder (`Read(./.env)` becomes `Read(./music-back/.env)`). Other settings that differ between
-  repos are left out and listed in the report.
+  repo folder (`Read(./.env)` becomes `Read(./music-back/.env)`, `Read(**/.env)` becomes
+  `Read(./music-back/**/.env)`). A command run by a relative path (`Bash(scripts/x.sh:*)`) also gets
+  `music-back/scripts/x.sh` and `./music-back/scripts/x.sh` forms, so it matches from the wt folder.
+  Other settings that differ between repos are left out and listed in the report.
 - **Hooks** of every repo run, each only for files of its own repo and from its own repo folder.
 
 It is rebuilt after `wt add` and `wt up`, by hand with `wt claude sync NAME`, and removed by
@@ -725,6 +728,7 @@ warm Docker image cache: expect different numbers elsewhere, especially on a fir
 | v0.13.0 ✔ | `wt catalog --json` lists the catalog's repo folders (`repos` with paths) |
 | v0.14.0 ✔ | `wt catalog --json` service rows say each service's `group` |
 | v0.14.1 ✔ | `up` reuses a wt's repo folder that was switched to another branch |
+| v0.14.2 ✔ | Merged `.claude` fixes: path and command rules scoped to their repo, skills with unique names |
 | later | a real Windows port (see `docs/windows.md`), if it is ever wanted |
 
 The full design is in [docs/SPEC.md](docs/SPEC.md).
