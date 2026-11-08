@@ -173,6 +173,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.11.0 ✔ (§29) | A merged `.claude/` and `CLAUDE.md` in every wt folder with two or more repos (`wt claude sync`) |
 | v0.12.0 ✔ (§30) | `--json` branch rows and actions say where the worktrees are (`folder`, `repos` with paths) |
 | v0.13.0 ✔ (§31) | `wt catalog --json` lists the catalog's repo folders (`repos` with paths) |
+| v0.13.1 ✔ (§32) | Merged `.claude` fixes: path and command rules scoped to their repo, skills with unique names |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1375,7 +1376,7 @@ wt/<name>/
    runs, but **with the wt folder as working directory and as `CLAUDE_PROJECT_DIR`**, not the repo's. `allow` entries
    are ignored until the folder is trusted once (Claude Code's trust dialog); `deny` applies regardless.
 
-**What `wt claude sync NAME` generates** (pure merge logic in the model layer, `wt.claudemerge`; file, link and
+**What `wt claude sync NAME` generates** (items 2 and 3 amended by §32) (pure merge logic in the model layer, `wt.claudemerge`; file, link and
 manifest writing in the runtime layer, `wt.claudegen`; trigger in the core; command in the interface). The wt's repos
 are the repos of its recorded worktrees (`worktree_dir`, §26), in catalog order; `<repo>` is the catalog repo name.
 1. **Agents:** each `<repo>/.claude/agents/<a>.md` becomes `.claude/agents/<repo>-<a>.md` (copy) with the frontmatter
@@ -1477,3 +1478,21 @@ checkout to plan in it and to read its git history. Amends §21 (JSON output).
   reports it. Readers check the folder themselves.
 - `"schema"` stays `1`: a key is only added. Example: `{"schema":1,"project":"dev","domain":"dev.localhost",
   "repos":[{"repo":"notes-back","path":"/home/u/code/notes-back"}],"services":[…]}`.
+
+## 32. v0.13.1: merged `.claude` fixes (scoped rules, unique skill names)
+
+Decided 2026-11-08 after checking the first real merged `.claude` (three repos). Amends §29, items 2 and 3.
+
+- **Path rules (item 3).** Only `//…` (absolute) and `~…` (home) paths stay as they are. `**/…` becomes
+  `./<repo>/**/…` and `/…` (relative to the project root in Claude Code) becomes `/<repo>/…`, so one repo's
+  `Read(**/.env.*)` no longer blocks the other repos' files. `./x` and `x` still become `./<repo>/x`.
+- **Command rules (item 3).** A `Bash(…)` rule whose command starts with a relative path (`./x`, or a first word
+  with a `/` that doesn't start with `/`, `~`, `$` or `*`) is kept and followed by two copies that match from the
+  wt folder: `Bash(api/.venv/bin/uvicorn:*)` and `Bash(./api/.venv/bin/uvicorn:*)` for `Bash(.venv/bin/uvicorn:*)`
+  in repo `api`. Same for `allow`, `ask` and `deny`. A program called by its absolute path is not covered.
+- **Skills (item 2).** `.claude/skills/<repo>-<s>/` is a real folder: `SKILL.md` is a copy (kind `copy`) with
+  `name: <repo>-<s>`, the line `This skill belongs to ./<repo>/. Every path in it is relative to that folder.` right
+  after the frontmatter, and the same repo's agent and skill names rewritten as in item 1. Every other entry of the
+  skill folder is a symlink (kind `link`) to the original, so supporting files stay live. A link that cannot be
+  created is copied instead (a note in the report). A wt synced by v0.13.0 has its old folder link (listed in the
+  manifest) replaced by the folder.
