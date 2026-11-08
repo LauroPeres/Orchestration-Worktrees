@@ -25,7 +25,9 @@ description: Lints
 Lint it.
 """
 HEADER = "You work in ./{repo}/. Every path in your instructions is relative to that folder."
+SKILL_HEADER = "This skill belongs to ./{repo}/. Every path in it is relative to that folder."
 MANIFEST = ".claude/.wt-generated.json"
+SKILLS = ".claude/skills/music-front-lint"
 
 
 def make_repo(
@@ -119,15 +121,32 @@ def test_sync_generates_prefixed_agents(folder: Path, repos: dict[str, Path]) ->
     assert (folder / ".claude/agents/music-back-builder.md").is_file()
 
 
-def test_sync_links_skills_to_the_absolute_repo_folders(
+def test_sync_writes_skill_folders_with_a_renamed_skill_md(
     folder: Path, repos: dict[str, Path]
 ) -> None:
     claudegen.sync(folder, "feat", repos)
 
-    link = folder / ".claude/skills/music-front-lint"
-    assert link.is_symlink()
-    assert os.readlink(link) == str((repos["music-front"] / ".claude/skills/lint").absolute())
-    assert Path(os.readlink(folder / ".claude/skills/music-back-deploy")).is_absolute()
+    skill = folder / ".claude/skills/music-front-lint"
+    assert skill.is_dir() and not skill.is_symlink()
+    text = (skill / "SKILL.md").read_text()
+    assert text.startswith("---\nname: music-front-lint\n")
+    assert SKILL_HEADER.format(repo="music-front") in text
+    assert "name: lint" in (repos["music-front"] / ".claude/skills/lint/SKILL.md").read_text()
+
+
+def test_sync_links_a_skills_other_files_to_the_absolute_repo_paths(
+    folder: Path, repos: dict[str, Path]
+) -> None:
+    source = repos["music-front"] / ".claude/skills/lint"
+    (source / "reference.md").write_text("ref")
+    (source / "scripts").mkdir()
+
+    claudegen.sync(folder, "feat", repos)
+
+    skill = folder / ".claude/skills/music-front-lint"
+    for name in ("reference.md", "scripts"):
+        assert (skill / name).is_symlink()
+        assert os.readlink(skill / name) == str((source / name).absolute())
 
 
 def test_sync_merges_settings_and_wraps_hooks(folder: Path, repos: dict[str, Path]) -> None:
@@ -178,6 +197,7 @@ def test_sync_rejects_an_unknown_plan_repo(folder: Path, repos: dict[str, Path])
 
 
 def test_sync_writes_the_manifest(folder: Path, repos: dict[str, Path]) -> None:
+    (repos["music-front"] / ".claude/skills/lint/extra.txt").write_text("extra")
     claudegen.sync(folder, "feat", repos)
 
     data = manifest(folder)
@@ -191,8 +211,9 @@ def test_sync_writes_the_manifest(folder: Path, repos: dict[str, Path]) -> None:
     assert set(files) == {
         ".claude/agents/music-front-checker.md",
         ".claude/agents/music-back-builder.md",
-        ".claude/skills/music-front-lint",
-        ".claude/skills/music-back-deploy",
+        ".claude/skills/music-front-lint/SKILL.md",
+        ".claude/skills/music-back-deploy/SKILL.md",
+        ".claude/skills/music-front-lint/extra.txt",
         ".claude/settings.json",
         ".claude/wt-hook.sh",
         "CLAUDE.md",
@@ -202,12 +223,15 @@ def test_sync_writes_the_manifest(folder: Path, repos: dict[str, Path]) -> None:
     assert agent["source"] == "music-front/.claude/agents/checker.md"
     agent_bytes = (folder / ".claude/agents/music-front-checker.md").read_bytes()
     assert agent["sha256"] == hashlib.sha256(agent_bytes).hexdigest()
-    link = files[".claude/skills/music-front-lint"]
-    target = str((repos["music-front"] / ".claude/skills/lint").absolute())
+    skill_md = files[".claude/skills/music-front-lint/SKILL.md"]
+    assert skill_md["kind"] == "copy"
+    assert skill_md["source"] == "music-front/.claude/skills/lint/SKILL.md"
+    link = files[".claude/skills/music-front-lint/extra.txt"]
+    target = str((repos["music-front"] / ".claude/skills/lint/extra.txt").absolute())
     assert link == {
         "kind": "link",
         "sha256": hashlib.sha256(target.encode()).hexdigest(),
-        "source": "music-front/.claude/skills/lint",
+        "source": "music-front/.claude/skills/lint/extra.txt",
     }
     assert files["CLAUDE.md"]["kind"] == "file"
 
@@ -277,16 +301,18 @@ def test_sync_recreates_a_deleted_generated_file(folder: Path, repos: dict[str, 
 def test_sync_points_a_moved_skill_link_at_the_new_folder(
     folder: Path, tmp_path: Path, repos: dict[str, Path]
 ) -> None:
+    (repos["music-front"] / ".claude/skills/lint/extra.txt").write_text("extra")
     claudegen.sync(folder, "feat", repos)
     moved = make_repo(
         tmp_path / "moved", "music-front", agents={"checker": AGENT}, skills={"lint": SKILL}
     )
+    (moved / ".claude/skills/lint/extra.txt").write_text("extra")
 
     result = claudegen.sync(folder, "feat", {**repos, "music-front": moved})
 
     assert result.changed is True
-    link = folder / ".claude/skills/music-front-lint"
-    assert os.readlink(link) == str((moved / ".claude/skills/lint").absolute())
+    link = folder / ".claude/skills/music-front-lint/extra.txt"
+    assert os.readlink(link) == str((moved / ".claude/skills/lint/extra.txt").absolute())
 
 
 def test_sync_skips_a_skill_folder_without_skill_md(folder: Path, repos: dict[str, Path]) -> None:
@@ -403,7 +429,7 @@ def test_sync_rejects_a_manifest_path_that_leaves_the_folder(
     assert victim.read_text() == "keep"
 
 
-def test_sync_copies_the_skill_when_symlinks_fail(
+def test_sync_copies_a_skill_file_when_symlinks_fail(
     monkeypatch: pytest.MonkeyPatch, folder: Path, repos: dict[str, Path]
 ) -> None:
     (repos["music-front"] / ".claude/skills/lint/extra.txt").write_text("extra")
@@ -419,12 +445,12 @@ def test_sync_copies_the_skill_when_symlinks_fail(
     assert skill.is_dir() and not skill.is_symlink()
     assert "name: music-front-lint" in (skill / "SKILL.md").read_text()
     assert (skill / "extra.txt").read_text() == "extra"
-    assert any(
-        ".claude/skills/music-front-lint" in note and "copied the skill" in note
-        for note in result.notes
-    )
+    assert (skill / "extra.txt").is_file() and not (skill / "extra.txt").is_symlink()
+    assert result.notes == [
+        ".claude/skills/music-front-lint/extra.txt: symlinks are not available here; copied it"
+    ]
     assert manifest(folder)["notes"] == result.notes
-    assert manifest(folder)["files"][".claude/skills/music-front-lint/SKILL.md"]["kind"] == "copy"
+    assert manifest(folder)["files"][".claude/skills/music-front-lint/extra.txt"]["kind"] == "copy"
     # the original skill is untouched
     assert "name: lint" in (repos["music-front"] / ".claude/skills/lint/SKILL.md").read_text()
 
@@ -432,6 +458,7 @@ def test_sync_copies_the_skill_when_symlinks_fail(
 def test_sync_with_failing_symlinks_is_still_idempotent_and_upgrades_to_links(
     monkeypatch: pytest.MonkeyPatch, folder: Path, repos: dict[str, Path]
 ) -> None:
+    (repos["music-front"] / ".claude/skills/lint/extra.txt").write_text("extra")
     with monkeypatch.context() as patch:
 
         def refuse(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
@@ -446,10 +473,37 @@ def test_sync_with_failing_symlinks_is_still_idempotent_and_upgrades_to_links(
     result = claudegen.sync(folder, "feat", repos)
 
     assert result.changed is True
-    assert (folder / ".claude/skills/music-front-lint").is_symlink()
-    assert ".claude/skills/music-front-lint/SKILL.md" not in manifest(folder)["files"]
-    assert (repos["music-front"] / ".claude/skills/lint/SKILL.md").read_text() == SKILL
+    assert (folder / ".claude/skills/music-front-lint/extra.txt").is_symlink()
+    assert manifest(folder)["files"][".claude/skills/music-front-lint/extra.txt"]["kind"] == "link"
+    assert (repos["music-front"] / ".claude/skills/lint/extra.txt").read_text() == "extra"
     assert result.notes == []
+
+
+def test_sync_replaces_a_v0_13_0_skill_folder_link_without_touching_the_repo(
+    folder: Path, repos: dict[str, Path]
+) -> None:
+    source = repos["music-front"] / ".claude/skills/lint"
+    claudegen.sync(folder, "feat", repos)
+    # the v0.13.0 layout: the whole skill folder is one link, listed in the manifest
+    skill = folder / ".claude/skills/music-front-lint"
+    for item in skill.iterdir():
+        item.unlink()
+    skill.rmdir()
+    skill.symlink_to(source.absolute())
+    data = manifest(folder)
+    data["files"] = {k: v for k, v in data["files"].items() if not k.startswith(f"{SKILLS}/")}
+    data["files"][".claude/skills/music-front-lint"] = {"kind": "link", "sha256": "x", "source": ""}
+    (folder / MANIFEST).write_text(json.dumps(data))
+
+    result = claudegen.sync(folder, "feat", repos)
+
+    assert result.changed is True
+    assert skill.is_dir() and not skill.is_symlink()
+    assert "name: music-front-lint" in (skill / "SKILL.md").read_text()
+    assert sorted(path.name for path in source.iterdir()) == ["SKILL.md"]
+    assert (source / "SKILL.md").read_text() == SKILL
+    assert ".claude/skills/music-front-lint" not in manifest(folder)["files"]
+    assert claudegen.sync(folder, "feat", repos).changed is False
 
 
 def test_remove_deletes_exactly_the_generated_files(folder: Path, repos: dict[str, Path]) -> None:
@@ -464,8 +518,8 @@ def test_remove_deletes_exactly_the_generated_files(folder: Path, repos: dict[st
         [
             ".claude/agents/music-front-checker.md",
             ".claude/agents/music-back-builder.md",
-            ".claude/skills/music-front-lint",
-            ".claude/skills/music-back-deploy",
+            ".claude/skills/music-front-lint/SKILL.md",
+            ".claude/skills/music-back-deploy/SKILL.md",
             ".claude/settings.json",
             ".claude/wt-hook.sh",
             "CLAUDE.md",
@@ -504,17 +558,20 @@ def test_remove_without_a_manifest_deletes_nothing(folder: Path) -> None:
 def test_remove_deletes_a_link_not_its_target(
     folder: Path, tmp_path: Path, repos: dict[str, Path]
 ) -> None:
+    (repos["music-front"] / ".claude/skills/lint/extra.txt").write_text("extra")
     claudegen.sync(folder, "feat", repos)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "file.txt").write_text("keep")
-    (folder / ".claude/skills/music-front-lint").unlink()
-    (folder / ".claude/skills/music-front-lint").symlink_to(outside)
+    link = folder / ".claude/skills/music-front-lint/extra.txt"
+    link.unlink()
+    link.symlink_to(outside)
 
     claudegen.remove(folder)
 
     assert (outside / "file.txt").read_text() == "keep"
-    assert not (folder / ".claude/skills/music-front-lint").is_symlink()
+    assert not link.is_symlink()
+    assert (repos["music-front"] / ".claude/skills/lint/extra.txt").read_text() == "extra"
 
 
 def test_remove_rejects_a_manifest_path_that_leaves_the_folder(

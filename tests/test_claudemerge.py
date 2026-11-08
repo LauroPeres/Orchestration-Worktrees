@@ -13,6 +13,7 @@ from wt.claudemerge import (
     RepoClaude,
     merge_agent,
     merge_settings,
+    merge_skill,
     prefixed,
     render_claude_md,
 )
@@ -33,6 +34,47 @@ def wrapped(repo_name: str, command: str) -> str:
 # --- prefixed ---
 def test_prefixed_joins_repo_and_name() -> None:
     assert prefixed("music-back", "checker") == "music-back-checker"
+
+
+# --- merge_skill ---
+SKILL = """---
+name: architecture
+description: The layers. See the `checks` skill and the `checker` agent.
+---
+Read `architecture` first, run `checks`, ask the `checker` agent. Plain checks stay.
+"""
+SKILL_LINE = "This skill belongs to ./api/. Every path in it is relative to that folder."
+
+
+def test_skill_name_comes_from_its_folder_and_is_prefixed() -> None:
+    merged = merge_skill("api", "architecture", SKILL, ["checker"], ["architecture", "checks"])
+    front = merged.split("---\n")[1]
+    assert front.startswith("name: api-architecture\n")
+    assert "name: architecture" not in merged
+
+
+def test_skill_gets_the_repo_line_after_its_frontmatter() -> None:
+    merged = merge_skill("api", "architecture", SKILL, [], ["architecture"])
+    assert merged.split("---\n")[2].startswith(SKILL_LINE + "\n")
+
+
+def test_skill_references_to_its_repos_agents_and_skills_are_prefixed() -> None:
+    merged = merge_skill("api", "architecture", SKILL, ["checker"], ["architecture", "checks"])
+    assert "See the `api-checks` skill and the `api-checker` agent." in merged
+    assert "Read `api-architecture` first, run `api-checks`, ask the `api-checker` agent." in merged
+    assert "Plain checks stay." in merged
+
+
+def test_two_repos_skills_with_the_same_name_get_distinct_names() -> None:
+    first = merge_skill("api", "architecture", SKILL, [], ["architecture"])
+    second = merge_skill("web", "architecture", SKILL, [], ["architecture"])
+    assert "name: api-architecture" in first
+    assert "name: web-architecture" in second
+
+
+def test_skill_without_frontmatter_gets_a_minimal_one() -> None:
+    merged = merge_skill("api", "notes", "Just text.\n", [], ["notes"])
+    assert merged == f"---\nname: api-notes\n---\n{SKILL_LINE}\n\nJust text.\n"
 
 
 # --- merge_agent ---
@@ -182,14 +224,18 @@ def test_no_repos_and_empty_settings_give_nothing() -> None:
         ("Write(src/**)", "Write(./music-back/src/**)"),
         ("Read(.env)", "Read(./music-back/.env)"),
         ("Glob(./)", "Glob(./music-back/)"),
-        ("Read(**/secrets/*)", "Read(**/secrets/*)"),
-        ("Read(/abs/file)", "Read(/abs/file)"),
+        ("Read(**/secrets/*)", "Read(./music-back/**/secrets/*)"),
+        ("Read(**/.env.*)", "Read(./music-back/**/.env.*)"),
+        ("Read(/from/root)", "Read(/music-back/from/root)"),
         ("Read(//abs/file)", "Read(//abs/file)"),
         ("Read(~/.ssh/**)", "Read(~/.ssh/**)"),
         ("Read", "Read"),
         ("Read()", "Read()"),
         ("Bash(npm test:*)", "Bash(npm test:*)"),
-        ("Bash(./scripts/x.sh)", "Bash(./scripts/x.sh)"),
+        ("Bash(/usr/bin/x:*)", "Bash(/usr/bin/x:*)"),
+        ("Bash(~/bin/x)", "Bash(~/bin/x)"),
+        ("Bash($HOME/x)", "Bash($HOME/x)"),
+        ("Bash(curl -s http://localhost:*)", "Bash(curl -s http://localhost:*)"),
         ("WebFetch(domain:example.com)", "WebFetch(domain:example.com)"),
         ("mcp__server__tool", "mcp__server__tool"),
     ],
@@ -197,6 +243,47 @@ def test_no_repos_and_empty_settings_give_nothing() -> None:
 def test_path_rules_get_the_repo_folder(rule: str, expected: str) -> None:
     result = merge_settings([repo("music-back", permissions(deny=[rule]))])
     assert result.settings["permissions"]["deny"] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("rule", "copies"),
+    [
+        ("Bash(./scripts/x.sh)", ["Bash(api/scripts/x.sh)", "Bash(./api/scripts/x.sh)"]),
+        ("Bash(scripts/x.sh:*)", ["Bash(api/scripts/x.sh:*)", "Bash(./api/scripts/x.sh:*)"]),
+        (
+            "Bash(.venv/bin/ruff check:*)",
+            ["Bash(api/.venv/bin/ruff check:*)", "Bash(./api/.venv/bin/ruff check:*)"],
+        ),
+        ("Bash(bin/run *)", ["Bash(api/bin/run *)", "Bash(./api/bin/run *)"]),
+    ],
+)
+def test_relative_commands_also_match_from_the_wt_folder(rule: str, copies: list[str]) -> None:
+    result = merge_settings([repo("api", permissions(deny=[rule]))])
+    assert result.settings["permissions"]["deny"] == [rule, *copies]
+
+
+def test_one_repos_relative_command_rules_do_not_duplicate() -> None:
+    rules = ["Bash(./scripts/x.sh:*)", "Bash(scripts/x.sh:*)"]
+    result = merge_settings([repo("api", permissions(allow=rules))])
+    assert result.settings["permissions"]["allow"] == [
+        "Bash(./scripts/x.sh:*)",
+        "Bash(api/scripts/x.sh:*)",
+        "Bash(./api/scripts/x.sh:*)",
+        "Bash(scripts/x.sh:*)",
+    ]
+
+
+def test_a_relative_command_denied_in_one_repo_stays_allowed_in_another() -> None:
+    a = repo("a", permissions(allow=["Bash(scripts/run.sh:*)"]))
+    b = repo("b", permissions(deny=["Bash(scripts/run.sh:*)"]))
+    perms = merge_settings([a, b]).settings["permissions"]
+    # the bare form is denied (deny wins), the repo-scoped copies keep their own repo's rule
+    assert perms["allow"] == ["Bash(a/scripts/run.sh:*)", "Bash(./a/scripts/run.sh:*)"]
+    assert perms["deny"] == [
+        "Bash(scripts/run.sh:*)",
+        "Bash(b/scripts/run.sh:*)",
+        "Bash(./b/scripts/run.sh:*)",
+    ]
 
 
 def test_permission_lists_are_unioned_in_repo_order_without_duplicates() -> None:
