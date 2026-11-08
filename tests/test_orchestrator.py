@@ -98,7 +98,10 @@ def up_logs_with_ensure_result(
     def fake(repo: Path, branch: str, target: Path) -> SimpleNamespace:
         res = real(repo, branch, target)
         return SimpleNamespace(
-            path=res.path, created=res.created, branch_created=res.branch_created, **ensure_fields
+            path=res.path,
+            created=res.created,
+            branch_created=res.branch_created,
+            **{"other_branch": None, **ensure_fields},
         )
 
     monkeypatch.setattr(git, "ensure_worktree", fake)
@@ -139,6 +142,28 @@ def test_up_logs_why_origin_could_not_be_fetched(
     note = "could not fetch origin (no route to host); using the last known origin state"
     logs = up_logs_with_ensure_result(orch, monkeypatch, base="HEAD", fetch_note=note)
     assert f"[yellow]note:[/] repo 'api': {note}" in logs
+
+
+def test_up_warns_when_the_wt_folder_is_on_another_branch(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = up_logs_with_ensure_result(
+        orch, monkeypatch, base=None, fetch_note=None, other_branch="feat/cart-step"
+    )
+    assert any(
+        m.startswith("[yellow]warning:[/] repo 'api': ")
+        and m.endswith(" is on 'feat/cart-step', not 'feat/cart'; using it")
+        for m in logs
+    )
+
+
+def test_up_warns_when_the_wt_folder_is_on_a_detached_head(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logs = up_logs_with_ensure_result(
+        orch, monkeypatch, base=None, fetch_note=None, other_branch=git.DETACHED
+    )
+    assert any(m.endswith(" is on a detached HEAD, not 'feat/cart'; using it") for m in logs)
 
 
 def route_for_another_project(project: str, branch: str, domain: str, host_name: str) -> Path:
