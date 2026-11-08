@@ -144,6 +144,7 @@ class Row:
     consumes: list[str]
     consumed_by: list[str]
     remote: str | None
+    group: str | None
 
 
 def rows(cat: Catalog) -> list[Row]:
@@ -157,6 +158,7 @@ def rows(cat: Catalog) -> list[Row]:
             consumes=list(svc.consumes),
             consumed_by=sorted(n for n, other in cat.services.items() if name in other.consumes),
             remote=svc.remote,
+            group=svc.group,
         )
         for name, svc in sorted(cat.services.items())
     ]

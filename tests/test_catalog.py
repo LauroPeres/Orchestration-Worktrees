@@ -1449,3 +1449,13 @@ def test_group_must_not_be_empty(tmp_path: Path) -> None:
     )
     with pytest.raises(WtError, match="group"):
         load_catalog(write(tmp_path, text))
+
+
+def test_rows_carry_each_service_group_or_none(tmp_path: Path) -> None:
+    from wt.catalog import rows
+
+    text = GOOD.replace(
+        "  front:\n    repo: notes-front\n", "  front:\n    group: notes\n    repo: notes-front\n"
+    )
+    result = rows(load_catalog(write(tmp_path, text)).catalog)
+    assert [(r.service, r.group) for r in result] == [("back", None), ("front", "notes")]
