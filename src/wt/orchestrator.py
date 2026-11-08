@@ -1032,6 +1032,11 @@ class Orchestrator:
                 res = git.ensure_worktree(source, branch, self.worktree_target(names, repo))
             worktrees[repo] = res.path
             self._log_branch_start(branch, repo, res)
+            if res.other_branch:
+                self.log(
+                    f"[yellow]warning:[/] repo {repo!r}: {res.path} is on "
+                    f"{_quoted_branch(res.other_branch)}, not {branch!r}; using it"
+                )
             if not res.created:
                 self.log(
                     f"repo {repo!r}: {branch!r} is already checked out at {res.path}; using it"
@@ -1811,6 +1816,10 @@ def _own_folders(bs: BranchState) -> list[Path]:
     A checkout wt did not create (`created` false) is the repo's own folder, never the wt's.
     """
     return list(dict.fromkeys(Path(rs.path).parent for rs in bs.repos.values() if rs.created))
+
+
+def _quoted_branch(name: str) -> str:
+    return name if name == git.DETACHED else repr(name)
 
 
 def _is_worktree_of(repo: Path, path: Path) -> bool:

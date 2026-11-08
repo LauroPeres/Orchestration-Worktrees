@@ -269,3 +269,23 @@ def test_origin_head_decides_the_base(make_repo, tmp_path: Path) -> None:
     run_git(app, "remote", "set-head", "origin", "trunk")
     res = git.ensure_worktree(app, "feat/x", tmp_path / "t")
     assert res.base is not None and res.base.startswith("origin/trunk (")
+
+
+def test_uses_target_switched_to_another_branch(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    target = tmp_path / "t"
+    git.ensure_worktree(repo, "feat/x", target)
+    run_git(target, "switch", "-q", "-c", "feat/x-step")
+    res = git.ensure_worktree(repo, "feat/x", target)
+    assert res.path == target and res.created and not res.branch_created
+    assert res.other_branch == "feat/x-step"
+    assert "feat/x" in branches(repo)
+
+
+def test_uses_target_on_detached_head(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    target = tmp_path / "t"
+    git.ensure_worktree(repo, "feat/x", target)
+    run_git(target, "switch", "-q", "--detach")
+    res = git.ensure_worktree(repo, "feat/x", target)
+    assert res.path == target and res.other_branch == git.DETACHED

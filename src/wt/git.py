@@ -58,6 +58,12 @@ class EnsureResult:
     branch_created: bool
     base: str | None = None  # where a created branch started: "origin/main (a1b2c3d)" or "HEAD"
     fetch_note: str | None = None  # why `git fetch origin` did not happen or failed
+    # the target was already a worktree on another branch, used as is (SPEC section 33);
+    # DETACHED for a detached HEAD
+    other_branch: str | None = None
+
+
+DETACHED = "a detached HEAD"
 
 
 FETCH_TIMEOUT_SECONDS = 30
@@ -116,6 +122,7 @@ def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
     """Make sure `branch` of `repo` is checked out somewhere, preferring `target`.
 
     - already checked out (main repo or another worktree): reuse it, wt does not own it
+    - `target` is a worktree of `repo` on another branch: use it as is, wt owns it
     - local branch exists: add a worktree for it
     - only origin/<branch> exists: add a worktree with a tracking branch
     - neither: create the branch from origin's default branch (no upstream), else from HEAD
@@ -125,10 +132,15 @@ def ensure_worktree(repo: Path, branch: str, target: Path) -> EnsureResult:
     """
     check_repo(repo)
     _git(repo, "worktree", "prune")
-    for tree in list_worktrees(repo):
+    trees = list_worktrees(repo)
+    for tree in trees:
         if tree.branch == branch:
             owned = tree.path.resolve() == target.resolve()
             return EnsureResult(tree.path, created=owned, branch_created=False)
+    for tree in trees:
+        if target.exists() and tree.path.resolve() == target.resolve():
+            other = tree.branch or DETACHED
+            return EnsureResult(target, created=True, branch_created=False, other_branch=other)
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
         raise WtError(f"{target} exists and is not a worktree of {branch!r}; remove it first")
     target.parent.mkdir(parents=True, exist_ok=True)

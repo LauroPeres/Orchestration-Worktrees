@@ -174,6 +174,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.12.0 ✔ (§30) | `--json` branch rows and actions say where the worktrees are (`folder`, `repos` with paths) |
 | v0.13.0 ✔ (§31) | `wt catalog --json` lists the catalog's repo folders (`repos` with paths) |
 | v0.14.0 ✔ (§32) | `wt catalog --json` service rows say each service's `group` (or `null`) |
+| v0.14.1 ✔ (§33) | `up` reuses a wt's repo folder that was switched to another branch |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1488,3 +1489,17 @@ groups like `configure` does. Amends §21 (JSON output).
   catalog (§30), or `null` when it has none. The human `wt catalog` table is unchanged.
 - `"schema"` stays `1`: a key is only added. Example row: `{"name":"api","repo":"notes-back","kind":"compose",
   "infra":[],"consumes":{},"consumed_by":[],"remote":null,"group":"music"}`.
+
+## 33. v0.14.1: a wt folder switched to another branch
+
+Decided 2026-11-08 (bug). Work inside a wt often moves to a sub-branch with `git switch` in the repo's folder;
+`up` then looked only for the wt's branch, did not find it, and refused the folder
+(`<path> exists and is not a worktree of '<branch>'`). Amends §13 (Branches).
+
+- **The wt's folder wins.** When the wt's target folder for a repo is already a git worktree of that repo, on
+  another branch or a detached HEAD, `up` and `add` use it as it is and warn
+  `repo '<repo>': <path> is on '<other>', not '<branch>'; using it` (`a detached HEAD` for no branch).
+  Nothing is switched, created or fetched.
+- wt still owns that folder (`created` true): `down` removes it as usual and keeps every branch.
+- The branch checked out elsewhere still comes first (§13). A folder that is not a worktree of the repo is
+  still refused with the same error.
