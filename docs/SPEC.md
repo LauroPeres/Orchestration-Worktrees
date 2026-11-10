@@ -1539,9 +1539,10 @@ and §21 (JSON).
   `no origin` (no remote or no `origin/<branch>`), `could not fetch origin: <line>` or `push failed: <first stderr line>`;
   `remove` still succeeds.
   Protected branches (§16) never touch the remote. Squash merges are not detected (the branch is kept).
-- **Images (`down`, `remove`).** `docker compose down` gains `--rmi local`; then every image labelled
-  `com.docker.compose.project=<project>` of the branch's compose projects is removed too (for the images whose
-  containers were already gone). `stop` keeps the images. The next `up` rebuilds them.
+- **Images (`down`, `remove`).** `docker compose down` gains `--rmi local`; then every image of the branch's compose
+  projects is removed too: labelled `com.docker.compose.project=<project>`, or tagged `<project>-<service>` (some
+  Compose versions don't label what they build; pulled images are never touched). This covers images whose
+  containers were already gone. `stop` keeps the images. The next `up` rebuilds them.
 - **The wt folder.** When `wt/<slug>/` is not empty after its worktrees are removed it is kept, with the warning
   `kept <folder>: not empty (<up to 5 entries>, …)`.
 - **`wt prune [--dry-run] [--yes] [--json]`.** Finds and cleans the orphans of the current project, or of every
@@ -1553,7 +1554,7 @@ and §21 (JSON).
   - `remote_ref`: stale `origin/*` refs, removed by `git fetch --prune origin`.
   - `compose` / `image`: compose projects named `<instance>-<project>-…` (from container, volume and image labels)
     that are no live branch's compose project: `docker compose down -v --remove-orphans --rmi local`, then their
-    labelled images.
+    images (labelled or named as above).
   - `file`: route files, cert files and `branches/<slug>/` state folders of the project that belong to no live branch.
   - Prune never touches the remote. Each item is tried on its own: a failure goes in its `note` and the next one
     goes on; prune fails only when the project cannot load. A fetch failure skips that repo's git items with a note.

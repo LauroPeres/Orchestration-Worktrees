@@ -122,20 +122,69 @@ def _fake_docker(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]) -> li
     return calls
 
 
+LABELLED = "label=com.docker.compose.project=wt-shop-x-api"
+NAMED = "reference=wt-shop-x-api-*"
+
+
+def _rm_calls(calls: list[list[str]]) -> list[list[str]]:
+    return [call for call in calls if call[:3] == ["docker", "image", "rm"]]
+
+
 def test_remove_images_removes_each_labelled_image_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _fake_docker(monkeypatch, {"image ls": "aaa\nbbb\naaa\n"})
+    calls = _fake_docker(monkeypatch, {LABELLED: "aaa\nbbb\naaa\n"})
     assert compose.remove_images("wt-shop-x-api") == ["aaa", "bbb"]
-    assert calls[0] == [
-        "docker", "image", "ls", "-q",
-        "--filter", "label=com.docker.compose.project=wt-shop-x-api",
-    ]  # fmt: skip
-    assert calls[1] == ["docker", "image", "rm", "aaa", "bbb"]
+    assert calls[0] == ["docker", "image", "ls", "-q", "--filter", LABELLED]
+    assert _rm_calls(calls) == [["docker", "image", "rm", "aaa", "bbb"]]
+
+
+def test_remove_images_removes_unlabelled_images_named_after_the_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_docker(monkeypatch, {NAMED: "n1 wt-shop-x-api-web latest\n"})
+    assert compose.remove_images("wt-shop-x-api") == ["n1"]
+    assert [
+        "docker", "image", "ls", "--filter", NAMED,
+        "--format", "{{.ID}} {{.Repository}} {{.Tag}}",
+    ] in calls  # fmt: skip
+    assert _rm_calls(calls) == [["docker", "image", "rm", "wt-shop-x-api-web:latest"]]
+
+
+def test_remove_images_dedups_an_image_both_labelled_and_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    named = "n1 wt-shop-x-api-web latest\nn1 wt-shop-x-api-worker latest\n"
+    calls = _fake_docker(monkeypatch, {NAMED: named, LABELLED: "n1\nlab\n"})
+    assert compose.remove_images("wt-shop-x-api") == ["n1", "lab"]
+    # Two tags of one image go by name: removing it by id would fail.
+    assert _rm_calls(calls) == [
+        ["docker", "image", "rm", "wt-shop-x-api-web:latest", "wt-shop-x-api-worker:latest", "lab"]
+    ]
+
+
+def test_remove_images_never_selects_a_pulled_or_untagged_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    named = "p1 postgres 16\np2 wt-shop-x-apiary latest\nq1 wt-shop-x-api-web <none>\n"
+    calls = _fake_docker(monkeypatch, {NAMED: named})
+    assert compose.remove_images("wt-shop-x-api") == []
+    assert _rm_calls(calls) == []
+
+
+def test_remove_images_skips_images_named_after_a_longer_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    named = "a1 wt-shop-x-api-web latest\nb1 wt-shop-x-api-back-web latest\n"
+    calls = _fake_docker(
+        monkeypatch, {NAMED: named, "docker ps": "wt-shop-x-api\nwt-shop-x-api-back\n"}
+    )
+    assert compose.remove_images("wt-shop-x-api") == ["a1"]
+    assert _rm_calls(calls) == [["docker", "image", "rm", "wt-shop-x-api-web:latest"]]
 
 
 def test_remove_images_with_none_found_does_not_call_rm(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _fake_docker(monkeypatch, {})
     assert compose.remove_images("wt-shop-x-api") == []
-    assert len(calls) == 1
+    assert len(calls) == 2  # the labelled and the named lookups, no rm
 
 
 def test_wt_projects_unions_containers_volumes_and_images(
