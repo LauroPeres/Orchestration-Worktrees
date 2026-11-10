@@ -177,6 +177,10 @@ class FakeDocker:
     downs: list[str] = field(default_factory=list)
     kept_downs: list[str] = field(default_factory=list)  # down without -v (stop)
     files: list[list[Path]] = field(default_factory=list)
+    image_removals: list[str] = field(default_factory=list)  # projects asked to drop their images
+    images: dict[str, list[str]] = field(default_factory=dict)  # project -> image ids it leaves
+    fail_images: bool = False
+    projects: set[str] = field(default_factory=set)  # compose projects Docker "has", for prune
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(router, "ensure_running", lambda timeout=60, on_line=None: None)
@@ -187,6 +191,8 @@ class FakeDocker:
         monkeypatch.setattr(compose, "up", self.up)
         monkeypatch.setattr(compose, "down", self.downs.append)
         monkeypatch.setattr(compose, "down_keep_volumes", self.kept_downs.append)
+        monkeypatch.setattr(compose, "remove_images", self.remove_images)
+        monkeypatch.setattr(compose, "wt_projects", self.wt_projects)
         monkeypatch.setattr(
             compose,
             "ps",
@@ -195,6 +201,15 @@ class FakeDocker:
         check = health.Check(self.healthy, "HTTP 200" if self.healthy else "HTTP 502")
         monkeypatch.setattr(health, "wait_healthy", lambda *a, **k: check)
         monkeypatch.setattr(health, "probe", lambda *a, **k: check)
+
+    def remove_images(self, project: str) -> list[str]:
+        self.image_removals.append(project)
+        if self.fail_images:
+            raise WtError("image rm failed")
+        return self.images.pop(project, [])
+
+    def wt_projects(self, prefix: str) -> set[str]:
+        return {name for name in self.projects if name.startswith(prefix)}
 
     def up(self, project: str, files: list[Path], **kwargs: object) -> None:
         if self.fail_up:

@@ -32,9 +32,19 @@ from wt.catalog import (
 from wt.claudegen import ClaudeSyncResult
 from wt.config import LoadedConfig
 from wt.errors import WtError
-from wt.messages import CONFIRM_REMOVE
+from wt.messages import CONFIRM_PRUNE, CONFIRM_REMOVE
 from wt.naming import slugify
-from wt.orchestrator import BranchStatus, Choice, MoveResult, Orchestrator, ServiceReport
+from wt.orchestrator import (
+    BranchStatus,
+    Choice,
+    MoveResult,
+    Orchestrator,
+    PruneItem,
+    RemoteResult,
+    RemoveResult,
+    ServiceReport,
+    prune_all,
+)
 from wt.projects import KnownProject, known_projects
 from wt.state import atomic_write
 
@@ -332,6 +342,38 @@ def action_document(
         "repos": _repos_json(outcome.worktrees),
         "urls": outcome.urls,
         "warnings": list(outcome.warnings),
+    }
+
+
+def _remote_json(results: list[RemoteResult]) -> list[JsonDocument]:
+    return [
+        {"repo": r.repo, "branch": r.branch, "deleted": r.deleted, "reason": r.reason}
+        for r in results
+    ]
+
+
+def _pruned_json(items: list[PruneItem]) -> list[JsonDocument]:
+    return [
+        {"kind": i.kind, "target": i.target, "repo": i.repo, "done": i.done, "note": i.note}
+        for i in items
+    ]
+
+
+def remove_document(branch: str, result: RemoveResult) -> JsonDocument:
+    """The action document of `remove`, plus what happened to the remote branches and the prune."""
+    return {
+        **action_document(branch, "remove", ActionOutcome()),
+        "remote": _remote_json(result.remote),
+        "pruned": _pruned_json(result.pruned),
+    }
+
+
+def prune_document(items: list[PruneItem], *, dry_run: bool) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "action": "prune",
+        "dry_run": dry_run,
+        "items": _pruned_json(items),
     }
 
 
@@ -655,7 +697,10 @@ def remove(
     yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
     json_output: JsonOption = False,
 ) -> None:
-    """Do `down` for BRANCH, then delete the git branch (unpushed commits are lost)."""
+    """Do `down` for BRANCH, delete the git branch (unpushed commits are lost), then prune.
+
+    The remote branch is deleted too when it is merged into origin's default branch.
+    """
     with _json_errors(json_output):
         if json_output and not yes:
             raise WtError("remove --json never asks for confirmation: pass --yes")
@@ -663,11 +708,89 @@ def remove(
             # typer.confirm appends ` [y/N]` itself
             question = CONFIRM_REMOVE.format(branch=branch).removesuffix(" y/N")
             typer.confirm(question, abort=True)
-        done = Orchestrator(_load(ctx), log=_progress(json_output)).remove(branch, force=force)
+        result = Orchestrator(_load(ctx), log=_progress(json_output)).remove(branch, force=force)
         if json_output:
-            _emit(action_document(branch, "remove", ActionOutcome()))
-        elif done:
+            _emit(remove_document(branch, result))
+            return
+        if result:
             console.print(f"[green]{branch} is removed.[/]")
+        _print_prune_lines([i for i in result.pruned if i.done or i.note], dry_run=False)
+
+
+def _prune_status(item: PruneItem, *, dry_run: bool) -> str:
+    if item.done:
+        return "[green]removed[/]"
+    if dry_run:
+        return "would remove"
+    return f"[red]failed:[/] {escape(item.note or 'unknown error')}"
+
+
+def _print_prune_lines(items: list[PruneItem], *, dry_run: bool) -> None:
+    for item in items:
+        target = escape(f"{item.repo}/{item.target}" if item.repo else item.target)
+        # emoji off: an image id like `sha256:abc:` would turn into an emoji
+        console.print(f"{item.kind} {target}: {_prune_status(item, dry_run=dry_run)}", emoji=False)
+
+
+def _print_prune(items: list[PruneItem], *, dry_run: bool) -> None:
+    if not items:
+        console.print("nothing to prune")
+        return
+    _print_prune_lines(items, dry_run=dry_run)
+    count = len(items)
+    if dry_run:
+        console.print(f"{count} item(s) would be removed")
+        return
+    failed = sum(1 for item in items if not item.done)
+    console.print(f"removed {count - failed} of {count} item(s)")
+
+
+def _find_orphans(
+    ctx: typer.Context, *, dry_run: bool, log: Callable[[str], None]
+) -> list[PruneItem]:
+    """The orphans of the catalog's project, or of every known project when there is no catalog."""
+    if _catalog_file(ctx).is_file():
+        return Orchestrator(_load(ctx), log=log).prune(dry_run=dry_run)
+    return prune_all(dry_run=dry_run, log=log)
+
+
+def _confirm_and_prune(ctx: typer.Context, log: Callable[[str], None]) -> list[PruneItem]:
+    """Show the dry run and ask, then prune for real.
+
+    An empty preview runs without asking: the dry run cannot list `worktree_ref` and
+    `remote_ref`, and those only drop git's own stale records.
+    """
+    preview = _find_orphans(ctx, dry_run=True, log=log)
+    if preview:
+        _print_prune_lines(preview, dry_run=True)
+        # typer.confirm appends ` [y/N]` itself
+        question = CONFIRM_PRUNE.format(count=len(preview)).removesuffix(" y/N")
+        typer.confirm(question, abort=True)
+    return _find_orphans(ctx, dry_run=False, log=log)
+
+
+@app.command()
+def prune(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be removed; change nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
+    json_output: JsonOption = False,
+) -> None:
+    """Remove what no live wt owns: stale branches and refs, compose projects, images, files."""
+    with _json_errors(json_output):
+        if json_output and not (yes or dry_run):
+            raise WtError("prune --json never asks for confirmation: pass --yes")
+        log = _progress(json_output)
+        if yes or dry_run:
+            items = _find_orphans(ctx, dry_run=dry_run, log=log)
+        else:
+            items = _confirm_and_prune(ctx, log)
+        if json_output:
+            _emit(prune_document(items, dry_run=dry_run))
+        else:
+            _print_prune(items, dry_run=dry_run)
 
 
 BRANCH_COLUMNS = ("BRANCH", "STATUS", "UP", "SERVICE", "KIND", "URL", "HEALTH")

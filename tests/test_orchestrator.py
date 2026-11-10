@@ -1,3 +1,4 @@
+import fcntl
 import os
 import shutil
 import socket
@@ -43,6 +44,7 @@ from wt import (
     host,
     naming,
     orchestrator,
+    paths,
     pgpass,
     proc,
     providers,
@@ -52,10 +54,16 @@ from wt import (
 )
 from wt.catalog import load_project
 from wt.errors import WtError
-from wt.orchestrator import Orchestrator, ServiceReport
+from wt.orchestrator import (
+    Orchestrator,
+    PruneItem,
+    RemoteResult,
+    ServiceReport,
+    prune_all,
+)
 from wt.providers import postgres
 from wt.providers.base import Check
-from wt.state import ProcessState
+from wt.state import BranchState, ProcessState, StateStore
 
 
 def test_up_creates_everything(orch, docker: FakeDocker, isolated_home: Path) -> None:
@@ -2050,7 +2058,7 @@ def test_stop_unknown_branch_is_an_error(orch, docker: FakeDocker) -> None:
 def test_remove_deletes_the_git_branch(orch, docker: FakeDocker, tmp_path: Path) -> None:
     o = orch()
     o.up("feat/cart", uses=selection(o))
-    assert o.remove("feat/cart") is True
+    assert o.remove("feat/cart").removed is True
     assert o.store.load().branches == {}
     assert "feat/cart" not in git_run(tmp_path / "shop-api", "branch", "--list")
 
@@ -2063,7 +2071,7 @@ def test_remove_refuses_dirty_worktree_without_force(
     (isolated_home / "shop" / "worktrees" / "feat-cart" / "api" / "wip.txt").write_text("x")
     with pytest.raises(WtError, match="untracked"):
         o.remove("feat/cart")
-    assert o.remove("feat/cart", force=True) is True
+    assert o.remove("feat/cart", force=True).removed is True
     assert "feat/cart" not in git_run(tmp_path / "shop-api", "branch", "--list")
 
 
@@ -2082,7 +2090,7 @@ def test_remove_of_a_name_that_exists_nowhere_says_nothing_to_remove(
 ) -> None:
     o = orch()
     logs = _logged(o)
-    assert o.remove("feat/nope") is False
+    assert o.remove("feat/nope").removed is False
     assert logs == ["branch feat/nope not found; nothing to remove"]
 
 
@@ -2094,10 +2102,10 @@ def test_remove_after_down_deletes_the_branch_it_kept(
     assert o.down("feat/cart") is True
     assert "feat/cart" in _branches(tmp_path / "shop-api")  # down keeps the git branch
     logs = _logged(o)
-    assert o.remove("feat/cart") is True
+    assert o.remove("feat/cart").removed is True
     assert "feat/cart" not in _branches(tmp_path / "shop-api")
     assert not any("nothing to remove" in m for m in logs)
-    assert o.remove("feat/cart") is False  # idempotent: the second run has nothing left
+    assert o.remove("feat/cart").removed is False  # idempotent: the second run has nothing left
 
 
 def test_down_alone_keeps_the_branch_and_reports_nothing_for_an_unknown_one(
@@ -2115,7 +2123,7 @@ def test_remove_without_state_deletes_the_branch_in_every_repo(dep_stack, tmp_pa
     o = dep_stack(["front", "lone"])
     for repo in ("shop-api", "shop-ui"):
         git_run(tmp_path / repo, "branch", "feat/x")
-    assert o.remove("feat/x") is True
+    assert o.remove("feat/x").removed is True
     assert all("feat/x" not in _branches(tmp_path / r) for r in ("shop-api", "shop-ui"))
 
 
@@ -2125,9 +2133,12 @@ def test_remove_without_state_deletes_a_branch_that_exists_in_one_repo(
     o = dep_stack(["front", "lone"])
     git_run(tmp_path / "shop-ui", "branch", "feat/x")
     logs = _logged(o)
-    assert o.remove("feat/x") is True
+    assert o.remove("feat/x").removed is True
     assert "feat/x" not in _branches(tmp_path / "shop-ui")
-    assert logs == ["deleting branch 'feat/x' in repo 'ui'"]
+    assert logs == [
+        "deleting branch 'feat/x' in repo 'ui'",
+        "kept remote branch feat/x in ui: no origin",
+    ]
 
 
 def test_remove_after_down_keeps_the_branch_checked_out_in_the_main_folder(
@@ -2138,7 +2149,7 @@ def test_remove_after_down_keeps_the_branch_checked_out_in_the_main_folder(
     o.up("dev", uses=selection(o))
     o.down("dev")
     logs = _logged(o)
-    assert o.remove("dev") is False  # nothing was deleted
+    assert o.remove("dev").removed is False  # nothing was deleted
     assert "dev" in _branches(tmp_path / "shop-api")
     assert logs == ["keeping branch 'dev' in repo 'api': checked out elsewhere"]
 
@@ -2151,7 +2162,7 @@ def test_remove_after_down_keeps_the_postgres_base_branch(
     o.up("develop", uses=selection(o))
     o.down("develop")
     logs = _logged(o)
-    assert o.remove("develop") is False
+    assert o.remove("develop").removed is False
     assert "develop" in _branches(tmp_path / "shop-api")
     assert logs == ["keeping branch 'develop' in repo 'api': Postgres base branch"]
 
@@ -2163,7 +2174,7 @@ def test_remove_after_down_keeps_a_branch_checked_out_in_a_foreign_folder(
     foreign = tmp_path / "foreign"
     git_run(tmp_path / "shop-api", "worktree", "add", "-b", "feat/x", str(foreign))
     logs = _logged(o)
-    assert o.remove("feat/x") is False
+    assert o.remove("feat/x").removed is False
     assert foreign.is_dir()
     assert "feat/x" in _branches(tmp_path / "shop-api")
     assert logs == ["keeping branch 'feat/x' in repo 'api': checked out elsewhere"]
@@ -2174,7 +2185,7 @@ def test_remove_keeps_the_branch_checked_out_in_the_main_folder(
 ) -> None:
     o = orch()
     o.up("main", uses=selection(o))
-    assert o.remove("main") is True
+    assert o.remove("main").removed is True
     assert "main" in git_run(tmp_path / "shop-api", "branch", "--list")
 
 
@@ -2184,7 +2195,7 @@ def test_remove_keeps_the_postgres_base_branch(
     o = orch(shared={"postgres": {"databases": ["shop"], "base_branch": "develop"}})
     git_run(tmp_path / "shop-api", "branch", "develop")
     o.up("develop", uses=selection(o))
-    assert o.remove("develop") is True
+    assert o.remove("develop").removed is True
     assert "develop" in git_run(tmp_path / "shop-api", "branch", "--list")
 
 
@@ -2196,7 +2207,7 @@ def test_remove_keeps_a_branch_checked_out_in_a_foreign_folder(
     git_run(tmp_path / "shop-api", "worktree", "add", "-b", "feat/x", str(foreign))
     o.up("feat/x", uses=selection(o))
     assert not o.store.load().branches["feat/x"].repos["api"].created
-    assert o.remove("feat/x") is True
+    assert o.remove("feat/x").removed is True
     assert foreign.is_dir()
     assert "feat/x" in git_run(tmp_path / "shop-api", "branch", "--list")
 
@@ -3849,9 +3860,9 @@ def test_remove_after_down_deletes_the_branch_in_every_repo_of_the_catalog(
     o.add("feat/x", uses=BOTH_REPOS)
     assert o.down("feat/x") is True
     assert all("feat/x" in _branches(tmp_path / r) for r in ("shop-api", "shop-web"))
-    assert o.remove("feat/x") is True
+    assert o.remove("feat/x").removed is True
     assert all("feat/x" not in _branches(tmp_path / r) for r in ("shop-api", "shop-web"))
-    assert o.remove("feat/x") is False  # idempotent
+    assert o.remove("feat/x").removed is False  # idempotent
 
 
 def test_remove_after_down_keeps_a_foreign_checkout_in_a_repo_outside_the_anchor(
@@ -3863,7 +3874,7 @@ def test_remove_after_down_keeps_a_foreign_checkout_in_a_repo_outside_the_anchor
     foreign = tmp_path / "foreign"
     git_run(tmp_path / "shop-web", "worktree", "add", str(foreign), "feat/x")
     logs = _logged(o)
-    assert o.remove("feat/x") is True  # deleted in api
+    assert o.remove("feat/x").removed is True  # deleted in api
     assert "feat/x" not in _branches(tmp_path / "shop-api")
     assert "feat/x" in _branches(tmp_path / "shop-web")  # kept: checked out in a folder not ours
     assert foreign.is_dir()
@@ -5058,7 +5069,7 @@ def test_a_dbeaver_failure_is_a_note_not_an_error_of_up_down_or_remove(
     o.up("feat/cart", uses=selection(o))
     assert o.down("feat/cart") is True
     o.up("feat/pay", uses=selection(o))
-    assert o.remove("feat/pay") is True
+    assert o.remove("feat/pay").removed is True
     notes = [m for m in logs if "DBeaver sync failed: DBeaver workspace not found" in m]
     assert len(notes) == 4 and all(m.startswith("[yellow]note:[/]") for m in notes)
     assert o.store.load().branches == {}
@@ -5289,7 +5300,7 @@ def test_remove_removes_the_claude_files_before_the_worktrees(
     o = _claude_orch(make_repo, tmp_path)
     o.add("feat/x", uses=BOTH_REPOS)
     folder = o.worktree_dir("feat/x")
-    assert o.remove("feat/x") is True
+    assert o.remove("feat/x").removed is True
     assert ordered_removals.removed == [folder]
     assert ordered_removals.events[0] == "claude remove (folder exists: True)"
     assert ordered_removals.events[1:] == ["remove worktree"] * 2
@@ -5322,3 +5333,760 @@ def test_stop_keeps_the_claude_files(
     o.up("feat/x", uses=BOTH_REPOS)
     o.stop("feat/x")
     assert fake_claudegen.removed == [] and fake_claudegen.events == []
+
+
+# ---- remove cleans everything (SPEC §35) -------------------------------------------------------
+
+
+@dataclass
+class FakeRemote:
+    """Stands in for the git calls that touch origin; `calls` records the ones that changed it."""
+
+    merged: bool | None = True
+    fetch_error: str | None = None
+    check_error: str | None = None  # git could not answer after the fetch
+    push_error: str | None = None
+    calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(git, "remote_branch_merged", self.remote_branch_merged)
+        monkeypatch.setattr(git, "delete_remote_branch", self.delete_remote_branch)
+        monkeypatch.setattr(git, "drop_remote_ref", self.drop_remote_ref)
+
+    def remote_branch_merged(self, repo: Path, branch: str) -> git.RemoteMerge | None:
+        self.calls.append(("merged?", branch))
+        if self.fetch_error:
+            raise git.FetchError(repo, self.fetch_error)
+        if self.check_error:
+            raise WtError(f"{self.check_error}\nmore detail")
+        return None if self.merged is None else git.RemoteMerge(self.merged, "origin/main")
+
+    def delete_remote_branch(self, repo: Path, branch: str) -> None:
+        if self.push_error:
+            result = proc.Result(1, "", f"\n{self.push_error}\nsecond line\n")
+            raise proc.CommandError(["git", "push"], result)
+        self.calls.append(("push --delete", branch))
+
+    def drop_remote_ref(self, repo: Path, branch: str) -> None:
+        self.calls.append(("branch -dr", branch))
+
+
+@pytest.fixture
+def remote(monkeypatch: pytest.MonkeyPatch) -> FakeRemote:
+    fake = FakeRemote()
+    fake.install(monkeypatch)
+    return fake
+
+
+def test_remove_deletes_the_merged_remote_branch(orch, docker: FakeDocker, remote: FakeRemote):
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.remote == [RemoteResult("api", "feat/cart", True, None)]
+    assert remote.calls == [
+        ("merged?", "feat/cart"),
+        ("push --delete", "feat/cart"),
+        ("branch -dr", "feat/cart"),
+    ]
+    assert "deleted remote branch feat/cart in api" in logs
+
+
+def test_remove_keeps_a_remote_branch_that_is_not_merged(orch, docker, remote: FakeRemote):
+    remote.merged = False
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.removed is True
+    assert result.remote == [RemoteResult("api", "feat/cart", False, "not merged into origin/main")]
+    assert ("push --delete", "feat/cart") not in remote.calls
+    assert "kept remote branch feat/cart in api: not merged into origin/main" in logs
+
+
+def test_remove_keeps_the_remote_branch_when_there_is_no_origin(orch, docker, remote: FakeRemote):
+    remote.merged = None
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    assert o.remove("feat/cart").remote == [RemoteResult("api", "feat/cart", False, "no origin")]
+    assert "kept remote branch feat/cart in api: no origin" in logs
+
+
+def test_remove_survives_a_failed_push_and_names_the_first_stderr_line(
+    orch, docker, remote: FakeRemote, tmp_path: Path
+):
+    remote.push_error = "remote: protected branch"
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.removed is True
+    assert result.remote == [
+        RemoteResult("api", "feat/cart", False, "push failed: remote: protected branch")
+    ]
+    assert "kept remote branch feat/cart in api: push failed: remote: protected branch" in logs
+    assert "feat/cart" not in _branches(tmp_path / "shop-api")  # the local branch still went
+
+
+def test_remove_survives_a_failed_fetch_of_origin(orch, docker, remote: FakeRemote):
+    remote.fetch_error = "unable to access origin"
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    result = o.remove("feat/cart")
+    assert result.removed is True
+    assert result.remote == [
+        RemoteResult("api", "feat/cart", False, "could not fetch origin: unable to access origin")
+    ]
+
+
+def test_remove_names_a_check_that_failed_after_the_fetch_apart_from_a_fetch_failure(
+    orch, docker, remote: FakeRemote
+):
+    remote.check_error = "fatal: Not a valid object name refs/remotes/origin/main"
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    result = o.remove("feat/cart")
+    assert result.removed is True
+    reason = (
+        "could not check origin/feat/cart: fatal: Not a valid object name refs/remotes/origin/main"
+    )
+    assert result.remote == [RemoteResult("api", "feat/cart", False, reason)]
+
+
+def _lock_is_held(name: str) -> bool:
+    with open(paths.locks_dir() / f"{name}.lock", "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
+
+def test_remove_talks_to_origin_after_releasing_the_branch_lock(
+    orch, docker, remote: FakeRemote, monkeypatch: pytest.MonkeyPatch
+):
+    held: list[bool] = []
+
+    def merged(repo: Path, branch: str) -> git.RemoteMerge:
+        held.append(_lock_is_held("branch-shop-feat-cart"))
+        return git.RemoteMerge(True, "origin/main")
+
+    monkeypatch.setattr(git, "remote_branch_merged", merged)
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert o.remove("feat/cart").remote == [RemoteResult("api", "feat/cart", True, None)]
+    assert held == [False]
+
+
+def test_remove_still_cleans_the_remote_where_it_deleted_before_failing_on_another_repo(
+    orch, docker, remote: FakeRemote, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    sources = {"api": tmp_path / "shop-api", "gone": tmp_path / "missing-repo"}
+    monkeypatch.setattr(Orchestrator, "_catalog_repo_paths", lambda self: sources)
+    with pytest.raises(
+        WtError, match=r"could not delete branch 'feat/cart' in 1 repo\(s\): 'gone'"
+    ):
+        o.remove("feat/cart")
+    assert ("push --delete", "feat/cart") in remote.calls
+
+
+def test_remove_never_touches_the_remote_of_a_protected_branch(
+    orch, docker, remote: FakeRemote, tmp_path: Path
+):
+    o = orch()
+    o.up("main", uses=selection(o))  # checked out in the main folder
+    result = o.remove("main")
+    assert result.remote == []
+    git_run(tmp_path / "shop-api", "branch", "develop")
+    o2 = orch(shared={"postgres": {"databases": ["shop"], "base_branch": "develop"}})
+    assert o2.remove("develop").remote == []
+    assert remote.calls == []
+
+
+def test_remove_has_no_remote_result_for_a_branch_that_was_not_there(orch, docker, remote):
+    assert orch().remove("feat/nope").remote == []
+    assert remote.calls == []
+
+
+def _origin(make_repo, tmp_path: Path, repo: Path) -> Path:
+    """A bare origin next to `repo`, with `main` pushed."""
+    bare = tmp_path / "origin.git"
+    git_run(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    git_run(repo, "remote", "add", "origin", str(bare))
+    git_run(repo, "push", "-q", "origin", "main")
+    git_run(repo, "fetch", "-q", "origin")
+    return bare
+
+
+def _remote_branches(bare: Path) -> list[str]:
+    return git_run(bare, "branch", "--format=%(refname:short)").split()
+
+
+def test_remove_deletes_a_merged_branch_on_a_real_origin(
+    orch, docker, make_repo, tmp_path: Path
+) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    bare = _origin(make_repo, tmp_path, repo)
+    o.up("feat/cart", uses=selection(o))
+    git_run(repo, "push", "-q", "origin", "feat/cart")
+    assert "feat/cart" in _remote_branches(bare)
+    result = o.remove("feat/cart")
+    assert result.remote == [RemoteResult("api", "feat/cart", True, None)]
+    assert "feat/cart" not in _remote_branches(bare)
+    assert "origin/feat/cart" not in git_run(repo, "branch", "-r")
+
+
+def test_remove_keeps_an_unmerged_branch_on_a_real_origin(
+    orch, docker, make_repo, tmp_path: Path, isolated_home: Path
+) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    bare = _origin(make_repo, tmp_path, repo)
+    o.up("feat/cart", uses=selection(o))
+    worktree = isolated_home / "shop" / "worktrees" / "feat-cart" / "api"
+    git_run(worktree, "commit", "-q", "--allow-empty", "-m", "wip")
+    git_run(repo, "push", "-q", "origin", "feat/cart")
+    result = o.remove("feat/cart")
+    assert result.remote == [RemoteResult("api", "feat/cart", False, "not merged into origin/main")]
+    assert "feat/cart" in _remote_branches(bare)
+
+
+# ---- images and the wt folder ------------------------------------------------------------------
+
+
+def test_down_and_remove_remove_the_images_of_every_compose_project(
+    orch, docker: FakeDocker
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert o.down("feat/cart") is True
+    assert docker.image_removals == ["wt-shop-feat-cart-api"]
+    o.up("feat/cart", uses=selection(o))
+    assert o.remove("feat/cart").removed is True
+    assert docker.image_removals == ["wt-shop-feat-cart-api"] * 2
+
+
+def test_stop_keeps_the_images(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.stop("feat/cart")
+    assert docker.kept_downs == ["wt-shop-feat-cart-api"]
+    assert docker.image_removals == []
+
+
+def test_a_failure_removing_images_is_a_note_and_down_goes_on(orch, docker: FakeDocker) -> None:
+    docker.fail_images = True
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    assert o.down("feat/cart") is True
+    assert o.store.load().branches == {}
+    assert "[yellow]note:[/] images of wt-shop-feat-cart-api not removed: image rm failed" in logs
+
+
+def test_down_logs_the_images_it_removed(orch, docker: FakeDocker) -> None:
+    docker.images["wt-shop-feat-cart-api"] = ["a1", "b2"]
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    o.down("feat/cart")
+    assert "removed 2 image(s) of wt-shop-feat-cart-api" in logs
+
+
+def _wt_folder(isolated_home: Path) -> Path:
+    return isolated_home / "shop" / "worktrees" / "feat-cart"
+
+
+def test_down_keeps_a_wt_folder_that_is_not_empty_and_warns(
+    orch, docker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    folder = _wt_folder(isolated_home)
+    (folder / "notes.txt").write_text("mine")
+    (folder / "a-dir").mkdir()
+    logs = _logged(o)
+    assert o.down("feat/cart") is True
+    assert (folder / "notes.txt").read_text() == "mine"
+    assert not (folder / "api").exists()
+    assert f"[yellow]warning:[/] kept {folder}: not empty (a-dir, notes.txt)" in logs
+
+
+def test_the_not_empty_warning_lists_five_entries_then_an_ellipsis(
+    orch, docker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    folder = _wt_folder(isolated_home)
+    for name in "gfedcba":
+        (folder / name).write_text("")
+    logs = _logged(o)
+    o.remove("feat/cart")
+    assert f"[yellow]warning:[/] kept {folder}: not empty (a, b, c, d, e, …)" in logs
+
+
+def test_an_empty_wt_folder_is_removed_without_a_warning(orch, docker, isolated_home: Path):
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    o.down("feat/cart")
+    assert not _wt_folder(isolated_home).exists()
+    assert not any("kept" in m for m in logs)
+
+
+# ---- prune (SPEC §35) ----------------------------------------------------------------------------
+
+
+def _foreign_branch(project: str, branch: str, compose_project: str | None = None) -> None:
+    """A branch in the state of another project, as `wt up` there would leave it."""
+    projects = {"api": compose_project} if compose_project else {}
+    with StateStore(project).edit() as st:
+        st.branches[branch] = BranchState(
+            branch=branch, slug=naming.slugify(branch), compose_projects=projects
+        )
+
+
+def _touch(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    return path
+
+
+def _kinds(items: list[PruneItem], kind: str) -> list[PruneItem]:
+    return [item for item in items if item.kind == kind]
+
+
+def test_prune_of_a_clean_project_finds_nothing(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert o.prune() == []
+
+
+def test_prune_drops_a_worktree_entry_whose_folder_is_gone(orch, docker, tmp_path: Path) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    stale = tmp_path / "stale-tree"
+    git_run(repo, "worktree", "add", "-q", "-b", "feat/stale", str(stale))
+    shutil.rmtree(stale)
+    items = o.prune()
+    refs = _kinds(items, "worktree_ref")
+    assert len(refs) == 1 and "stale-tree" in refs[0].target
+    assert (refs[0].repo, refs[0].done, refs[0].note) == ("api", True, None)
+    assert "stale-tree" not in git_run(repo, "worktree", "list")
+
+
+def test_prune_keeps_a_live_worktree_entry(orch, docker: FakeDocker, tmp_path: Path) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert _kinds(o.prune(), "worktree_ref") == []
+    assert "feat-cart" in git_run(tmp_path / "shop-api", "worktree", "list")
+
+
+def test_prune_dry_run_skips_the_worktree_entries_it_cannot_preview(
+    orch, docker, tmp_path: Path
+) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    stale = tmp_path / "stale-tree"
+    git_run(repo, "worktree", "add", "-q", "-b", "feat/stale", str(stale))
+    shutil.rmtree(stale)
+    assert o.prune(dry_run=True) == []
+    assert "stale-tree" in git_run(repo, "worktree", "list")
+
+
+def test_prune_removes_stale_remote_refs_and_the_merged_branches_they_leave_behind(
+    orch, docker, make_repo, tmp_path: Path
+) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    bare = _origin(make_repo, tmp_path, repo)
+    git_run(repo, "branch", "feat/old")
+    git_run(repo, "push", "-q", "-u", "origin", "feat/old")
+    git_run(bare, "branch", "-q", "-D", "feat/old")  # deleted on the remote by somebody else
+    items = o.prune()
+    assert [(i.kind, i.target, i.repo, i.done) for i in items] == [
+        ("remote_ref", "origin/feat/old", "api", True),
+        ("branch", "feat/old", "api", True),
+    ]
+    assert "feat/old" not in _branches(repo)
+    assert "origin/feat/old" not in git_run(repo, "branch", "-r")
+
+
+def test_prune_keeps_a_branch_that_is_not_merged(orch, docker, make_repo, tmp_path: Path) -> None:
+    o = orch()
+    repo = tmp_path / "shop-api"
+    bare = _origin(make_repo, tmp_path, repo)
+    git_run(repo, "checkout", "-q", "-b", "feat/wip")
+    git_run(repo, "commit", "-q", "--allow-empty", "-m", "wip")
+    git_run(repo, "push", "-q", "-u", "origin", "feat/wip")
+    git_run(repo, "checkout", "-q", "main")
+    git_run(bare, "branch", "-q", "-D", "feat/wip")
+    assert _kinds(o.prune(), "branch") == []
+    assert "feat/wip" in _branches(repo)
+
+
+@dataclass
+class GoneBranches:
+    """What git reports as merged with a gone upstream; deletes are recorded, not run."""
+
+    names: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
+
+
+@pytest.fixture
+def gone(monkeypatch: pytest.MonkeyPatch) -> GoneBranches:
+    fake = GoneBranches()
+    monkeypatch.setattr(git, "prune_remote_refs", lambda repo: [])
+    monkeypatch.setattr(git, "gone_merged_branches", lambda repo: list(fake.names))
+    monkeypatch.setattr(git, "delete_branch_safe", lambda repo, branch: fake.deleted.append(branch))
+    return fake
+
+
+def test_prune_never_deletes_a_live_protected_or_foreign_project_branch(
+    orch, docker, gone: GoneBranches
+) -> None:
+    o = orch()
+    o.add("feat/live", uses=selection(o))
+    _foreign_branch("shop-admin", "feat/admin")
+    gone.names += ["feat/live", "feat/admin", "main", "feat/old"]
+    items = _kinds(o.prune(), "branch")
+    assert [(i.target, i.done) for i in items] == [("feat/old", True)]
+    assert gone.deleted == ["feat/old"]
+
+
+def test_prune_dry_run_lists_the_branches_without_deleting(
+    orch, docker, gone: GoneBranches
+) -> None:
+    o = orch()
+    gone.names += ["feat/old"]
+    items = o.prune(dry_run=True)
+    assert items == [PruneItem("branch", "feat/old", "api", False, None)]
+    assert gone.deleted == []
+
+
+def test_a_refused_branch_delete_is_a_note_and_the_next_one_goes_on(
+    orch, docker, gone: GoneBranches, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deleted: list[str] = []
+
+    def delete(repo: Path, branch: str) -> None:
+        if branch == "feat/a":
+            raise WtError("not fully merged")
+        deleted.append(branch)
+
+    monkeypatch.setattr(git, "delete_branch_safe", delete)
+    gone.names += ["feat/a", "feat/b"]
+    items = orch().prune()
+    assert [(i.target, i.done, i.note) for i in items] == [
+        ("feat/a", False, "not fully merged"),
+        ("feat/b", True, None),
+    ]
+    assert deleted == ["feat/b"]
+
+
+def test_a_failed_fetch_is_a_note_and_skips_the_git_items_of_that_repo(
+    orch, docker, gone: GoneBranches, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fetch(repo: Path) -> list[str]:
+        raise WtError("could not read from remote")
+
+    monkeypatch.setattr(git, "prune_remote_refs", fetch)
+    gone.names += ["feat/old"]
+    o = orch()
+    _touch(router.dynamic_dir() / "shop--old.yml")
+    items = o.prune()
+    assert PruneItem("remote_ref", "origin", "api", False, "could not read from remote") in items
+    assert _kinds(items, "branch") == []
+    assert gone.deleted == []
+    assert _kinds(items, "file") != []  # the other kinds still ran
+
+
+def test_prune_removes_orphan_compose_projects_and_their_images(orch, docker: FakeDocker) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    docker.projects |= {
+        "wt-shop-feat-cart-api",  # live
+        "wt-shop-old-api",
+        "wt-shop-admin-feat-x-api",  # a live branch of the project shop-admin
+        "wt-blog-old-api",  # another project
+    }
+    _foreign_branch("shop-admin", "feat/x", "wt-shop-admin-feat-x-api")
+    docker.images["wt-shop-old-api"] = ["img1", "img2"]
+    items = o.prune()
+    assert [(i.kind, i.target, i.repo, i.done) for i in items] == [
+        ("compose", "wt-shop-old-api", None, True),
+        ("image", "img1", None, True),
+        ("image", "img2", None, True),
+    ]
+    assert docker.downs == ["wt-shop-old-api"]
+
+
+def test_prune_keeps_the_compose_project_of_a_branch_that_only_has_a_worktree(
+    orch, docker: FakeDocker
+) -> None:
+    o = orch()
+    o.add("feat/cart", uses=selection(o))  # no compose project recorded yet
+    docker.projects.add("wt-shop-feat-cart-api")
+    assert o.prune() == []
+
+
+def test_prune_dry_run_lists_only_the_compose_project(orch, docker: FakeDocker) -> None:
+    docker.projects.add("wt-shop-old-api")
+    docker.images["wt-shop-old-api"] = ["img1"]
+    items = orch().prune(dry_run=True)
+    assert items == [PruneItem("compose", "wt-shop-old-api", None, False, None)]
+    assert docker.downs == [] and docker.image_removals == []
+
+
+def test_a_failed_compose_down_is_a_note_skips_its_images_and_the_next_one_goes_on(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def down(project: str) -> None:
+        if project == "wt-shop-a-api":
+            raise WtError("daemon busy")
+        docker.downs.append(project)
+
+    monkeypatch.setattr(compose, "down", down)
+    docker.projects |= {"wt-shop-a-api", "wt-shop-b-api"}
+    docker.images["wt-shop-b-api"] = ["img"]
+    items = orch().prune()
+    assert [(i.kind, i.target, i.done, i.note) for i in items] == [
+        ("compose", "wt-shop-a-api", False, "daemon busy"),
+        ("compose", "wt-shop-b-api", True, None),
+        ("image", "img", True, None),
+    ]
+    assert docker.image_removals == ["wt-shop-b-api"]
+
+
+def test_a_failure_listing_docker_projects_is_one_item_and_the_files_still_go(
+    orch, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(prefix: str) -> set[str]:
+        raise WtError("docker not running")
+
+    monkeypatch.setattr(compose, "wt_projects", broken)
+    _touch(router.dynamic_dir() / "shop--old.yml")
+    items = orch().prune()
+    assert PruneItem("compose", "wt-shop-", None, False, "docker not running") in items
+    assert [i.target for i in _kinds(items, "file")] == [
+        str(router.dynamic_dir() / "shop--old.yml")
+    ]
+
+
+def test_a_failed_image_removal_is_an_item_with_a_note(orch, docker: FakeDocker) -> None:
+    docker.projects.add("wt-shop-old-api")
+    docker.fail_images = True
+    items = orch().prune()
+    assert [(i.kind, i.done, i.note) for i in items] == [
+        ("compose", True, None),
+        ("image", False, "image rm failed"),
+    ]
+
+
+def test_prune_removes_the_files_of_no_live_branch(orch, docker, isolated_home: Path) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    routes, certs = router.dynamic_dir(), router.certs_dir()
+    orphans = [
+        _touch(routes / "shop--old.yml"),
+        _touch(certs / "shop--old.pem"),
+        _touch(certs / "shop--old-key.pem"),
+        _touch(certs / "shop--old.hosts"),
+        _touch(isolated_home / "shop" / "branches" / "old" / "api.log"),
+    ]
+    kept = [
+        routes / "shop--feat-cart.yml",
+        _touch(certs / "shop--feat-cart.pem"),
+        _touch(certs / "shop--feat-cart-key.pem"),
+        _touch(routes / "shop-admin--feat-x.yml"),  # another project
+        _touch(routes / "shop-admin--old.yml"),
+        _touch(isolated_home / "shop" / "branches" / "feat-cart" / "api.log"),
+    ]
+    items = o.prune()
+    assert sorted(i.target for i in _kinds(items, "file")) == sorted(
+        [str(p) for p in orphans[:4]] + [str(isolated_home / "shop" / "branches" / "old")]
+    )
+    assert all(i.done and i.repo is None for i in _kinds(items, "file"))
+    assert not any(p.exists() for p in orphans)
+    assert all(p.exists() for p in kept)
+
+
+def test_prune_keeps_the_files_of_a_branch_of_another_project_with_a_similar_prefix(
+    orch, docker, isolated_home: Path
+) -> None:
+    o = orch()
+    _foreign_branch("shop--admin", "feat/x")  # its route file starts with `shop--`
+    mine = _touch(router.dynamic_dir() / "shop--admin--feat-x.yml")
+    assert o.prune() == []
+    assert mine.exists()
+
+
+def test_prune_dry_run_changes_nothing_and_reports_every_item_not_done(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = orch()
+    docker.projects.add("wt-shop-old-api")
+    route = _touch(router.dynamic_dir() / "shop--old.yml")
+    state_dir = _touch(isolated_home / "shop" / "branches" / "old" / "x.log").parent
+    items = o.prune(dry_run=True)
+    assert {(i.kind, i.target) for i in items} == {
+        ("compose", "wt-shop-old-api"),
+        ("file", str(route)),
+        ("file", str(state_dir)),
+    }
+    assert not any(i.done or i.note for i in items)
+    assert route.exists() and state_dir.exists() and docker.downs == []
+    assert o.prune() != []  # the same items are real afterwards
+    assert not route.exists()
+
+
+def test_a_file_that_cannot_be_deleted_is_a_note_and_the_next_one_goes_on(
+    orch, docker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _touch(router.dynamic_dir() / "shop--a.yml")
+    second = _touch(router.dynamic_dir() / "shop--b.yml")
+    real = orchestrator._delete_path
+
+    def delete(path: Path) -> None:
+        if path == first:
+            raise PermissionError("denied")
+        real(path)
+
+    monkeypatch.setattr(orchestrator, "_delete_path", delete)
+    items = orch().prune()
+    assert [(i.target, i.done) for i in items] == [(str(first), False), (str(second), True)]
+    assert "denied" in (items[0].note or "")
+    assert first.exists() and not second.exists()
+
+
+def test_remove_ends_with_a_prune_of_the_project(orch, docker, remote) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    leftover = _touch(router.dynamic_dir() / "shop--old.yml")
+    result = o.remove("feat/cart")
+    assert result.pruned == [PruneItem("file", str(leftover), None, True, None)]
+    assert not leftover.exists()
+
+
+def test_a_prune_that_raises_is_a_note_and_remove_still_succeeds(
+    orch, docker, remote, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def broken(self: Orchestrator, *, dry_run: bool = False) -> list[PruneItem]:
+        raise WtError("boom")
+
+    monkeypatch.setattr(Orchestrator, "prune", broken)
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.removed is True and result.pruned == []
+    assert "[yellow]note:[/] prune failed: boom" in logs
+    assert "feat/cart" not in _branches(tmp_path / "shop-api")
+
+
+def test_a_remove_of_the_only_branch_still_prunes_its_project(orch, docker, remote) -> None:
+    o = orch()  # after the remove the project has no branch left, so it is no "known project"
+    o.up("feat/cart", uses=selection(o))
+    docker.projects.add("wt-shop-feat-cart-api")
+    result = o.remove("feat/cart")
+    assert [i.target for i in result.pruned] == ["wt-shop-feat-cart-api"]
+
+
+def _second_project(make_repo, tmp_path: Path) -> Orchestrator:
+    make_repo("blog-api", {"docker-compose.yml": COMPOSE})
+    catalog = {
+        "project": "blog",
+        "domain": "blog.localhost",
+        "repos": {"api": "../blog-api"},
+        "services": {
+            "api": {"repo": "api", "compose": "docker-compose.yml", "port": 80, "subdomain": "api"}
+        },
+    }
+    folder = tmp_path / "blog-catalog"
+    folder.mkdir()
+    return Orchestrator(write_global_catalog(folder, catalog, uses=["api"]), log=lambda m: None)
+
+
+def _corrupt_state(project: str) -> Path:
+    path = StateStore(project).path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{nope")
+    return path
+
+
+def test_prune_refuses_when_another_projects_state_is_unreadable(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    docker.projects.add("wt-shop-admin-feat-x-api")  # could be a live branch of `shop-admin`
+    leftover = _touch(router.dynamic_dir() / "shop--old.yml")
+    path = _corrupt_state("shop-admin")
+    with pytest.raises(WtError, match="cannot prune: state of shop-admin is unreadable") as caught:
+        o.prune()
+    assert str(path) in str(caught.value)
+    assert leftover.exists()
+    assert "wt-shop-admin-feat-x-api" in docker.projects
+
+
+def test_remove_notes_a_prune_refused_for_an_unreadable_state_and_still_succeeds(
+    orch, docker: FakeDocker, remote, tmp_path: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    _corrupt_state("shop-admin")
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.removed is True and result.pruned == []
+    assert any(
+        m.startswith("[yellow]note:[/] prune failed: cannot prune: state of shop-admin")
+        for m in logs
+    )
+    assert "feat/cart" not in _branches(tmp_path / "shop-api")
+
+
+def test_prune_all_prunes_every_known_project_and_lists_each_orphan_once(
+    orch, docker: FakeDocker, make_repo, tmp_path: Path
+) -> None:
+    shop = orch()
+    shop.up("feat/cart", uses=selection(shop))
+    blog = _second_project(make_repo, tmp_path)
+    blog.up("feat/post", uses=["api"])
+    old_shop = _touch(router.dynamic_dir() / "shop--old.yml")
+    old_blog = _touch(router.dynamic_dir() / "blog--old.yml")
+    live = router.dynamic_dir() / "blog--feat-post.yml"
+    docker.projects.add("wt-shop-old-api")
+    dry = prune_all(dry_run=True, log=lambda m: None)
+    assert not any(i.done for i in dry) and old_shop.exists() and old_blog.exists()
+    items = prune_all(log=lambda m: None)
+    assert sorted((i.kind, i.target) for i in items) == sorted(
+        [("compose", "wt-shop-old-api"), ("file", str(old_shop)), ("file", str(old_blog))]
+    )
+    assert live.exists() and not old_shop.exists() and not old_blog.exists()
+
+
+def test_prune_all_notes_a_project_that_cannot_load_and_goes_on(
+    orch, docker: FakeDocker, make_repo, tmp_path: Path
+) -> None:
+    shop = orch()
+    shop.up("feat/cart", uses=selection(shop))
+    blog = _second_project(make_repo, tmp_path)
+    blog.up("feat/post", uses=["api"])
+    blog.loaded.path.unlink()
+    old = _touch(router.dynamic_dir() / "shop--old.yml")
+    logs: list[str] = []
+    items = prune_all(log=logs.append)
+    assert [i.target for i in items] == [str(old)]
+    assert any("prune skipped blog" in m for m in logs)
+
+
+def test_prune_of_a_branch_with_a_slash_keeps_its_files(orch, docker, isolated_home: Path):
+    o = orch()
+    o.up("feat/deep/cart", uses=selection(o))
+    assert o.prune() == []
+    assert (router.dynamic_dir() / "shop--feat-deep-cart.yml").exists()

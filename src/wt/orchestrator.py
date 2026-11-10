@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,12 +29,13 @@ from wt import (
     tls,
 )
 from wt import providers as registry
-from wt.catalog import CatalogService, load_catalog
+from wt.catalog import CatalogService, load_catalog, load_project
 from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
 from wt.messages import no_services_message
 from wt.naming import Names
-from wt.paths import project_dir
+from wt.paths import instance, project_dir
+from wt.projects import known_projects, scan_projects
 from wt.providers import postgres
 from wt.providers.base import BranchContext, Kind, Provider
 from wt.state import (
@@ -57,6 +59,9 @@ _REASON_TAIL_CHARS = _REASON_MAX_CHARS - _REASON_HEAD_CHARS - len(_REASON_ELLIPS
 _NOT_RUNNING_STATUSES = ("stopped", "removing")
 DBEAVER_HOST = "127.0.0.1"  # the shared Postgres publishes on loopback only
 ROUTE_WAIT_SECONDS = 5  # the default wait of router.wait_unrouted
+FOLDER_LISTED_ENTRIES = 5  # entries named in the "kept <folder>: not empty" warning
+NOT_MERGED_REASON = "not merged into {base}"  # base: origin's default branch, e.g. origin/main
+NO_ORIGIN_REASON = "no origin"
 
 Log = Callable[[str], None]
 Outcome = Literal["ok", "fail", "skipped"]
@@ -114,6 +119,59 @@ class BranchStatus:
     docker_ok: bool = True
     # True when wt created none of its worktrees: the repos' own checkout (e.g. main)
     main_checkout: bool = False
+
+
+@dataclass(frozen=True)
+class RemoteResult:
+    """What `remove` did about the remote copy of the branch in one repo (SPEC §35)."""
+
+    repo: str
+    branch: str
+    deleted: bool
+    reason: str | None  # why it was kept (or, when deleted, why its origin/<branch> ref stayed)
+
+
+PruneKind = Literal["branch", "remote_ref", "compose", "image", "file", "worktree_ref"]
+
+
+@dataclass(frozen=True)
+class PruneItem:
+    """One orphan `prune` found. `done` is False on a dry run and on a failure."""
+
+    kind: PruneKind
+    target: str  # branch name, compose project, image id, or file path
+    repo: str | None  # for branch / remote_ref / worktree_ref, else None
+    done: bool
+    note: str | None  # failure reason, else None
+
+
+@dataclass(frozen=True)
+class RemoveResult:
+    """The outcome of `remove`; truthy when state or a git branch was removed."""
+
+    removed: bool
+    remote: list[RemoteResult] = field(default_factory=list)
+    pruned: list[PruneItem] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return self.removed
+
+
+@dataclass(frozen=True)
+class _Live:
+    """What belongs to a branch in the state of any known project: prune never touches it."""
+
+    branches: frozenset[str]
+    compose_projects: frozenset[str]
+    files: frozenset[Path]  # route and certificate files
+    slugs: frozenset[str]  # slugs of the pruned project's own branches
+
+
+@dataclass(frozen=True)
+class _DeleteOutcome:
+    found: int  # repos that had the branch
+    deleted: dict[str, Path]  # repo -> main folder, where the local branch was deleted
+    failures: dict[str, str]  # repo -> why its branch could not be deleted
 
 
 def _kind(svc: Service) -> Literal["compose", "run"]:
@@ -721,8 +779,19 @@ class Orchestrator:
             self.log(f"compose down [bold]{target}[/]")
             if volumes:
                 compose.down(target)
+                self._remove_images(target)
             else:
                 compose.down_keep_volumes(target)
+
+    def _remove_images(self, project: str) -> None:
+        """The images `compose down --rmi local` could not reach; a failure is only a note."""
+        try:
+            removed = compose.remove_images(project)
+        except WtError as exc:
+            self.log(f"[yellow]note:[/] images of {project} not removed: {_short_reason(exc)}")
+            return
+        if removed:
+            self.log(f"removed {len(removed)} image(s) of {project}")
 
     def _remove_routes(self, names: Names, bs: BranchState | None) -> None:
         """Delete the route files, then wait until Traefik stops answering for their hosts.
@@ -1290,11 +1359,13 @@ class Orchestrator:
         self._sync_dbeaver_quietly()
         return True
 
-    def remove(self, branch: str, *, force: bool = False) -> bool:
+    def remove(self, branch: str, *, force: bool = False) -> RemoveResult:
         """`down`, then delete the git branch in every repo, except protected ones.
 
         Also works after `down` (the branch is no longer in state). The branch is looked up in
-        every repo of the catalog. True when state or a git branch was removed.
+        every repo of the catalog. Where the local branch was deleted, the remote one goes too
+        when it is merged (§35). Ends with a prune of the project; a prune failure is a note.
+        The result is truthy when state or a git branch was removed.
         """
         if (other := self._for(branch)) is not self:
             return other.remove(branch, force=force)
@@ -1303,12 +1374,18 @@ class Orchestrator:
             known = recorded is not None
             # The stack of this orchestrator knows only some repos; the branch may be in any.
             sources = {**self._catalog_repo_paths(), **(recorded or {})}
-            found, deleted = self._delete_branch_in_repos(branch, sources)
-            if not known and not found:
+            outcome = self._delete_branch_in_repos(branch, sources)
+            if not known and not outcome.found:
                 self._log_nothing_to_remove(branch)
+        # Network calls run outside the lock: a slow origin must not block the branch.
+        remote = [
+            self._remove_remote_branch(repo, branch, source)
+            for repo, source in outcome.deleted.items()
+        ]
+        _raise_delete_failures(branch, outcome.failures)
         if known:
             self._sync_dbeaver_quietly()
-        return known or deleted > 0
+        return RemoveResult(known or bool(outcome.deleted), remote, self._prune_quietly())
 
     def _catalog_repo_paths(self) -> dict[str, Path]:
         """Every repo of the catalog (not only those of the selected services) -> its folder."""
@@ -1317,13 +1394,14 @@ class Orchestrator:
     def _log_nothing_to_remove(self, branch: str) -> None:
         self.log(f"branch {branch} not found; nothing to remove")
 
-    def _delete_branch_in_repos(self, branch: str, sources: dict[str, Path]) -> tuple[int, int]:
-        """Delete `branch` where it exists unless protected; returns (repos having it, deleted).
+    def _delete_branch_in_repos(self, branch: str, sources: dict[str, Path]) -> _DeleteOutcome:
+        """Delete `branch` where it exists unless protected.
 
         A repo that fails (missing folder, not a git repo, refused delete) is logged and does not
-        stop the others; once all were tried, one error lists the failed repos.
+        stop the others; the caller raises once for all of them (`_raise_delete_failures`).
         """
-        found = deleted = 0
+        found = 0
+        deleted: dict[str, Path] = {}
         failures: dict[str, str] = {}
         for repo, source in sources.items():
             try:
@@ -1335,13 +1413,18 @@ class Orchestrator:
                 )
                 continue
             found += outcome != "absent"
-            deleted += outcome == "deleted"
-        if failures:
-            listed = "; ".join(f"{repo!r} ({reason})" for repo, reason in failures.items())
-            raise WtError(
-                f"could not delete branch {branch!r} in {len(failures)} repo(s): {listed}"
-            )
-        return found, deleted
+            if outcome == "deleted":
+                deleted[repo] = source
+        return _DeleteOutcome(found, deleted, failures)
+
+    def _remove_remote_branch(self, repo: str, branch: str, source: Path) -> RemoteResult:
+        result = _remote_cleanup(repo, branch, source)
+        self.log(_remote_note(result))
+        return result
+
+    def _protected_base_branch(self) -> str:
+        pg = self.cfg.shared.postgres
+        return pg.base_branch if pg is not None else "main"
 
     def _delete_branch_in_repo(
         self, branch: str, repo: str, source: Path
@@ -1349,8 +1432,7 @@ class Orchestrator:
         git.check_repo(source)
         if not git.branch_exists(source, branch):
             return "absent"
-        pg = self.cfg.shared.postgres
-        if branch == (pg.base_branch if pg is not None else "main"):
+        if branch == self._protected_base_branch():
             self.log(f"keeping branch {branch!r} in repo {repo!r}: Postgres base branch")
         elif any(t.branch == branch for t in git.list_worktrees(source)):
             self.log(f"keeping branch {branch!r} in repo {repo!r}: checked out elsewhere")
@@ -1421,7 +1503,7 @@ class Orchestrator:
             self.log(f"removing worktree {path}")
             git.remove_worktree(source, path, force=force)
         for slug_dir in {self._slug_dir(names), *(path.parent for _, path in removals)}:
-            _remove_if_empty(slug_dir)
+            self._remove_wt_folder(slug_dir)
 
         with ports_lock():
             with self.store.edit() as state:
@@ -1430,6 +1512,18 @@ class Orchestrator:
         sources = {r: self.loaded.repo_path(r) for r in self.cfg.repos}
         sources.update({r: Path(s.source) for r, s in (bs.repos if bs else {}).items()})
         return sources
+
+    def _remove_wt_folder(self, folder: Path) -> None:
+        """Remove `folder` when empty; a folder holding anything stays, with a warning."""
+        if not folder.is_dir():
+            return
+        entries = sorted(entry.name for entry in folder.iterdir())
+        if not entries:
+            folder.rmdir()
+            return
+        listed = ", ".join(entries[:FOLDER_LISTED_ENTRIES])
+        more = ", …" if len(entries) > FOLDER_LISTED_ENTRIES else ""
+        self.log(f"[yellow]warning:[/] kept {folder}: not empty ({listed}{more})")
 
     def _is_removable(self, recorded: RepoState) -> bool:
         """False when the record is the repo's own folder: git refuses it, so wt must not try."""
@@ -1494,6 +1588,152 @@ class Orchestrator:
                 f"{name}: could not clean branch {branch} ({_short_reason(exc)}). "
                 f"Try `wt doctor --fix`, then `wt down {branch}` again."
             ) from exc
+
+    # ---- prune (SPEC §35) -----------------------------------------------------------------
+
+    def prune(self, *, dry_run: bool = False) -> list[PruneItem]:
+        """Find (and unless `dry_run`, clean) what no live branch owns in this project.
+
+        Each item is tried on its own: a failure goes in the item's `note` and the next one
+        goes on. Never touches the remote. A dry run changes nothing; it cannot preview
+        `worktree_ref` and `remote_ref` (git has no cheap dry form for them), so it skips them.
+        """
+        live = self._live()
+        items: list[PruneItem] = []
+        for repo, source in self._catalog_repo_paths().items():
+            items += self._prune_repo(repo, source, live, dry_run=dry_run)
+        items += self._prune_compose(live, dry_run=dry_run)
+        items += self._prune_files(live, dry_run=dry_run)
+        return items
+
+    def _prune_quietly(self) -> list[PruneItem]:
+        """The prune that ends `remove`: whatever goes wrong is a note, never an error."""
+        try:
+            return self.prune()
+        except (WtError, OSError) as exc:  # a failed cleanup must not undo a successful remove
+            self.log(f"[yellow]note:[/] prune failed: {_short_reason(exc)}")
+            return []
+
+    def _live(self) -> _Live:
+        """Every branch of every known project, plus this one even when it has none left.
+
+        `shop` and `shop-admin` share the compose prefix `wt-shop-`, so a branch of another
+        project must count as live too; a project whose state cannot be read stops the prune,
+        since its branches would look orphaned.
+        """
+        states = {self.cfg.project: self.store.load()}
+        scan = scan_projects()
+        if scan.unreadable:
+            bad = scan.unreadable[0]
+            raise WtError(f"cannot prune: state of {bad.name} is unreadable: {bad.reason}")
+        for known in scan.known:
+            if known.name not in states:
+                states[known.name] = StateStore(known.name).load()
+        own_repos = set(self._catalog_repo_paths())
+        branches: set[str] = set()
+        projects: set[str] = set()
+        files: set[Path] = set()
+        for project, state in states.items():
+            for branch, bs in state.branches.items():
+                names = Names(project, branch, self.cfg.domain)
+                repos = set(bs.repos) | (own_repos if project == self.cfg.project else set())
+                branches.add(branch)
+                projects |= set(bs.compose_projects.values())
+                projects |= {names.compose_project(repo) for repo in repos}
+                files |= _branch_files(names, bs)
+        slugs = {bs.slug for bs in states[self.cfg.project].branches.values()}
+        return _Live(frozenset(branches), frozenset(projects), frozenset(files), frozenset(slugs))
+
+    def _prune_repo(
+        self, repo: str, source: Path, live: _Live, *, dry_run: bool
+    ) -> list[PruneItem]:
+        """Worktree entries, stale `origin/*` refs, then merged branches whose upstream is gone.
+
+        The fetch comes first because it is what makes an upstream `[gone]`. A failed fetch skips
+        the branches of the repo: they could not be told apart from live work.
+        """
+        if dry_run:
+            return self._prune_branches(repo, source, live, dry_run=True)
+        items = self._prune_worktree_refs(repo, source)
+        refs, fetched = self._prune_remote_refs(repo, source)
+        if fetched:
+            refs += self._prune_branches(repo, source, live, dry_run=False)
+        return items + refs
+
+    def _prune_worktree_refs(self, repo: str, source: Path) -> list[PruneItem]:
+        try:
+            lines = git.prune_worktrees(source)
+        except (WtError, OSError) as exc:
+            return [PruneItem("worktree_ref", "worktrees", repo, False, _short_reason(exc))]
+        return [PruneItem("worktree_ref", line, repo, True, None) for line in lines]
+
+    def _prune_remote_refs(self, repo: str, source: Path) -> tuple[list[PruneItem], bool]:
+        try:
+            refs = git.prune_remote_refs(source)
+        except (WtError, OSError) as exc:
+            return [PruneItem("remote_ref", "origin", repo, False, _short_reason(exc))], False
+        return [PruneItem("remote_ref", ref, repo, True, None) for ref in refs], True
+
+    def _prune_branches(
+        self, repo: str, source: Path, live: _Live, *, dry_run: bool
+    ) -> list[PruneItem]:
+        try:
+            gone = git.gone_merged_branches(source)
+        except (WtError, OSError) as exc:
+            return [PruneItem("branch", "branches", repo, False, _short_reason(exc))]
+        protected = self._protected_base_branch()
+        return [
+            _attempt(
+                "branch", branch, repo, partial(git.delete_branch_safe, source, branch), dry_run
+            )
+            for branch in gone
+            if branch not in live.branches and branch != protected
+        ]
+
+    def _prune_compose(self, live: _Live, *, dry_run: bool) -> list[PruneItem]:
+        prefix = f"{instance()}-{self.cfg.project}-"
+        try:
+            orphans = sorted(compose.wt_projects(prefix) - live.compose_projects)
+        except (WtError, OSError) as exc:
+            return [PruneItem("compose", prefix, None, False, _short_reason(exc))]
+        items: list[PruneItem] = []
+        for project in orphans:
+            down = _attempt("compose", project, None, partial(compose.down, project), dry_run)
+            items.append(down)
+            # Images of a project whose containers could not be removed would only fail too.
+            if down.done:
+                items += self._prune_images(project)
+        return items
+
+    def _prune_images(self, project: str) -> list[PruneItem]:
+        try:
+            ids = compose.remove_images(project)
+        except (WtError, OSError) as exc:
+            return [PruneItem("image", project, None, False, _short_reason(exc))]
+        return [PruneItem("image", image, None, True, None) for image in ids]
+
+    def _prune_files(self, live: _Live, *, dry_run: bool) -> list[PruneItem]:
+        return [
+            _attempt("file", str(path), None, partial(_delete_path, path), dry_run)
+            for path in self._orphan_files(live)
+        ]
+
+    def _orphan_files(self, live: _Live) -> list[Path]:
+        """Route files, cert files and `branches/<slug>/` folders that no live branch owns."""
+        prefix = f"{self.cfg.project}{router.ROUTE_FILE_SEPARATOR}"
+        routes = [
+            path
+            for path in _children(router.dynamic_dir())
+            if path.suffix in router.ROUTE_FILE_SUFFIXES
+        ]
+        certs = _children(router.certs_dir())
+        owned = [path for path in [*routes, *certs] if path.name.startswith(prefix)]
+        state_dirs = [
+            path
+            for path in _children(project_dir(self.cfg.project) / "branches")
+            if path.name not in live.slugs
+        ]
+        return [path for path in owned if path not in live.files] + state_dirs
 
     # ---- ls / logs ------------------------------------------------------------------------
 
@@ -1840,6 +2080,110 @@ def _remove_if_empty(folder: Path) -> None:
     """Never `rmtree`: a folder that holds anything is somebody's and stays."""
     if folder.is_dir() and not any(folder.iterdir()):
         folder.rmdir()
+
+
+def _raise_delete_failures(branch: str, failures: dict[str, str]) -> None:
+    if failures:
+        listed = "; ".join(f"{repo!r} ({reason})" for repo, reason in failures.items())
+        raise WtError(f"could not delete branch {branch!r} in {len(failures)} repo(s): {listed}")
+
+
+def _remote_cleanup(repo: str, branch: str, source: Path) -> RemoteResult:
+    """Delete `origin/<branch>` when it is merged into origin's default branch; else keep it.
+
+    Never raises: a remote that cannot be reached or refuses the push only keeps the branch.
+    """
+    try:
+        check = git.remote_branch_merged(source, branch)
+    except git.FetchError as exc:
+        return RemoteResult(repo, branch, False, f"could not fetch origin: {exc.line}")
+    except WtError as exc:
+        reason = f"could not check origin/{branch}: {_first_line(exc)}"
+        return RemoteResult(repo, branch, False, reason)
+    if check is None:
+        return RemoteResult(repo, branch, False, NO_ORIGIN_REASON)
+    if not check.merged:
+        return RemoteResult(repo, branch, False, NOT_MERGED_REASON.format(base=check.base))
+    try:
+        git.delete_remote_branch(source, branch)
+    except WtError as exc:
+        return RemoteResult(repo, branch, False, f"push failed: {_first_line(exc)}")
+    try:
+        git.drop_remote_ref(source, branch)
+    except WtError as exc:
+        return RemoteResult(
+            repo, branch, True, f"origin/{branch} not forgotten: {_first_line(exc)}"
+        )
+    return RemoteResult(repo, branch, True, None)
+
+
+def _remote_note(result: RemoteResult) -> str:
+    where = f"{result.branch} in {result.repo}"
+    if not result.deleted:
+        return f"kept remote branch {where}: {result.reason}"
+    suffix = f" ({result.reason})" if result.reason else ""
+    return f"deleted remote branch {where}{suffix}"
+
+
+def _first_line(exc: WtError) -> str:
+    """The first non-empty line git wrote to stderr (the message of any other error)."""
+    text = exc.result.stderr if isinstance(exc, proc.CommandError) else str(exc)
+    lines = _non_empty_lines(text) or _non_empty_lines(str(exc))
+    return lines[0] if lines else type(exc).__name__
+
+
+def _branch_files(names: Names, bs: BranchState) -> set[Path]:
+    """The route and certificate files a branch owns, derived and recorded."""
+    cert, key = tls.cert_paths(names)
+    files = {router.route_file(names), cert, key, cert.with_suffix(".hosts")}
+    files |= {Path(path) for path in bs.cert_files}
+    if bs.route_file:
+        files.add(Path(bs.route_file))
+    return files
+
+
+def _children(folder: Path) -> list[Path]:
+    return sorted(folder.iterdir()) if folder.is_dir() else []
+
+
+def _delete_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _attempt(
+    kind: PruneKind, target: str, repo: str | None, action: Callable[[], object], dry_run: bool
+) -> PruneItem:
+    """Run `action` for one prune item; a dry run only reports it, a failure goes in the note."""
+    if dry_run:
+        return PruneItem(kind, target, repo, False, None)
+    try:
+        action()
+    except (WtError, OSError) as exc:
+        return PruneItem(kind, target, repo, False, _short_reason(exc))
+    return PruneItem(kind, target, repo, True, None)
+
+
+def prune_all(*, dry_run: bool = False, log: Log = print) -> list[PruneItem]:
+    """`Orchestrator.prune` over every known project; one that cannot load is only a note.
+
+    The same orphan reached from two projects (they share a compose prefix) is listed once.
+    """
+    items: dict[tuple[PruneKind, str, str | None], PruneItem] = {}
+    for known in known_projects():
+        if known.config_path is None or not known.config_exists:
+            log(f"[yellow]note:[/] prune skipped {known.name}: its config is not available")
+            continue
+        try:
+            found = Orchestrator(load_project(known.config_path), log).prune(dry_run=dry_run)
+        except WtError as exc:
+            log(f"[yellow]note:[/] prune skipped {known.name}: {_short_reason(exc)}")
+            continue
+        for item in found:
+            items.setdefault((item.kind, item.target, item.repo), item)
+    return list(items.values())
 
 
 def _execute_setup(job: SetupJob) -> None:

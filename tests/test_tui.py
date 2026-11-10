@@ -535,8 +535,8 @@ def test_without_a_catalog_a_still_adds_to_the_selected_project() -> None:
 
 REMOVE_QUESTION = (
     "remove feat-a: removes what wt created for it (containers, volumes, databases, "
-    "worktrees) and deletes the git branch in every repo of the project where it exists; "
-    "unpushed commits are lost. Remove? y/N"
+    "worktrees) and deletes the git branch in every repo of the project where it exists, "
+    "and deletes the remote branch when merged; unpushed commits are lost. Remove? y/N"
 )
 
 

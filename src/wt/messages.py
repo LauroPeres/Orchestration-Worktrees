@@ -4,9 +4,10 @@ from collections.abc import Sequence
 
 CONFIRM_REMOVE = (
     "remove {branch}: removes what wt created for it (containers, volumes, databases, "
-    "worktrees) and deletes the git branch in every repo of the project where it exists; "
-    "unpushed commits are lost. Remove? y/N"
+    "worktrees) and deletes the git branch in every repo of the project where it exists, "
+    "and deletes the remote branch when merged; unpushed commits are lost. Remove? y/N"
 )
+CONFIRM_PRUNE = "Prune {count} item(s)? y/N"
 NO_SERVICES_YET = (
     "branch {branch} has no services yet; run wt add {branch} --uses {example} (services: {names})"
 )

@@ -176,6 +176,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.14.0 ✔ (§32) | `wt catalog --json` service rows say each service's `group` (or `null`) |
 | v0.14.1 ✔ (§33) | `up` reuses a wt's repo folder that was switched to another branch |
 | v0.14.2 ✔ (§34) | Merged `.claude` fixes: path and command rules scoped to their repo, skills with unique names |
+| v0.15.0 ✔ (§35) | `remove` cleans everything (merged remote branch, images, a non-empty wt folder warning) and `wt prune` cleans orphans, also run by every `remove` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -577,8 +578,8 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
 | `wt add <branch>` | Pre-flight (as `up`), git worktrees for every repo, reserved ports; state entry with status `stopped`. No containers, databases, routes or certs. Already in state: no-op with a note. | — |
 | `wt up <branch>` | As today. On a `stopped` branch it reuses its worktrees, ports and databases. | — |
 | `wt stop <branch>` | Stops the host processes and runs `docker compose down` (no `-v`) for each compose project of the branch; removes its route file. Status `stopped`. Not in state: error. | worktrees, volumes, databases, ports, cert |
-| `wt down <branch>` | As today (removes everything wt created, keeps the git branch). | git branch |
-| `wt remove <branch> [--force] [--yes]` | Hard delete: everything `down` does, then `git branch -D <branch>` in every repo. Asks for confirmation unless `--yes`. | nothing |
+| `wt down <branch>` | As today (removes everything wt created, including the images Compose built for it (§35), keeps the git branch). | git branch |
+| `wt remove <branch> [--force] [--yes]` | Hard delete: everything `down` does, then `git branch -D <branch>` in every repo, the remote branch when merged (§35), then `wt prune` (§35). Asks for confirmation unless `--yes`. | nothing |
 
 - `remove` never deletes a protected branch: the Postgres `base_branch` (default `main`) and the
   branch checked out in each repo's main folder. It never deletes a branch that is checked out in
@@ -608,7 +609,7 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
   the selected row, or, when the table is empty, the only usable project; with several, `a` says to run
   `wt tui` inside one). `r` = a confirm box (`remove <branch>: removes what wt created for it (containers,
   volumes, databases, worktrees) and deletes the git branch in every repo of the project where it
-  exists; unpushed commits are lost. Remove? y/N`), then `remove` with `--force`. The CLI asks
+  exists, and deletes the remote branch when merged; unpushed commits are lost. Remove? y/N`), then `remove` with `--force`. The CLI asks
   the same question before `wt remove` (unless `--yes`). Arrows select, `q` quits.
 - One action at a time, in a worker thread; keys pressed while busy show a note on the message
   line. The table refreshes every 2 s and after each action.
@@ -1010,6 +1011,7 @@ doctor:  {"schema":1,"ok":true,"checks":[{"name":"docker","ok":true,"detail":"�
 catalog: {"schema":1,"project":"notes","domain":"notes.localhost","services":[{"name":"back","repo":"notes-back",
           "kind":"compose","infra":["postgres"],"consumes":{"back":"API_URL"},"consumed_by":["front"],"remote":null}]}
 actions: {"schema":1,"branch":"feat/x","action":"up","changed":true,"status":"up","urls":{"front":"https://…"},"warnings":[]}
+          (remove adds "remote" and "pruned", and `wt prune --json` has its own document: §35)
 error:   {"schema":1,"error":"<the text the CLI prints>"}      (stdout, exit code 1)
 ```
 `health` is `ok`, `fail` or `null` (not probed). `kind` is `compose` or `run`. The TUI snapshot for agents is `wt ls --json`.
@@ -1522,3 +1524,48 @@ Decided 2026-11-08 after checking the first real merged `.claude` (three repos).
   skill folder is a symlink (kind `link`) to the original, so supporting files stay live. A link that cannot be
   created is copied instead (a note in the report). A wt synced by v0.13.0 has its old folder link (listed in the
   manifest) replaced by the folder.
+
+## 35. v0.15.0: remove cleans everything, `wt prune`
+
+Decided 2026-11-10 with the user. `remove` left behind the branch on GitHub, the local `origin/<branch>` ref,
+the images Compose built for the branch and the leftovers of earlier removes. Amends §16 (`down`, `remove`)
+and §21 (JSON).
+
+- **Remote branch (`remove`).** After the local branch is deleted in a repo, `remove` fetches `origin` (no prune)
+  and, when `origin/<branch>` is an ancestor of `origin/<default>` (`git merge-base --is-ancestor`), runs
+  `git push origin --delete <branch>` and `git branch -dr origin/<branch>`, with the note
+  `deleted remote branch <branch> in <repo>`. Otherwise the remote branch is kept, with the note
+  `kept remote branch <branch> in <repo>: <reason>`, the reason being `not merged into origin/<default>`,
+  `no origin` (no remote or no `origin/<branch>`), `could not fetch origin: <line>` or `push failed: <first stderr line>`;
+  `remove` still succeeds.
+  Protected branches (§16) never touch the remote. Squash merges are not detected (the branch is kept).
+- **Images (`down`, `remove`).** `docker compose down` gains `--rmi local`; then every image of the branch's compose
+  projects is removed too: labelled `com.docker.compose.project=<project>`, or tagged `<project>-<service>` (some
+  Compose versions don't label what they build; pulled images are never touched). This covers images whose
+  containers were already gone. `stop` keeps the images. The next `up` rebuilds them.
+- **The wt folder.** When `wt/<slug>/` is not empty after its worktrees are removed it is kept, with the warning
+  `kept <folder>: not empty (<up to 5 entries>, …)`.
+- **`wt prune [--dry-run] [--yes] [--json]`.** Finds and cleans the orphans of the current project, or of every
+  known project outside one. "Live" means a branch in the state of **any** known project (so `shop` never prunes
+  `shop-admin`). Kinds:
+  - `worktree_ref`: `git worktree prune` in each catalog repo (an item when it removed entries).
+  - `branch`: local branches whose upstream is gone (`[gone]`) and whose tip is in `origin/<default>`, not checked
+    out anywhere, not live and not protected; deleted with `git branch -d`.
+  - `remote_ref`: stale `origin/*` refs, removed by `git fetch --prune origin`.
+  - `compose` / `image`: compose projects named `<instance>-<project>-…` (from container, volume and image labels)
+    that are no live branch's compose project: `docker compose down -v --remove-orphans --rmi local`, then their
+    images (labelled or named as above).
+  - `file`: route files, cert files and `branches/<slug>/` state folders of the project that belong to no live branch.
+  - Prune never touches the remote. Each item is tried on its own: a failure goes in its `note` and the next one
+    goes on; prune fails only when the project cannot load. A fetch failure skips that repo's git items with a note.
+  - It asks `Prune N item(s)? y/N` unless `--yes`; `--dry-run` changes nothing and lists the same items with
+    `done: false`, except `worktree_ref` and `remote_ref`, which git cannot preview without changing them. `--json` needs `--yes` or `--dry-run` (`prune --json never asks for confirmation: pass --yes`).
+  - Text: one line per item `<kind> <repo/>target: removed|would remove|failed: <note>`, then a total.
+  - JSON: `{"schema":1,"action":"prune","dry_run":false,"items":[{"kind":"branch","target":"feat/x",
+    "repo":"notes-back","done":true,"note":null}]}`.
+- **Automatic prune.** Every `remove` ends with a prune of the same project. A prune failure is a yellow note and
+  never fails `remove`.
+- **Remove JSON.** Two new keys, the others unchanged: `"remote":[{"repo":"notes-back","branch":"feat/x",
+  "deleted":true,"reason":null}]` and `"pruned":[<prune items as above>]`.
+- **Confirmation.** The `remove` question (CLI and TUI `r`) adds that it deletes the remote branch when merged.
+- Out of scope: orphan provider slices (databases, topics, keys, clients), `docker builder prune`, a prune timer.

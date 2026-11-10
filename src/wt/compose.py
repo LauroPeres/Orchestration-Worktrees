@@ -122,13 +122,109 @@ def up(  # noqa: PLR0913
 
 
 def down(project: str) -> None:
-    """Stop and remove the project's containers, networks and volumes. No-op if absent."""
-    proc.run(["docker", "compose", "-p", project, "down", "-v", "--remove-orphans"])
+    """Remove the project's containers, networks, volumes and locally built images.
+
+    No-op if absent.
+    """
+    proc.run(
+        ["docker", "compose", "-p", project, "down", "-v", "--remove-orphans", "--rmi", "local"]
+    )
 
 
 def down_keep_volumes(project: str) -> None:
     """Stop and remove the project's containers and networks; volumes stay. No-op if absent."""
     proc.run(["docker", "compose", "-p", project, "down", "--remove-orphans"])
+
+
+PROJECT_LABEL = "com.docker.compose.project"
+
+
+def _image_ids(*label_filters: str) -> list[str]:
+    """Distinct ids of the images carrying every label filter (`key` or `key=value`)."""
+    args = ["docker", "image", "ls", "-q"]
+    for label in label_filters:
+        args += ["--filter", f"label={label}"]
+    return list(dict.fromkeys(proc.run(args, check=False).stdout.split()))
+
+
+@dataclass(frozen=True)
+class _TaggedImage:
+    id: str
+    repository: str
+    tag: str
+
+
+def _images_named_after(project: str) -> list[_TaggedImage]:
+    """Tagged images whose repository is `<project>-<service>`, Compose's default name for the
+    image of a `build:` service. A pulled image (`postgres:16`) never has that name."""
+    image_format = "{{.ID}} {{.Repository}} {{.Tag}}"
+    reference = f"reference={project}-*"
+    args = ["docker", "image", "ls", "--filter", reference, "--format", image_format]
+    images: list[_TaggedImage] = []
+    for line in proc.run(args, check=False).stdout.splitlines():
+        image_id, _, rest = line.strip().partition(" ")
+        repository, _, tag = rest.partition(" ")
+        if repository.startswith(f"{project}-") and tag and tag != "<none>":
+            images.append(_TaggedImage(image_id, repository, tag))
+    return images
+
+
+def _named_by_a_longer_project(repository: str, project: str, others: set[str]) -> bool:
+    """`wt-x-notes-back-api` is not `wt-x-notes`'s image when `wt-x-notes-back` is a project."""
+    return any(
+        repository.startswith(f"{other}-") for other in others if other.startswith(f"{project}-")
+    )
+
+
+def remove_images(project: str) -> list[str]:
+    """Remove the images of the compose project; returns their ids.
+
+    An image is the project's when it is labelled `com.docker.compose.project=<project>` or
+    named `<project>-<service>`: some Compose versions do not label the images they build, and
+    `down -p <project> --rmi local` (without the compose files) leaves those behind. Named
+    images go by `repository:tag`, since an image tagged for two services cannot be removed
+    by id; the labelled ones that have no such name go by id.
+    """
+    labelled = _image_ids(f"{PROJECT_LABEL}={project}")
+    named = _images_named_after(project)
+    if named:
+        others = _project_names() - {project}
+        named = [i for i in named if not _named_by_a_longer_project(i.repository, project, others)]
+    named_ids = {image.id for image in named}
+    targets = [f"{image.repository}:{image.tag}" for image in named]
+    targets += [image_id for image_id in labelled if image_id not in named_ids]
+    if targets:
+        proc.run(["docker", "image", "rm", *targets])
+    return list(dict.fromkeys([*(image.id for image in named), *labelled]))
+
+
+def _lines(args: list[str]) -> set[str]:
+    return {line.strip() for line in proc.run(args, check=False).stdout.splitlines()}
+
+
+def _project_names() -> set[str]:
+    """Every compose project name on the labels of containers, volumes and images."""
+    label_value = f'{{{{.Label "{PROJECT_LABEL}"}}}}'
+    names = _lines(
+        ["docker", "ps", "-a", "--filter", f"label={PROJECT_LABEL}", "--format", label_value]
+    )
+    names |= _lines(
+        ["docker", "volume", "ls", "--filter", f"label={PROJECT_LABEL}", "--format", label_value]
+    )
+    # `docker image ls` cannot print labels: inspect the ids it finds.
+    if image_ids := _image_ids(PROJECT_LABEL):
+        inspect_label = f'{{{{index .Config.Labels "{PROJECT_LABEL}"}}}}'
+        names |= _lines(["docker", "image", "inspect", "--format", inspect_label, *image_ids])
+    return {name for name in names if name}
+
+
+def wt_projects(prefix: str) -> set[str]:
+    """Compose project names starting with `prefix`, from the labels of containers, volumes
+    and images (so a project with only a volume or a labelled image left is found too).
+
+    Image names are not used: `<project>-<service>` cannot be split when both hold hyphens.
+    """
+    return {name for name in _project_names() if name.startswith(prefix)}
 
 
 def remove_service(project: str, service: str) -> None:

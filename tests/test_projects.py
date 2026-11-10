@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from wt.paths import project_dir
-from wt.projects import known_projects
+from wt.projects import known_projects, scan_projects
 from wt.state import BranchState, StateStore
 
 
@@ -42,3 +42,17 @@ def test_missing_config_is_flagged(tmp_path: Path) -> None:
     assert not found["gone"].config_exists
     assert not found["noconfig"].config_exists
     assert found["noconfig"].config_path is None
+
+
+def test_scan_reports_the_unreadable_projects_and_keeps_the_known_ones(tmp_path: Path) -> None:
+    write_state("shop", tmp_path / "w.yaml", ["main"])
+    project_dir("broken").mkdir(parents=True)
+    (project_dir("broken") / "state.json").write_text("{nope")
+    (project_dir("future")).mkdir(parents=True)
+    (project_dir("future") / "state.json").write_text(json.dumps({"version": 99}))
+    (project_dir("postgres")).mkdir(parents=True)  # shared infra: no state.json, not unreadable
+    scan = scan_projects()
+    assert [p.name for p in scan.known] == ["shop"]
+    assert [p.name for p in scan.unreadable] == ["broken", "future"]
+    assert str(project_dir("broken") / "state.json") in scan.unreadable[0].reason
+    assert known_projects() == scan.known
