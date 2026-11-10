@@ -67,7 +67,10 @@ wt add my-branch        # worktrees + reserved ports only, status "stopped"; not
 wt stop my-branch       # stops containers and processes; worktrees, volumes, databases, ports stay
 wt down my-branch       # --force also removes worktrees with uncommitted changes
 wt remove my-branch     # down + deletes the git branch in every repo of the project where it exists
+                        # (and the remote branch when merged into origin), then runs wt prune
                         # (asks first; --yes, --force); also works after a `wt down`
+wt prune --dry-run      # lists leftovers: gone branches, stale refs, orphan stacks, images, files
+wt prune                # cleans them (asks first; --yes)
 ```
 
 When wt has to create a branch (it does not exist locally or on `origin`), it runs `git fetch
