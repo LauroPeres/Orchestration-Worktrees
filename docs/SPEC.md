@@ -1536,7 +1536,8 @@ and §21 (JSON).
   `git push origin --delete <branch>` and `git branch -dr origin/<branch>`, with the note
   `deleted remote branch <branch> in <repo>`. Otherwise the remote branch is kept, with the note
   `kept remote branch <branch> in <repo>: <reason>`, the reason being `not merged into origin/<default>`,
-  `no origin` (no remote or no `origin/<branch>`) or `push failed: <first stderr line>`; `remove` still succeeds.
+  `no origin` (no remote or no `origin/<branch>`), `could not fetch origin: <line>` or `push failed: <first stderr line>`;
+  `remove` still succeeds.
   Protected branches (§16) never touch the remote. Squash merges are not detected (the branch is kept).
 - **Images (`down`, `remove`).** `docker compose down` gains `--rmi local`; then every image labelled
   `com.docker.compose.project=<project>` of the branch's compose projects is removed too (for the images whose
@@ -1557,7 +1558,7 @@ and §21 (JSON).
   - Prune never touches the remote. Each item is tried on its own: a failure goes in its `note` and the next one
     goes on; prune fails only when the project cannot load. A fetch failure skips that repo's git items with a note.
   - It asks `Prune N item(s)? y/N` unless `--yes`; `--dry-run` changes nothing and lists the same items with
-    `done: false`. `--json` needs `--yes` or `--dry-run` (`prune --json never asks for confirmation: pass --yes`).
+    `done: false`, except `worktree_ref` and `remote_ref`, which git cannot preview without changing them. `--json` needs `--yes` or `--dry-run` (`prune --json never asks for confirmation: pass --yes`).
   - Text: one line per item `<kind> <repo/>target: removed|would remove|failed: <note>`, then a total.
   - JSON: `{"schema":1,"action":"prune","dry_run":false,"items":[{"kind":"branch","target":"feat/x",
     "repo":"notes-back","done":true,"note":null}]}`.
