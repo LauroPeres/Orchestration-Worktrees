@@ -59,13 +59,36 @@ def _output(result: subprocess.CompletedProcess[str]) -> str:
     return result.stdout + result.stderr
 
 
+def _project_images(project: str) -> set[str]:
+    """Ids of the project's images, found without relying on image labels.
+
+    Some Compose/buildx versions do not label built images, so the ids come from what the
+    project's containers use, from Compose's `<project>-<service>` naming, and from the label.
+    """
+    label = f"label={PROJECT_LABEL}={project}"
+    containers = _lines(docker("ps", "-a", "-q", "--filter", label))
+    used = _lines(docker("inspect", "--format", "{{.Image}}", *containers)) if containers else []
+    named = _lines(docker("image", "ls", "-q", "--filter", f"reference={project}-*"))
+    labelled = _lines(docker("image", "ls", "-q", "--filter", label))
+    return {_short_id(i) for i in [*used, *named, *labelled]}
+
+
+def _short_id(image_id: str) -> str:
+    return image_id.removeprefix("sha256:")[:12]
+
+
+def _existing(image_ids: set[str]) -> list[str]:
+    """The given image ids that still exist in the daemon."""
+    return sorted(i for i in image_ids if docker("image", "inspect", i).returncode == 0)
+
+
 def _leftovers(project: str) -> dict[str, list[str]]:
-    """Every Docker object labelled with the compose project."""
+    """Every Docker object of the compose project."""
     label = f"label={PROJECT_LABEL}={project}"
     return {
         "containers": _lines(docker("ps", "-a", "-q", "--filter", label)),
         "volumes": _lines(docker("volume", "ls", "-q", "--filter", label)),
-        "images": _lines(docker("image", "ls", "-q", "--filter", label)),
+        "images": sorted(_project_images(project)),
     }
 
 
@@ -196,6 +219,7 @@ def test_remove_leaves_no_container_volume_image_route_cert_branch_or_state(note
     # Prove the test looks at real things before it asserts they are gone.
     before = _leftovers(projects[0])
     assert before["containers"] and before["images"], before
+    built_images = set(before["images"])
     routes = [p for p in router.dynamic_dir().iterdir() if p.name.startswith(key)]
     certs = [p for p in router.certs_dir().iterdir() if p.name.startswith(key)]
     assert routes, list(router.dynamic_dir().iterdir())
@@ -207,6 +231,7 @@ def test_remove_leaves_no_container_volume_image_route_cert_branch_or_state(note
     assert removed["action"] == "remove"
     for project in projects:
         assert _leftovers(project) == {"containers": [], "volumes": [], "images": []}
+    assert _existing(built_images) == []
     assert not any(p.exists() for p in [*routes, *certs])
     assert not state_dir.exists()
     assert branch not in _branches(stack / "notes-back")
@@ -313,7 +338,8 @@ def test_prune_lists_then_removes_orphans_and_keeps_the_live_branch(
     ghost = f"{notes.instance}-{notes.instance}-ghost"
     _ghost(ghost, tmp_path)
     assert _leftovers(ghost)["containers"] and _leftovers(ghost)["volumes"]
-    assert _leftovers(ghost)["images"]
+    ghost_images = _project_images(ghost)
+    assert ghost_images
 
     preview = _json(notes, "prune", "--dry-run")
     items = {(i["kind"], i["target"]): i for i in preview["items"]}
@@ -334,6 +360,7 @@ def test_prune_lists_then_removes_orphans_and_keeps_the_live_branch(
     assert all(i["done"] for i in done["items"]), [i for i in done["items"] if not i["done"]]
     assert "feat/gone" not in _branches(back)
     assert _leftovers(ghost) == {"containers": [], "volumes": [], "images": []}
+    assert _existing(ghost_images) == []
     assert "feat/live" in _branches(back)
     assert set(_leftovers(live_project)["containers"]) == set(live_containers)
     assert notes.branch("feat/live")["status"] == "up"
