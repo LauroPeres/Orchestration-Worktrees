@@ -2,6 +2,7 @@ import copy
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,15 @@ from wt.claudegen import ClaudeSyncResult
 from wt.claudemerge import Conflict
 from wt.cli import app
 from wt.errors import WtError
-from wt.orchestrator import BranchStatus, MoveResult, Orchestrator, ServiceReport
+from wt.orchestrator import (
+    BranchStatus,
+    MoveResult,
+    Orchestrator,
+    PruneItem,
+    RemoteResult,
+    RemoveResult,
+    ServiceReport,
+)
 from wt.state import BranchState, StateStore
 
 runner = CliRunner()
@@ -845,12 +854,14 @@ REMOVE_QUESTION = (
 )
 
 
-def _record_removes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool]]:
+def _record_removes(
+    monkeypatch: pytest.MonkeyPatch, result: RemoveResult | None = None
+) -> list[tuple[str, bool]]:
     calls: list[tuple[str, bool]] = []
 
-    def fake_remove(self: Any, branch: str, *, force: bool = False) -> bool:
+    def fake_remove(self: Any, branch: str, *, force: bool = False) -> RemoveResult:
         calls.append((branch, force))
-        return True
+        return result or RemoveResult(removed=True)
 
     monkeypatch.setattr(Orchestrator, "remove", fake_remove)
     return calls
@@ -1743,10 +1754,68 @@ def test_remove_json_with_yes(shop, docker: FakeDocker, monkeypatch: pytest.Monk
     result = runner.invoke(app, ["remove", "feat/cart", "--yes", "--force", "--json"])
     assert result.exit_code == 0, result.output
     document = _document(result)
-    assert list(document) == ACTION_KEYS
+    assert list(document) == [*ACTION_KEYS, "remote", "pruned"]
     assert (document["action"], document["changed"], document["status"]) == ("remove", True, None)
     assert document["urls"] == {}
+    assert (document["remote"], document["pruned"]) == ([], [])
     assert calls == [("feat/cart", True)]
+
+
+def test_remove_json_reports_the_remote_branches_and_the_prune(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _record_removes(
+        monkeypatch,
+        RemoveResult(
+            removed=True,
+            remote=[
+                RemoteResult("shop-api", "feat/cart", True, None),
+                RemoteResult("shop-web", "feat/cart", False, "not merged into origin/main"),
+            ],
+            pruned=[PruneItem("branch", "feat/old", "shop-api", True, None)],
+        ),
+    )
+    result = runner.invoke(app, ["remove", "feat/cart", "--yes", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert document["remote"] == [
+        {"repo": "shop-api", "branch": "feat/cart", "deleted": True, "reason": None},
+        {
+            "repo": "shop-web",
+            "branch": "feat/cart",
+            "deleted": False,
+            "reason": "not merged into origin/main",
+        },
+    ]
+    assert document["pruned"] == [
+        {"kind": "branch", "target": "feat/old", "repo": "shop-api", "done": True, "note": None}
+    ]
+
+
+def test_remove_text_lists_only_pruned_items_that_were_done_or_have_a_note(
+    shop, docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _record_removes(
+        monkeypatch,
+        RemoveResult(
+            removed=True,
+            pruned=[
+                PruneItem("branch", "feat/old", "shop-api", True, None),
+                PruneItem("image", "sha256:abc", None, False, "image is in use"),
+                PruneItem("file", "/tmp/x", None, False, None),
+            ],
+        ),
+    )
+    result = runner.invoke(app, ["remove", "feat/cart", "--yes"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0] == "feat/cart is removed."
+    assert lines[1:] == [
+        "branch shop-api/feat/old: removed",
+        "image sha256:abc: failed: image is in use",
+    ]
 
 
 def test_remove_json_without_yes_is_an_error_and_never_asks(
@@ -2498,3 +2567,149 @@ def test_the_starter_mentions_the_claude_key_as_a_comment(
         in path.read_text()
     )
     assert load_project(path).config.repos
+
+
+# --- wt prune (SPEC §35) ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_prune(shop, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Fake the project and the all-projects prune. `calls` lists (who, dry_run) in order."""
+    shop()
+    state: dict[str, Any] = {"calls": [], "items": []}
+
+    def found(who: str, dry_run: bool) -> list[PruneItem]:
+        state["calls"].append((who, dry_run))
+        return [replace(i, done=not dry_run and i.done) for i in state["items"]]
+
+    def project_prune(self: Any, *, dry_run: bool = False) -> list[PruneItem]:
+        return found("project", dry_run)
+
+    def all_prune(*, dry_run: bool = False, log: Any = print) -> list[PruneItem]:
+        return found("all", dry_run)
+
+    monkeypatch.setattr(Orchestrator, "prune", project_prune)
+    monkeypatch.setattr(cli, "prune_all", all_prune)
+    state["items"] = [
+        PruneItem("branch", "feat/old", "shop-api", True, None),
+        PruneItem("compose", "wt-shop-feat-old", None, True, None),
+    ]
+    return state
+
+
+def test_prune_dry_run_lists_would_remove_and_the_total_without_asking(
+    fake_prune: dict[str, Any],
+) -> None:
+    result = runner.invoke(app, ["prune", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "branch shop-api/feat/old: would remove",
+        "compose wt-shop-feat-old: would remove",
+        "2 item(s) would be removed",
+    ]
+    assert fake_prune["calls"] == [("project", True)]
+
+
+def test_prune_with_nothing_found_says_so_and_never_asks(fake_prune: dict[str, Any]) -> None:
+    fake_prune["items"] = []
+    result = runner.invoke(app, ["prune"])
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "nothing to prune"
+    assert fake_prune["calls"] == [("project", True)]
+
+
+def test_prune_no_answer_changes_nothing(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune"], input="n\n")
+    assert result.exit_code == 1, result.output
+    assert "Prune 2 item(s)? [y/N]" in result.output
+    assert "would remove" in result.output
+    assert fake_prune["calls"] == [("project", True)]
+
+
+def test_prune_yes_answer_runs_for_real_and_shows_the_results(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert fake_prune["calls"] == [("project", True), ("project", False)]
+    assert result.output.splitlines()[-3:] == [
+        "branch shop-api/feat/old: removed",
+        "compose wt-shop-feat-old: removed",
+        "removed 2 of 2 item(s)",
+    ]
+
+
+def test_prune_yes_flag_runs_for_real_without_asking(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "[y/N]" not in result.output
+    assert fake_prune["calls"] == [("project", False)]
+    assert "removed 2 of 2 item(s)" in result.output
+
+
+def test_prune_prints_a_failed_item_with_its_note_and_counts_it(
+    fake_prune: dict[str, Any],
+) -> None:
+    fake_prune["items"] = [
+        PruneItem("branch", "feat/old", "shop-api", True, None),
+        PruneItem("image", "sha256:abc", None, False, "image is in use"),
+    ]
+    result = runner.invoke(app, ["prune", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        "branch shop-api/feat/old: removed",
+        "image sha256:abc: failed: image is in use",
+        "removed 1 of 2 item(s)",
+    ]
+
+
+def test_prune_json_with_yes_is_one_document(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune", "--yes", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "action": "prune",
+        "dry_run": False,
+        "items": [
+            {
+                "kind": "branch",
+                "target": "feat/old",
+                "repo": "shop-api",
+                "done": True,
+                "note": None,
+            },
+            {
+                "kind": "compose",
+                "target": "wt-shop-feat-old",
+                "repo": None,
+                "done": True,
+                "note": None,
+            },
+        ],
+    }
+
+
+def test_prune_json_dry_run_has_done_false_and_never_asks(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune", "--dry-run", "--json"], input="y\n")
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert document["dry_run"] is True
+    assert [item["done"] for item in document["items"]] == [False, False]
+    assert fake_prune["calls"] == [("project", True)]
+
+
+def test_prune_json_alone_is_an_error_and_never_asks(fake_prune: dict[str, Any]) -> None:
+    result = runner.invoke(app, ["prune", "--json"], input="y\n")
+    assert result.exit_code == 1, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "error": "prune --json never asks for confirmation: pass --yes",
+    }
+    assert fake_prune["calls"] == []
+
+
+def test_prune_outside_a_project_prunes_every_known_project(
+    fake_prune: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WT_CATALOG", str(tmp_path / "missing.yaml"))
+    result = runner.invoke(app, ["prune", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert fake_prune["calls"] == [("all", False)]
