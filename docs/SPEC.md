@@ -609,7 +609,7 @@ Agreed with the user after the first TUI. Replaces the TUI layout and keys of §
   the selected row, or, when the table is empty, the only usable project; with several, `a` says to run
   `wt tui` inside one). `r` = a confirm box (`remove <branch>: removes what wt created for it (containers,
   volumes, databases, worktrees) and deletes the git branch in every repo of the project where it
-  exists; unpushed commits are lost. Remove? y/N`), then `remove` with `--force`. The CLI asks
+  exists, and deletes the remote branch when merged; unpushed commits are lost. Remove? y/N`), then `remove` with `--force`. The CLI asks
   the same question before `wt remove` (unless `--yes`). Arrows select, `q` quits.
 - One action at a time, in a worker thread; keys pressed while busy show a note on the message
   line. The table refreshes every 2 s and after each action.
