@@ -189,3 +189,101 @@ def branch_exists(repo: Path, branch: str) -> bool:
 def delete_branch(repo: Path, branch: str) -> None:
     """`git branch -D`: drops the branch even when it is not merged."""
     _git(repo, "branch", "-D", branch)
+
+
+def delete_branch_safe(repo: Path, branch: str) -> None:
+    """`git branch -d`: refuses a branch that is not merged."""
+    _git(repo, "branch", "-d", branch)
+
+
+def _fetch_checked(repo: Path, *args: str) -> proc.Result:
+    return proc.run(
+        ["git", "-C", str(repo), "fetch", *args, "origin"], timeout=FETCH_TIMEOUT_SECONDS
+    )
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """`git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else is a real failure."""
+    result = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant, check=False)
+    if result.returncode not in (0, 1):
+        reason = (result.stderr.strip().splitlines() or ["git failed"])[0]
+        raise WtError(f"git merge-base --is-ancestor failed in {repo}: {reason}")
+    return result.ok
+
+
+def remote_branch_merged(repo: Path, branch: str) -> bool | None:
+    """Fetch origin (no prune); is `origin/<branch>` merged into origin's default branch?
+
+    None when it cannot be told: no origin, no `origin/<branch>` or no default branch on origin.
+    """
+    if not _has_origin(repo):
+        return None
+    _fetch_checked(repo)
+    base = _origin_base(repo)
+    if base is None or not _has_ref(repo, f"refs/remotes/origin/{branch}"):
+        return None
+    return _is_ancestor(repo, f"refs/remotes/origin/{branch}", f"refs/remotes/{base}")
+
+
+def delete_remote_branch(repo: Path, branch: str) -> None:
+    """`git push origin --delete <branch>`."""
+    _git(repo, "push", "origin", "--delete", branch)
+
+
+def drop_remote_ref(repo: Path, branch: str) -> None:
+    """Forget the local `origin/<branch>` ref; no-op when it is already gone."""
+    if _has_ref(repo, f"refs/remotes/origin/{branch}"):
+        _git(repo, "branch", "-dr", f"origin/{branch}")
+
+
+GONE_UPSTREAM = "[gone]"
+
+
+def gone_merged_branches(repo: Path) -> list[str]:
+    """Local branches whose upstream is gone and whose tip is in origin's default branch.
+
+    Branches checked out in any worktree of the repo are never listed.
+    """
+    base = _origin_base(repo)
+    if base is None:
+        return []
+    rows = _git(
+        repo, "for-each-ref", "--format=%(refname:short)\t%(upstream:track)", "refs/heads"
+    ).stdout
+    checked_out = {tree.branch for tree in list_worktrees(repo)}
+    gone = [
+        name
+        for name, _, track in (row.partition("\t") for row in rows.splitlines())
+        if track.strip() == GONE_UPSTREAM and name not in checked_out
+    ]
+    return [
+        name for name in gone if _is_ancestor(repo, f"refs/heads/{name}", f"refs/remotes/{base}")
+    ]
+
+
+def _output_lines(result: proc.Result) -> list[str]:
+    """Non-empty stripped lines of stdout then stderr (git reports progress on stderr)."""
+    return [line.strip() for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+
+
+def prune_worktrees(repo: Path) -> list[str]:
+    """`git worktree prune --verbose`: the lines git printed for the entries it removed."""
+    return _output_lines(_git(repo, "worktree", "prune", "--verbose"))
+
+
+def _origin_refs(repo: Path) -> set[str]:
+    out = _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin").stdout
+    return set(out.split())
+
+
+def prune_remote_refs(repo: Path) -> list[str]:
+    """`git fetch --prune origin`: the `origin/*` refs it removed, e.g. `origin/feat/x`, sorted.
+
+    Empty when there is no origin or nothing was stale. Compares the refs before and after
+    because git's own report is translated to the user's language.
+    """
+    if not _has_origin(repo):
+        return []
+    before = _origin_refs(repo)
+    _fetch_checked(repo, "--prune")
+    return sorted(before - _origin_refs(repo))

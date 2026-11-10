@@ -289,3 +289,139 @@ def test_uses_target_on_detached_head(make_repo, tmp_path: Path) -> None:
     run_git(target, "switch", "-q", "--detach")
     res = git.ensure_worktree(repo, "feat/x", target)
     assert res.path == target and res.other_branch == git.DETACHED
+
+
+def _commit(repo: Path, name: str) -> None:
+    (repo / name).write_text(name)
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-qm", name)
+
+
+def _push_branch(app: Path, branch: str, *, merged: bool) -> None:
+    """Push `branch` (created in `app`) to origin; `merged` also fast-forwards origin/main to it."""
+    run_git(app, "switch", "-q", "-c", branch)
+    _commit(app, branch.replace("/", "-"))
+    run_git(app, "push", "-q", "-u", "origin", branch)
+    run_git(app, "switch", "-q", "main")
+    if merged:
+        run_git(app, "merge", "-q", "--ff-only", branch)
+        run_git(app, "push", "-q", "origin", "main")
+
+
+@pytest.mark.parametrize("branch", ["feat/x", "plain"])
+def test_remote_branch_merged_true_when_in_origin_default(
+    make_repo, tmp_path: Path, branch: str
+) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, branch, merged=True)
+    assert git.remote_branch_merged(app, branch) is True
+
+
+def test_remote_branch_merged_false_when_not_in_origin_default(make_repo, tmp_path: Path) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=False)
+    assert git.remote_branch_merged(app, "feat/x") is False
+
+
+def test_remote_branch_merged_fetches_origin_first(make_repo, tmp_path: Path) -> None:
+    _, app, other = _origin_with_stale_clone(make_repo, tmp_path)
+    run_git(other, "switch", "-q", "-c", "feat/x")
+    _commit(other, "x")
+    run_git(other, "push", "-q", "origin", "feat/x")
+    run_git(other, "switch", "-q", "main")
+    run_git(other, "merge", "-q", "--ff-only", "feat/x")
+    run_git(other, "push", "-q", "origin", "main")
+    assert git.remote_branch_merged(app, "feat/x") is True
+
+
+def test_remote_branch_merged_none_without_origin(make_repo) -> None:
+    assert git.remote_branch_merged(make_repo(), "feat/x") is None
+
+
+def test_remote_branch_merged_none_without_that_remote_branch(make_repo, tmp_path: Path) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    assert git.remote_branch_merged(app, "feat/x") is None
+
+
+def test_delete_remote_branch_removes_it_from_origin(make_repo, tmp_path: Path) -> None:
+    bare, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=True)
+    git.delete_remote_branch(app, "feat/x")
+    assert "feat/x" not in run_git(bare, "branch", "--format=%(refname:short)").split()
+    assert "origin/feat/x" not in run_git(app, "branch", "-r").split()
+
+
+def test_drop_remote_ref_forgets_the_local_origin_ref(make_repo, tmp_path: Path) -> None:
+    bare, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=True)
+    run_git(bare, "branch", "-D", "feat/x")  # the remote branch is gone, the local ref stays
+    assert "origin/feat/x" in run_git(app, "branch", "-r").split()
+    git.drop_remote_ref(app, "feat/x")
+    assert "origin/feat/x" not in run_git(app, "branch", "-r").split()
+
+
+def test_drop_remote_ref_is_a_no_op_when_absent(make_repo, tmp_path: Path) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    git.drop_remote_ref(app, "feat/nope")
+
+
+def _gone_branch(app: Path, bare: Path, branch: str, *, merged: bool) -> None:
+    """A local `branch` tracking an origin branch that was then deleted on the remote."""
+    _push_branch(app, branch, merged=merged)
+    run_git(bare, "branch", "-D", branch)
+    run_git(app, "fetch", "-q", "--prune", "origin")
+
+
+def test_gone_merged_branches_lists_only_gone_and_merged(make_repo, tmp_path: Path) -> None:
+    bare, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _gone_branch(app, bare, "feat/merged", merged=True)
+    _gone_branch(app, bare, "feat/unmerged", merged=False)
+    _push_branch(app, "feat/alive", merged=True)  # upstream still there
+    assert git.gone_merged_branches(app) == ["feat/merged"]
+
+
+def test_gone_merged_branches_skips_checked_out_branches(make_repo, tmp_path: Path) -> None:
+    bare, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _gone_branch(app, bare, "feat/here", merged=True)
+    _gone_branch(app, bare, "feat/there", merged=True)
+    git.ensure_worktree(app, "feat/there", tmp_path / "wt-there")
+    run_git(app, "switch", "-q", "feat/here")
+    assert git.gone_merged_branches(app) == []
+
+
+def test_gone_merged_branches_empty_without_origin(make_repo) -> None:
+    assert git.gone_merged_branches(make_repo()) == []
+
+
+def test_delete_branch_safe_refuses_unmerged_branch(make_repo) -> None:
+    repo = make_repo()
+    run_git(repo, "switch", "-q", "-c", "feat/x")
+    _commit(repo, "x")
+    run_git(repo, "switch", "-q", "main")
+    with pytest.raises(WtError):
+        git.delete_branch_safe(repo, "feat/x")
+    run_git(repo, "merge", "-q", "feat/x")
+    git.delete_branch_safe(repo, "feat/x")
+    assert "feat/x" not in branches(repo)
+
+
+def test_prune_remote_refs_reports_a_stale_ref(make_repo, tmp_path: Path) -> None:
+    bare, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=False)
+    run_git(bare, "branch", "-D", "feat/x")
+    assert git.prune_remote_refs(app) == ["origin/feat/x"]
+    assert git.prune_remote_refs(app) == []
+
+
+def test_prune_remote_refs_empty_without_origin(make_repo) -> None:
+    assert git.prune_remote_refs(make_repo()) == []
+
+
+def test_prune_worktrees_reports_entries_of_deleted_folders(make_repo, tmp_path: Path) -> None:
+    repo = make_repo()
+    target = tmp_path / "t"
+    git.ensure_worktree(repo, "feat/x", target)
+    shutil.rmtree(target)
+    pruned = git.prune_worktrees(repo)
+    assert len(pruned) == 1 and "worktrees/t" in pruned[0]
+    assert git.prune_worktrees(repo) == []

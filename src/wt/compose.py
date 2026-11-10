@@ -122,13 +122,61 @@ def up(  # noqa: PLR0913
 
 
 def down(project: str) -> None:
-    """Stop and remove the project's containers, networks and volumes. No-op if absent."""
-    proc.run(["docker", "compose", "-p", project, "down", "-v", "--remove-orphans"])
+    """Remove the project's containers, networks, volumes and locally built images.
+
+    No-op if absent.
+    """
+    proc.run(
+        ["docker", "compose", "-p", project, "down", "-v", "--remove-orphans", "--rmi", "local"]
+    )
 
 
 def down_keep_volumes(project: str) -> None:
     """Stop and remove the project's containers and networks; volumes stay. No-op if absent."""
     proc.run(["docker", "compose", "-p", project, "down", "--remove-orphans"])
+
+
+PROJECT_LABEL = "com.docker.compose.project"
+
+
+def _image_ids(*label_filters: str) -> list[str]:
+    """Distinct ids of the images carrying every label filter (`key` or `key=value`)."""
+    args = ["docker", "image", "ls", "-q"]
+    for label in label_filters:
+        args += ["--filter", f"label={label}"]
+    return list(dict.fromkeys(proc.run(args, check=False).stdout.split()))
+
+
+def remove_images(project: str) -> list[str]:
+    """Remove every image labelled with the compose project; returns the removed image ids.
+
+    `down --rmi` only finds images through containers; this covers the ones left behind.
+    """
+    ids = _image_ids(f"{PROJECT_LABEL}={project}")
+    if ids:
+        proc.run(["docker", "image", "rm", *ids])
+    return ids
+
+
+def _lines(args: list[str]) -> set[str]:
+    return {line.strip() for line in proc.run(args, check=False).stdout.splitlines()}
+
+
+def wt_projects(prefix: str) -> set[str]:
+    """Compose project names starting with `prefix`, from the labels of containers, volumes
+    and images (so a project with only a volume or an image left is found too)."""
+    label_value = f'{{{{.Label "{PROJECT_LABEL}"}}}}'
+    names = _lines(
+        ["docker", "ps", "-a", "--filter", f"label={PROJECT_LABEL}", "--format", label_value]
+    )
+    names |= _lines(
+        ["docker", "volume", "ls", "--filter", f"label={PROJECT_LABEL}", "--format", label_value]
+    )
+    # `docker image ls` cannot print labels: inspect the ids it finds.
+    if image_ids := _image_ids(PROJECT_LABEL):
+        inspect_label = f'{{{{index .Config.Labels "{PROJECT_LABEL}"}}}}'
+        names |= _lines(["docker", "image", "inspect", "--format", inspect_label, *image_ids])
+    return {name for name in names if name and name.startswith(prefix)}
 
 
 def remove_service(project: str, service: str) -> None:
