@@ -849,8 +849,8 @@ def test_ls_no_probe_still_shows_a_dash_for_health(shop, monkeypatch: pytest.Mon
 
 REMOVE_QUESTION = (
     "remove feat/cart: removes what wt created for it (containers, volumes, databases, "
-    "worktrees) and deletes the git branch in every repo of the project where it exists; "
-    "unpushed commits are lost. Remove? [y/N]"
+    "worktrees) and deletes the git branch in every repo of the project where it exists, "
+    "and deletes the remote branch when merged; unpushed commits are lost. Remove? [y/N]"
 )
 
 
@@ -2615,7 +2615,29 @@ def test_prune_with_nothing_found_says_so_and_never_asks(fake_prune: dict[str, A
     result = runner.invoke(app, ["prune"])
     assert result.exit_code == 0, result.output
     assert result.output.strip() == "nothing to prune"
-    assert fake_prune["calls"] == [("project", True)]
+    assert fake_prune["calls"] == [("project", True), ("project", False)]
+
+
+def test_prune_with_an_empty_preview_still_drops_the_refs_a_dry_run_cannot_list(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    calls: list[bool] = []
+    stale = PruneItem("remote_ref", "origin/feat/old", "shop-api", True, None)
+
+    def project_prune(self: Any, *, dry_run: bool = False) -> list[PruneItem]:
+        calls.append(dry_run)
+        return [] if dry_run else [stale]  # git cannot preview a stale origin/* ref
+
+    monkeypatch.setattr(Orchestrator, "prune", project_prune)
+    result = runner.invoke(app, ["prune"])
+    assert result.exit_code == 0, result.output
+    assert "[y/N]" not in result.output
+    assert calls == [True, False]
+    assert result.output.splitlines() == [
+        "remote_ref shop-api/origin/feat/old: removed",
+        "removed 1 of 1 item(s)",
+    ]
 
 
 def test_prune_no_answer_changes_nothing(fake_prune: dict[str, Any]) -> None:

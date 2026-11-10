@@ -4,8 +4,8 @@ from wt.messages import CONFIRM_REMOVE, NO_SERVICES_YET, no_services_message
 def test_confirm_remove_sentence() -> None:
     assert CONFIRM_REMOVE.format(branch="feat-a") == (
         "remove feat-a: removes what wt created for it (containers, volumes, databases, "
-        "worktrees) and deletes the git branch in every repo of the project where it exists; "
-        "unpushed commits are lost. Remove? y/N"
+        "worktrees) and deletes the git branch in every repo of the project where it exists, "
+        "and deletes the remote branch when merged; unpushed commits are lost. Remove? y/N"
     )
 
 

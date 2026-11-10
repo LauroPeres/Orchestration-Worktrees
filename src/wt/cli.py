@@ -32,7 +32,7 @@ from wt.catalog import (
 from wt.claudegen import ClaudeSyncResult
 from wt.config import LoadedConfig
 from wt.errors import WtError
-from wt.messages import CONFIRM_REMOVE
+from wt.messages import CONFIRM_PRUNE, CONFIRM_REMOVE
 from wt.naming import slugify
 from wt.orchestrator import (
     BranchStatus,
@@ -697,7 +697,10 @@ def remove(
     yes: Annotated[bool, typer.Option("--yes", help="Do not ask for confirmation.")] = False,
     json_output: JsonOption = False,
 ) -> None:
-    """Do `down` for BRANCH, then delete the git branch (unpushed commits are lost)."""
+    """Do `down` for BRANCH, delete the git branch (unpushed commits are lost), then prune.
+
+    The remote branch is deleted too when it is merged into origin's default branch.
+    """
     with _json_errors(json_output):
         if json_output and not yes:
             raise WtError("remove --json never asks for confirmation: pass --yes")
@@ -751,6 +754,21 @@ def _find_orphans(
     return prune_all(dry_run=dry_run, log=log)
 
 
+def _confirm_and_prune(ctx: typer.Context, log: Callable[[str], None]) -> list[PruneItem]:
+    """Show the dry run and ask, then prune for real.
+
+    An empty preview runs without asking: the dry run cannot list `worktree_ref` and
+    `remote_ref`, and those only drop git's own stale records.
+    """
+    preview = _find_orphans(ctx, dry_run=True, log=log)
+    if preview:
+        _print_prune_lines(preview, dry_run=True)
+        # typer.confirm appends ` [y/N]` itself
+        question = CONFIRM_PRUNE.format(count=len(preview)).removesuffix(" y/N")
+        typer.confirm(question, abort=True)
+    return _find_orphans(ctx, dry_run=False, log=log)
+
+
 @app.command()
 def prune(
     ctx: typer.Context,
@@ -768,18 +786,13 @@ def prune(
         if yes or dry_run:
             items = _find_orphans(ctx, dry_run=dry_run, log=log)
         else:
-            preview = _find_orphans(ctx, dry_run=True, log=log)
-            if preview:
-                _print_prune_lines(preview, dry_run=True)
-                typer.confirm(CONFIRM_PRUNE.format(count=len(preview)), abort=True)
-            items = _find_orphans(ctx, dry_run=False, log=log) if preview else []
+            items = _confirm_and_prune(ctx, log)
         if json_output:
             _emit(prune_document(items, dry_run=dry_run))
         else:
             _print_prune(items, dry_run=dry_run)
 
 
-CONFIRM_PRUNE = "Prune {count} item(s)?"  # typer adds ` [y/N]`
 BRANCH_COLUMNS = ("BRANCH", "STATUS", "UP", "SERVICE", "KIND", "URL", "HEALTH")
 
 

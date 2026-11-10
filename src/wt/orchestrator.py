@@ -35,7 +35,7 @@ from wt.errors import WtError
 from wt.messages import no_services_message
 from wt.naming import Names
 from wt.paths import instance, project_dir
-from wt.projects import known_projects
+from wt.projects import known_projects, scan_projects
 from wt.providers import postgres
 from wt.providers.base import BranchContext, Kind, Provider
 from wt.state import (
@@ -60,7 +60,7 @@ _NOT_RUNNING_STATUSES = ("stopped", "removing")
 DBEAVER_HOST = "127.0.0.1"  # the shared Postgres publishes on loopback only
 ROUTE_WAIT_SECONDS = 5  # the default wait of router.wait_unrouted
 FOLDER_LISTED_ENTRIES = 5  # entries named in the "kept <folder>: not empty" warning
-NOT_MERGED_REASON = "not merged into origin's default branch"
+NOT_MERGED_REASON = "not merged into {base}"  # base: origin's default branch, e.g. origin/main
 NO_ORIGIN_REASON = "no origin"
 
 Log = Callable[[str], None]
@@ -170,8 +170,8 @@ class _Live:
 @dataclass(frozen=True)
 class _DeleteOutcome:
     found: int  # repos that had the branch
-    deleted: int
-    remote: list[RemoteResult]
+    deleted: dict[str, Path]  # repo -> main folder, where the local branch was deleted
+    failures: dict[str, str]  # repo -> why its branch could not be deleted
 
 
 def _kind(svc: Service) -> Literal["compose", "run"]:
@@ -1377,9 +1377,15 @@ class Orchestrator:
             outcome = self._delete_branch_in_repos(branch, sources)
             if not known and not outcome.found:
                 self._log_nothing_to_remove(branch)
+        # Network calls run outside the lock: a slow origin must not block the branch.
+        remote = [
+            self._remove_remote_branch(repo, branch, source)
+            for repo, source in outcome.deleted.items()
+        ]
+        _raise_delete_failures(branch, outcome.failures)
         if known:
             self._sync_dbeaver_quietly()
-        return RemoveResult(known or outcome.deleted > 0, outcome.remote, self._prune_quietly())
+        return RemoveResult(known or bool(outcome.deleted), remote, self._prune_quietly())
 
     def _catalog_repo_paths(self) -> dict[str, Path]:
         """Every repo of the catalog (not only those of the selected services) -> its folder."""
@@ -1389,13 +1395,13 @@ class Orchestrator:
         self.log(f"branch {branch} not found; nothing to remove")
 
     def _delete_branch_in_repos(self, branch: str, sources: dict[str, Path]) -> _DeleteOutcome:
-        """Delete `branch` where it exists unless protected, and its merged remote copy.
+        """Delete `branch` where it exists unless protected.
 
         A repo that fails (missing folder, not a git repo, refused delete) is logged and does not
-        stop the others; once all were tried, one error lists the failed repos.
+        stop the others; the caller raises once for all of them (`_raise_delete_failures`).
         """
-        found = deleted = 0
-        remote: list[RemoteResult] = []
+        found = 0
+        deleted: dict[str, Path] = {}
         failures: dict[str, str] = {}
         for repo, source in sources.items():
             try:
@@ -1407,15 +1413,9 @@ class Orchestrator:
                 )
                 continue
             found += outcome != "absent"
-            deleted += outcome == "deleted"
             if outcome == "deleted":
-                remote.append(self._remove_remote_branch(repo, branch, source))
-        if failures:
-            listed = "; ".join(f"{repo!r} ({reason})" for repo, reason in failures.items())
-            raise WtError(
-                f"could not delete branch {branch!r} in {len(failures)} repo(s): {listed}"
-            )
-        return _DeleteOutcome(found, deleted, remote)
+                deleted[repo] = source
+        return _DeleteOutcome(found, deleted, failures)
 
     def _remove_remote_branch(self, repo: str, branch: str, source: Path) -> RemoteResult:
         result = _remote_cleanup(repo, branch, source)
@@ -1610,7 +1610,7 @@ class Orchestrator:
         """The prune that ends `remove`: whatever goes wrong is a note, never an error."""
         try:
             return self.prune()
-        except Exception as exc:  # a failed cleanup must not undo a successful remove
+        except (WtError, OSError) as exc:  # a failed cleanup must not undo a successful remove
             self.log(f"[yellow]note:[/] prune failed: {_short_reason(exc)}")
             return []
 
@@ -1618,10 +1618,15 @@ class Orchestrator:
         """Every branch of every known project, plus this one even when it has none left.
 
         `shop` and `shop-admin` share the compose prefix `wt-shop-`, so a branch of another
-        project must count as live too.
+        project must count as live too; a project whose state cannot be read stops the prune,
+        since its branches would look orphaned.
         """
         states = {self.cfg.project: self.store.load()}
-        for known in known_projects():
+        scan = scan_projects()
+        if scan.unreadable:
+            bad = scan.unreadable[0]
+            raise WtError(f"cannot prune: state of {bad.name} is unreadable: {bad.reason}")
+        for known in scan.known:
             if known.name not in states:
                 states[known.name] = StateStore(known.name).load()
         own_repos = set(self._catalog_repo_paths())
@@ -2077,19 +2082,28 @@ def _remove_if_empty(folder: Path) -> None:
         folder.rmdir()
 
 
+def _raise_delete_failures(branch: str, failures: dict[str, str]) -> None:
+    if failures:
+        listed = "; ".join(f"{repo!r} ({reason})" for repo, reason in failures.items())
+        raise WtError(f"could not delete branch {branch!r} in {len(failures)} repo(s): {listed}")
+
+
 def _remote_cleanup(repo: str, branch: str, source: Path) -> RemoteResult:
     """Delete `origin/<branch>` when it is merged into origin's default branch; else keep it.
 
     Never raises: a remote that cannot be reached or refuses the push only keeps the branch.
     """
     try:
-        merged = git.remote_branch_merged(source, branch)
+        check = git.remote_branch_merged(source, branch)
+    except git.FetchError as exc:
+        return RemoteResult(repo, branch, False, f"could not fetch origin: {exc.line}")
     except WtError as exc:
-        return RemoteResult(repo, branch, False, f"could not fetch origin: {_first_line(exc)}")
-    if merged is None:
+        reason = f"could not check origin/{branch}: {_first_line(exc)}"
+        return RemoteResult(repo, branch, False, reason)
+    if check is None:
         return RemoteResult(repo, branch, False, NO_ORIGIN_REASON)
-    if not merged:
-        return RemoteResult(repo, branch, False, NOT_MERGED_REASON)
+    if not check.merged:
+        return RemoteResult(repo, branch, False, NOT_MERGED_REASON.format(base=check.base))
     try:
         git.delete_remote_branch(source, branch)
     except WtError as exc:

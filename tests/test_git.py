@@ -1,11 +1,12 @@
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from tests.conftest import git as run_git
-from wt import git
+from wt import git, proc
 from wt.errors import WtError
 
 
@@ -314,13 +315,13 @@ def test_remote_branch_merged_true_when_in_origin_default(
 ) -> None:
     _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
     _push_branch(app, branch, merged=True)
-    assert git.remote_branch_merged(app, branch) is True
+    assert git.remote_branch_merged(app, branch) == git.RemoteMerge(True, "origin/main")
 
 
 def test_remote_branch_merged_false_when_not_in_origin_default(make_repo, tmp_path: Path) -> None:
     _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
     _push_branch(app, "feat/x", merged=False)
-    assert git.remote_branch_merged(app, "feat/x") is False
+    assert git.remote_branch_merged(app, "feat/x") == git.RemoteMerge(False, "origin/main")
 
 
 def test_remote_branch_merged_fetches_origin_first(make_repo, tmp_path: Path) -> None:
@@ -331,7 +332,7 @@ def test_remote_branch_merged_fetches_origin_first(make_repo, tmp_path: Path) ->
     run_git(other, "switch", "-q", "main")
     run_git(other, "merge", "-q", "--ff-only", "feat/x")
     run_git(other, "push", "-q", "origin", "main")
-    assert git.remote_branch_merged(app, "feat/x") is True
+    assert git.remote_branch_merged(app, "feat/x") == git.RemoteMerge(True, "origin/main")
 
 
 def test_remote_branch_merged_none_without_origin(make_repo) -> None:
@@ -341,6 +342,82 @@ def test_remote_branch_merged_none_without_origin(make_repo) -> None:
 def test_remote_branch_merged_none_without_that_remote_branch(make_repo, tmp_path: Path) -> None:
     _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
     assert git.remote_branch_merged(app, "feat/x") is None
+
+
+def test_remote_branch_merged_raises_a_fetch_error_when_origin_is_unreachable(
+    make_repo, tmp_path: Path
+) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    run_git(app, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+    with pytest.raises(git.FetchError) as caught:
+        git.remote_branch_merged(app, "feat/x")
+    assert caught.value.line  # the first line git wrote, e.g. "fatal: '...' does not appear ..."
+    assert "\n" not in caught.value.line
+    assert str(app) in str(caught.value)
+
+
+def test_a_fetch_timeout_is_a_fetch_error(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    real = proc.run
+
+    def run(args: list[str], **kwargs: Any) -> proc.Result:
+        if "fetch" in args:
+            raise proc.CommandTimeout(args, kwargs.get("timeout"))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", run)
+    with pytest.raises(git.FetchError) as caught:
+        git.remote_branch_merged(app, "feat/x")
+    assert caught.value.line.startswith("command timed out after 30")
+
+
+def _spy_runs(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], dict[str, Any]]]:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    real = proc.run
+
+    def run(args: list[str], **kwargs: Any) -> proc.Result:
+        calls.append((list(args), kwargs))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(proc, "run", run)
+    return calls
+
+
+def test_the_remote_git_calls_never_prompt_and_have_a_timeout(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=True)
+    calls = _spy_runs(monkeypatch)
+    git.remote_branch_merged(app, "feat/x")
+    git.delete_remote_branch(app, "feat/x")
+    git.prune_remote_refs(app)
+    remote = [(args, kw) for args, kw in calls if "fetch" in args or "push" in args]
+    assert [args[3] for args, _ in remote] == ["fetch", "push", "fetch"]
+    assert remote[1][0][3:] == ["push", "origin", "--delete", "refs/heads/feat/x"]
+    for _, kwargs in remote:
+        assert kwargs["env"] == {"GIT_TERMINAL_PROMPT": "0"}
+        assert kwargs["timeout"] > 0
+
+
+def test_branch_deletes_end_the_options_before_the_name(
+    make_repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, app, _ = _origin_with_stale_clone(make_repo, tmp_path)
+    _push_branch(app, "feat/x", merged=True)
+    run_git(app, "branch", "feat/y")
+    calls = _spy_runs(monkeypatch)
+    git.delete_branch_safe(app, "feat/x")
+    git.delete_branch(app, "feat/y")
+    git.drop_remote_ref(app, "feat/x")
+    deletes = [args[3:] for args, _ in calls if "branch" in args]
+    assert deletes == [
+        ["branch", "-d", "--", "feat/x"],
+        ["branch", "-D", "--", "feat/y"],
+        ["branch", "-dr", "--", "origin/feat/x"],
+    ]
 
 
 def test_delete_remote_branch_removes_it_from_origin(make_repo, tmp_path: Path) -> None:

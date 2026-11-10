@@ -188,18 +188,42 @@ def branch_exists(repo: Path, branch: str) -> bool:
 
 def delete_branch(repo: Path, branch: str) -> None:
     """`git branch -D`: drops the branch even when it is not merged."""
-    _git(repo, "branch", "-D", branch)
+    _git(repo, "branch", "-D", "--", branch)
 
 
 def delete_branch_safe(repo: Path, branch: str) -> None:
     """`git branch -d`: refuses a branch that is not merged."""
-    _git(repo, "branch", "-d", branch)
+    _git(repo, "branch", "-d", "--", branch)
 
 
-def _fetch_checked(repo: Path, *args: str) -> proc.Result:
-    return proc.run(
-        ["git", "-C", str(repo), "fetch", *args, "origin"], timeout=FETCH_TIMEOUT_SECONDS
-    )
+PUSH_TIMEOUT_SECONDS = 30
+# git must fail rather than ask for credentials: `remove` and `prune` run unattended
+NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+
+
+class FetchError(WtError):
+    """`git fetch origin` failed or timed out; `line` is the first line git (or wt) reported."""
+
+    def __init__(self, repo: Path, line: str) -> None:
+        self.line = line
+        super().__init__(f"git fetch origin failed in {repo}: {line}")
+
+
+def _first_error_line(exc: WtError) -> str:
+    text = exc.result.stderr if isinstance(exc, proc.CommandError) else ""
+    lines = [line.strip() for line in [*text.splitlines(), *str(exc).splitlines()]]
+    return next((line for line in lines if line), type(exc).__name__)
+
+
+def _fetch_checked(repo: Path, *args: str) -> None:
+    try:
+        proc.run(
+            ["git", "-C", str(repo), "fetch", *args, "origin"],
+            timeout=FETCH_TIMEOUT_SECONDS,
+            env=NO_PROMPT_ENV,
+        )
+    except WtError as exc:
+        raise FetchError(repo, _first_error_line(exc)) from exc
 
 
 def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
@@ -211,10 +235,17 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return result.ok
 
 
-def remote_branch_merged(repo: Path, branch: str) -> bool | None:
+@dataclass(frozen=True)
+class RemoteMerge:
+    merged: bool
+    base: str  # origin's default branch it was checked against, e.g. "origin/main"
+
+
+def remote_branch_merged(repo: Path, branch: str) -> RemoteMerge | None:
     """Fetch origin (no prune); is `origin/<branch>` merged into origin's default branch?
 
     None when it cannot be told: no origin, no `origin/<branch>` or no default branch on origin.
+    Raises `FetchError` when the fetch fails, `WtError` when git cannot answer.
     """
     if not _has_origin(repo):
         return None
@@ -222,18 +253,23 @@ def remote_branch_merged(repo: Path, branch: str) -> bool | None:
     base = _origin_base(repo)
     if base is None or not _has_ref(repo, f"refs/remotes/origin/{branch}"):
         return None
-    return _is_ancestor(repo, f"refs/remotes/origin/{branch}", f"refs/remotes/{base}")
+    merged = _is_ancestor(repo, f"refs/remotes/origin/{branch}", f"refs/remotes/{base}")
+    return RemoteMerge(merged, base)
 
 
 def delete_remote_branch(repo: Path, branch: str) -> None:
-    """`git push origin --delete <branch>`."""
-    _git(repo, "push", "origin", "--delete", branch)
+    """`git push origin --delete refs/heads/<branch>`, never prompting, with a timeout."""
+    proc.run(
+        ["git", "-C", str(repo), "push", "origin", "--delete", f"refs/heads/{branch}"],
+        timeout=PUSH_TIMEOUT_SECONDS,
+        env=NO_PROMPT_ENV,
+    )
 
 
 def drop_remote_ref(repo: Path, branch: str) -> None:
     """Forget the local `origin/<branch>` ref; no-op when it is already gone."""
     if _has_ref(repo, f"refs/remotes/origin/{branch}"):
-        _git(repo, "branch", "-dr", f"origin/{branch}")
+        _git(repo, "branch", "-dr", "--", f"origin/{branch}")
 
 
 GONE_UPSTREAM = "[gone]"

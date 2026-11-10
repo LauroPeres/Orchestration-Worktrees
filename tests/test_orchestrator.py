@@ -1,3 +1,4 @@
+import fcntl
 import os
 import shutil
 import socket
@@ -43,6 +44,7 @@ from wt import (
     host,
     naming,
     orchestrator,
+    paths,
     pgpass,
     proc,
     providers,
@@ -5342,6 +5344,7 @@ class FakeRemote:
 
     merged: bool | None = True
     fetch_error: str | None = None
+    check_error: str | None = None  # git could not answer after the fetch
     push_error: str | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
 
@@ -5350,11 +5353,13 @@ class FakeRemote:
         monkeypatch.setattr(git, "delete_remote_branch", self.delete_remote_branch)
         monkeypatch.setattr(git, "drop_remote_ref", self.drop_remote_ref)
 
-    def remote_branch_merged(self, repo: Path, branch: str) -> bool | None:
+    def remote_branch_merged(self, repo: Path, branch: str) -> git.RemoteMerge | None:
         self.calls.append(("merged?", branch))
         if self.fetch_error:
-            raise WtError(self.fetch_error)
-        return self.merged
+            raise git.FetchError(repo, self.fetch_error)
+        if self.check_error:
+            raise WtError(f"{self.check_error}\nmore detail")
+        return None if self.merged is None else git.RemoteMerge(self.merged, "origin/main")
 
     def delete_remote_branch(self, repo: Path, branch: str) -> None:
         if self.push_error:
@@ -5394,11 +5399,9 @@ def test_remove_keeps_a_remote_branch_that_is_not_merged(orch, docker, remote: F
     logs = _logged(o)
     result = o.remove("feat/cart")
     assert result.removed is True
-    assert result.remote == [
-        RemoteResult("api", "feat/cart", False, orchestrator.NOT_MERGED_REASON)
-    ]
+    assert result.remote == [RemoteResult("api", "feat/cart", False, "not merged into origin/main")]
     assert ("push --delete", "feat/cart") not in remote.calls
-    assert f"kept remote branch feat/cart in api: {orchestrator.NOT_MERGED_REASON}" in logs
+    assert "kept remote branch feat/cart in api: not merged into origin/main" in logs
 
 
 def test_remove_keeps_the_remote_branch_when_there_is_no_origin(orch, docker, remote: FakeRemote):
@@ -5435,6 +5438,60 @@ def test_remove_survives_a_failed_fetch_of_origin(orch, docker, remote: FakeRemo
     assert result.remote == [
         RemoteResult("api", "feat/cart", False, "could not fetch origin: unable to access origin")
     ]
+
+
+def test_remove_names_a_check_that_failed_after_the_fetch_apart_from_a_fetch_failure(
+    orch, docker, remote: FakeRemote
+):
+    remote.check_error = "fatal: Not a valid object name refs/remotes/origin/main"
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    result = o.remove("feat/cart")
+    assert result.removed is True
+    reason = (
+        "could not check origin/feat/cart: fatal: Not a valid object name refs/remotes/origin/main"
+    )
+    assert result.remote == [RemoteResult("api", "feat/cart", False, reason)]
+
+
+def _lock_is_held(name: str) -> bool:
+    with open(paths.locks_dir() / f"{name}.lock", "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
+
+def test_remove_talks_to_origin_after_releasing_the_branch_lock(
+    orch, docker, remote: FakeRemote, monkeypatch: pytest.MonkeyPatch
+):
+    held: list[bool] = []
+
+    def merged(repo: Path, branch: str) -> git.RemoteMerge:
+        held.append(_lock_is_held("branch-shop-feat-cart"))
+        return git.RemoteMerge(True, "origin/main")
+
+    monkeypatch.setattr(git, "remote_branch_merged", merged)
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    assert o.remove("feat/cart").remote == [RemoteResult("api", "feat/cart", True, None)]
+    assert held == [False]
+
+
+def test_remove_still_cleans_the_remote_where_it_deleted_before_failing_on_another_repo(
+    orch, docker, remote: FakeRemote, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    sources = {"api": tmp_path / "shop-api", "gone": tmp_path / "missing-repo"}
+    monkeypatch.setattr(Orchestrator, "_catalog_repo_paths", lambda self: sources)
+    with pytest.raises(
+        WtError, match=r"could not delete branch 'feat/cart' in 1 repo\(s\): 'gone'"
+    ):
+        o.remove("feat/cart")
+    assert ("push --delete", "feat/cart") in remote.calls
 
 
 def test_remove_never_touches_the_remote_of_a_protected_branch(
@@ -5495,9 +5552,7 @@ def test_remove_keeps_an_unmerged_branch_on_a_real_origin(
     git_run(worktree, "commit", "-q", "--allow-empty", "-m", "wip")
     git_run(repo, "push", "-q", "origin", "feat/cart")
     result = o.remove("feat/cart")
-    assert result.remote == [
-        RemoteResult("api", "feat/cart", False, orchestrator.NOT_MERGED_REASON)
-    ]
+    assert result.remote == [RemoteResult("api", "feat/cart", False, "not merged into origin/main")]
     assert "feat/cart" in _remote_branches(bare)
 
 
@@ -5922,7 +5977,7 @@ def test_a_prune_that_raises_is_a_note_and_remove_still_succeeds(
     orch, docker, remote, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     def broken(self: Orchestrator, *, dry_run: bool = False) -> list[PruneItem]:
-        raise RuntimeError("boom")
+        raise WtError("boom")
 
     monkeypatch.setattr(Orchestrator, "prune", broken)
     o = orch()
@@ -5955,6 +6010,44 @@ def _second_project(make_repo, tmp_path: Path) -> Orchestrator:
     folder = tmp_path / "blog-catalog"
     folder.mkdir()
     return Orchestrator(write_global_catalog(folder, catalog, uses=["api"]), log=lambda m: None)
+
+
+def _corrupt_state(project: str) -> Path:
+    path = StateStore(project).path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{nope")
+    return path
+
+
+def test_prune_refuses_when_another_projects_state_is_unreadable(
+    orch, docker: FakeDocker, isolated_home: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    docker.projects.add("wt-shop-admin-feat-x-api")  # could be a live branch of `shop-admin`
+    leftover = _touch(router.dynamic_dir() / "shop--old.yml")
+    path = _corrupt_state("shop-admin")
+    with pytest.raises(WtError, match="cannot prune: state of shop-admin is unreadable") as caught:
+        o.prune()
+    assert str(path) in str(caught.value)
+    assert leftover.exists()
+    assert "wt-shop-admin-feat-x-api" in docker.projects
+
+
+def test_remove_notes_a_prune_refused_for_an_unreadable_state_and_still_succeeds(
+    orch, docker: FakeDocker, remote, tmp_path: Path
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    _corrupt_state("shop-admin")
+    logs = _logged(o)
+    result = o.remove("feat/cart")
+    assert result.removed is True and result.pruned == []
+    assert any(
+        m.startswith("[yellow]note:[/] prune failed: cannot prune: state of shop-admin")
+        for m in logs
+    )
+    assert "feat/cart" not in _branches(tmp_path / "shop-api")
 
 
 def test_prune_all_prunes_every_known_project_and_lists_each_orphan_once(
