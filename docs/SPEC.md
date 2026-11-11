@@ -177,6 +177,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.14.1 ✔ (§33) | `up` reuses a wt's repo folder that was switched to another branch |
 | v0.14.2 ✔ (§34) | Merged `.claude` fixes: path and command rules scoped to their repo, skills with unique names |
 | v0.15.0 ✔ (§35) | `remove` cleans everything (merged remote branch, images, a non-empty wt folder warning) and `wt prune` cleans orphans, also run by every `remove` |
+| v0.16.0 ✔ (§36) | Shared installs and real disk use: uv installs clone from the cache (`UV_LINK_MODE=clone`), `wt du`, `cache ls` and doctor report exclusive bytes |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1569,3 +1570,35 @@ and §21 (JSON).
   "deleted":true,"reason":null}]` and `"pruned":[<prune items as above>]`.
 - **Confirmation.** The `remove` question (CLI and TUI `r`) adds that it deletes the remote branch when merged.
 - Out of scope: orphan provider slices (databases, topics, keys, clients), `docker builder prune`, a prune timer.
+
+## 36. v0.16.0: shared installs and real disk use
+
+Decided 2026-11-11 with the user (task T-16). Disk tools add up file sizes, so a reflinked copy on btrfs counts in
+full and every worktree looks ~3 GB. The user's choices: share dependencies with reflink copies, never symlinks;
+change new worktrees only; report the real use. Amends §24 (install caches). Existing worktrees are never
+rewritten (no deduplication).
+
+- **uv clones (§24 "Environment").** For a service with `setup_cache: uv`, `setup` and `run` also get
+  `UV_LINK_MODE=clone`, next to `UV_CACHE_DIR`, so uv installs packages into `.venv` as copy-on-write clones of its
+  cache. A variable the service's `env` already sets wins, one variable at a time (`UV_LINK_MODE=copy` in `env` keeps
+  `UV_CACHE_DIR` from the preset). `cache.tool_env("uv") == {"UV_CACHE_DIR": "<WT_HOME>/cache/uv",
+  "UV_LINK_MODE": "clone"}`; npm is unchanged (its restore already reflinks, §24).
+- **Measuring (`wt.disk`, runtime).** `usage(path) -> DiskUsage(apparent_bytes, exclusive_bytes, shared_bytes)`.
+  `apparent_bytes` is the sum of `lstat` sizes, symlinks never followed (what `cache` already counts).
+  Exclusive and shared come from `btrfs filesystem du -s --raw <path>` (unprivileged; columns Total, Exclusive,
+  Set shared), run through `proc.run`. When the filesystem is not btrfs, `btrfs` is missing, it exits non-zero or
+  its output does not parse, they are `None`; this is never an error. A missing `path` is a `WtError` with the path.
+- **`wt du [--json]`.** One row per wt folder of the project's branches (the folder holding the worktrees wt
+  created, as in `wt ls --paths`; branches without one are skipped), then a `cache` row for `$WT_HOME/cache`,
+  then the totals. A folder that disappears while it is measured is skipped. Text: name (branch), path,
+  apparent, exclusive, shared in human sizes, `—` for unknown. Exit 0 even when nothing can be measured.
+  JSON: `{"schema":1,"worktrees":[{"name","path","apparent_bytes","exclusive_bytes","shared_bytes"}],
+  "cache":{"apparent_bytes","exclusive_bytes","shared_bytes"},"total":{"apparent_bytes","exclusive_bytes"}}`;
+  unknown values are `null`, and a total's `exclusive_bytes` is `null` when any row's is. A missing cache folder
+  is a row of zeros. `wt du` is opt-in (slow on big trees): `wt ls` never measures.
+- **`wt cache ls` and doctor.** Both report what the cache really uses: the exclusive bytes of `$WT_HOME/cache`
+  when they can be measured, else the apparent total as before. Text: `total: <apparent> (<exclusive> on disk,
+  <shared> shared)` when known. `cache ls --json` gains `"exclusive_bytes"` and `"shared_bytes"` (or `null`); the
+  other keys are unchanged. The doctor `cache` check says `<n> MiB on disk in the install and tool caches` (or
+  the apparent number with today's wording), and its low-disk warning names the exclusive bytes as what a prune frees.
+- Out of scope: reclaiming space in existing worktrees, symlinked dependencies, pnpm, sizes in the TUI.
