@@ -11,6 +11,7 @@ from wt import cache, compose, host, proc, router, tls
 from wt.catalog import load_catalog
 from wt.config import BUILTIN_INFRA, LoadedConfig, Postgres, Shared
 from wt.errors import WtError
+from wt.orchestrator import cache_usage
 from wt.providers import kafka, keycloak, plugin_problems, postgres, redis
 from wt.state import StateStore, file_lock
 
@@ -156,8 +157,14 @@ def check_ca_trusted(fix: bool) -> Check | None:
 
 
 def check_cache() -> Check:
-    """The caches grow on their own: say how big, and warn when the disk is low."""
-    used = cache.total_bytes()
+    """The caches grow on their own: say how big, and warn when the disk is low.
+
+    Reflinked installs share blocks, so the bytes they hold alone are the real size; when they
+    cannot be measured (not btrfs) the apparent total is all there is.
+    """
+    exclusive = cache_usage().exclusive_bytes
+    on_disk = exclusive is not None
+    used = exclusive if exclusive is not None else cache.total_bytes()
     free = cache.free_bytes()
     if free < LOW_DISK_BYTES:
         return Check(
@@ -167,7 +174,10 @@ def check_cache() -> Check:
             f"wt cache prune frees {used // BYTES_PER_MIB} MiB",
             "wt cache prune --all",
         )
-    return Check("cache", "info", f"{used // BYTES_PER_MIB} MiB in the install and tool caches")
+    where = "on disk in" if on_disk else "in"
+    return Check(
+        "cache", "info", f"{used // BYTES_PER_MIB} MiB {where} the install and tool caches"
+    )
 
 
 def check_routing(fix: bool) -> list[Check]:
