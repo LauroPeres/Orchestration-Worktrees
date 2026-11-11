@@ -156,8 +156,16 @@ def check_ca_trusted(fix: bool) -> Check | None:
 
 
 def check_cache() -> Check:
-    """The caches grow on their own: say how big, and warn when the disk is low."""
-    used = cache.total_bytes()
+    """The caches grow on their own: say how big, and warn when the disk is low.
+
+    Reflinked installs share blocks, so the bytes they hold alone are the real size; when they
+    cannot be measured (not btrfs) the apparent total is all there is.
+    """
+    # The btrfs measure may take long on a huge cache; accepted, doctor is explicit.
+    usage = cache.cache_usage()
+    exclusive = usage.exclusive_bytes
+    on_disk = exclusive is not None
+    used = usage.apparent_bytes if exclusive is None else exclusive
     free = cache.free_bytes()
     if free < LOW_DISK_BYTES:
         return Check(
@@ -167,7 +175,10 @@ def check_cache() -> Check:
             f"wt cache prune frees {used // BYTES_PER_MIB} MiB",
             "wt cache prune --all",
         )
-    return Check("cache", "info", f"{used // BYTES_PER_MIB} MiB in the install and tool caches")
+    where = "on disk in" if on_disk else "in"
+    return Check(
+        "cache", "info", f"{used // BYTES_PER_MIB} MiB {where} the install and tool caches"
+    )
 
 
 def check_routing(fix: bool) -> list[Check]:

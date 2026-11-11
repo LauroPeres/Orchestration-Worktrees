@@ -15,7 +15,7 @@ from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
-from wt import __version__, cache, catalog_edit, doctor
+from wt import __version__, cache, catalog_edit, disk, doctor
 from wt.catalog import (
     LEGACY_NAME,
     Catalog,
@@ -37,6 +37,7 @@ from wt.naming import slugify
 from wt.orchestrator import (
     BranchStatus,
     Choice,
+    DuReport,
     MoveResult,
     Orchestrator,
     PruneItem,
@@ -45,6 +46,7 @@ from wt.orchestrator import (
     ServiceReport,
     prune_all,
 )
+from wt.paths import cache_dir
 from wt.projects import KnownProject, known_projects
 from wt.state import atomic_write
 
@@ -1342,7 +1344,25 @@ def human_size(size: int) -> str:
     return f"{value:.1f}".removesuffix(".0") + f" {SIZE_UNITS[unit]}"
 
 
-def _print_cache(entries: list[cache.Entry], tools: dict[str, int], total: int) -> None:
+UNKNOWN_SIZE = "\u2014"  # shown where a size cannot be measured (not btrfs, no `btrfs` tool)
+
+
+def _size_or_unknown(size: int | None) -> str:
+    return UNKNOWN_SIZE if size is None else human_size(size)
+
+
+def _total_line(total: int, usage: disk.DiskUsage) -> str:
+    if usage.exclusive_bytes is None:
+        return f"total: {human_size(total)}"
+    on_disk = f"{human_size(usage.exclusive_bytes)} on disk"
+    if usage.shared_bytes is None:
+        return f"total: {human_size(total)} ({on_disk})"
+    return f"total: {human_size(total)} ({on_disk}, {human_size(usage.shared_bytes)} shared)"
+
+
+def _print_cache(
+    entries: list[cache.Entry], tools: dict[str, int], total: int, usage: disk.DiskUsage
+) -> None:
     if not entries and not any(tools.values()):
         console.print("the install cache is empty")
         return
@@ -1361,7 +1381,7 @@ def _print_cache(entries: list[cache.Entry], tools: dict[str, int], total: int) 
         console.print(table)
     for tool, size in tools.items():
         console.print(f"{tool} cache: {human_size(size)}")
-    console.print(f"total: {human_size(total)}")
+    console.print(_total_line(total, usage))
 
 
 @cache_app.command("ls")
@@ -1369,6 +1389,7 @@ def cache_ls(json_output: JsonOption = False) -> None:
     """List the cached installs and the uv/npm caches with their sizes."""
     with _json_errors(json_output):
         entries, tools, total = cache.entries(), cache.tool_sizes(), cache.total_bytes()
+        usage = cache.cache_usage()
         if json_output:
             _emit(
                 {
@@ -1385,10 +1406,83 @@ def cache_ls(json_output: JsonOption = False) -> None:
                     ],
                     "tools": tools,
                     "total_bytes": total,
+                    "exclusive_bytes": usage.exclusive_bytes,
+                    "shared_bytes": usage.shared_bytes,
                 }
             )
         else:
-            _print_cache(entries, tools, total)
+            _print_cache(entries, tools, total, usage)
+
+
+# ---- wt du (SPEC section 36) ------------------------------------------------------------------
+
+DU_COLUMNS = ("NAME", "PATH", "APPARENT", "EXCLUSIVE", "SHARED")
+DU_SIZE_COLUMNS = DU_COLUMNS[2:]
+
+
+def _usage_json(usage: disk.DiskUsage) -> JsonDocument:
+    return {
+        "apparent_bytes": usage.apparent_bytes,
+        "exclusive_bytes": usage.exclusive_bytes,
+        "shared_bytes": usage.shared_bytes,
+    }
+
+
+def du_document(report: DuReport) -> JsonDocument:
+    return {
+        "schema": JSON_SCHEMA,
+        "worktrees": [
+            {"name": row.name, "path": str(row.path), **_usage_json(row.usage)}
+            for row in report.worktrees
+        ],
+        "cache": _usage_json(report.cache),
+        "total": {
+            "apparent_bytes": report.total_apparent_bytes,
+            "exclusive_bytes": report.total_exclusive_bytes,
+        },
+    }
+
+
+def _du_row(name: str, path: str, usage: disk.DiskUsage) -> tuple[str, ...]:
+    return (
+        escape(name),
+        escape(path),
+        human_size(usage.apparent_bytes),
+        _size_or_unknown(usage.exclusive_bytes),
+        _size_or_unknown(usage.shared_bytes),
+    )
+
+
+def _print_du(report: DuReport) -> None:
+    table = Table(box=None, pad_edge=False)
+    for column in DU_COLUMNS:
+        table.add_column(
+            column,
+            overflow="fold",
+            justify="right" if column in DU_SIZE_COLUMNS else "left",
+        )
+    for row in report.worktrees:
+        table.add_row(*_du_row(row.name, str(row.path), row.usage))
+    table.add_row(*_du_row("cache", str(cache_dir()), report.cache))
+    table.add_row(
+        "total",
+        "",
+        human_size(report.total_apparent_bytes),
+        _size_or_unknown(report.total_exclusive_bytes),
+        "",
+    )
+    console.print(table)
+
+
+@app.command()
+def du(ctx: typer.Context, json_output: JsonOption = False) -> None:
+    """Show each wt folder's real disk use (exclusive and shared bytes on btrfs)."""
+    with _json_errors(json_output):
+        report = Orchestrator(_load(ctx), log=_progress(json_output)).du()
+        if json_output:
+            _emit(du_document(report))
+        else:
+            _print_du(report)
 
 
 @cache_app.command("prune")

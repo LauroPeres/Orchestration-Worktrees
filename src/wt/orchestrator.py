@@ -7,7 +7,7 @@ import os
 import shutil
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -19,6 +19,7 @@ from wt import (
     claudegen,
     compose,
     dbeaver,
+    disk,
     git,
     health,
     host,
@@ -119,6 +120,25 @@ class BranchStatus:
     docker_ok: bool = True
     # True when wt created none of its worktrees: the repos' own checkout (e.g. main)
     main_checkout: bool = False
+
+
+@dataclass(frozen=True)
+class DuRow:
+    """The disk use of one wt folder: `name` is the branch that owns it (SPEC §36)."""
+
+    name: str
+    path: Path
+    usage: disk.DiskUsage
+
+
+@dataclass(frozen=True)
+class DuReport:
+    """`wt du`: one row per wt folder, the shared cache, and the totals over both."""
+
+    worktrees: tuple[DuRow, ...]
+    cache: disk.DiskUsage
+    total_apparent_bytes: int
+    total_exclusive_bytes: int | None  # None as soon as one row cannot be measured
 
 
 @dataclass(frozen=True)
@@ -1737,6 +1757,22 @@ class Orchestrator:
 
     # ---- ls / logs ------------------------------------------------------------------------
 
+    def du(self) -> DuReport:
+        """Real disk use of the project's wt folders and of the shared cache (SPEC §36).
+
+        A branch spread over several folders gets one row per folder; a branch with no folder of
+        its own has no row. A folder that disappears while it is measured is skipped.
+        """
+        rows: list[DuRow] = []
+        for bs in self.store.load().branches.values():
+            for folder in _own_folders(bs):
+                measured = _measure(folder)
+                if measured is not None:
+                    rows.append(DuRow(bs.branch, folder, measured))
+        shared_cache = cache.cache_usage()
+        apparent, exclusive = du_totals([row.usage for row in rows] + [shared_cache])
+        return DuReport(tuple(rows), shared_cache, apparent, exclusive)
+
     def ls(self, *, probe: bool = True) -> list[BranchStatus]:
         state = self.store.load()
 
@@ -2042,6 +2078,27 @@ def _server_connection(project: str, repo: str) -> dbeaver.DbConnection:
 def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...]:
     """The catalog services that consume `name` directly, in catalog order."""
     return tuple(other for other, svc in services.items() if name in svc.consumes)
+
+
+def du_totals(usages: Iterable[disk.DiskUsage]) -> tuple[int, int | None]:
+    """(apparent, exclusive) summed; exclusive is None when any of `usages` cannot say."""
+    rows = list(usages)
+    apparent = sum(row.apparent_bytes for row in rows)
+    exclusives = [row.exclusive_bytes for row in rows]
+    if any(value is None for value in exclusives):
+        return apparent, None
+    return apparent, sum(value for value in exclusives if value is not None)
+
+
+def _measure(folder: Path) -> disk.DiskUsage | None:
+    """`disk.usage(folder)`, or None when the folder is gone; any other failure propagates."""
+    try:
+        measured = disk.usage(folder)
+    except WtError:
+        if folder.is_dir():
+            raise
+        return None
+    return measured if folder.is_dir() else None  # removed while the btrfs tool ran
 
 
 def wt_folder(bs: BranchState) -> str | None:

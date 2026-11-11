@@ -8,6 +8,7 @@ import pytest
 from tests.conftest import SHOP_CATALOG, write_global_catalog
 from wt import cache, compose, doctor, host, proc, router, tls
 from wt.config import LoadedConfig, Shared
+from wt.disk import DiskUsage
 from wt.errors import WtError
 from wt.providers import kafka, keycloak, postgres, redis
 from wt.state import BranchState, ProcessState, StateStore
@@ -1013,9 +1014,13 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 
 
-def _disk(monkeypatch: pytest.MonkeyPatch, *, total: int, free: int) -> None:
-    monkeypatch.setattr(cache, "total_bytes", lambda: total)
+def _disk(
+    monkeypatch: pytest.MonkeyPatch, *, total: int, free: int, exclusive: int | None = None
+) -> None:
+    """The cache holds `total` apparent bytes, `exclusive` of them alone (None = unmeasurable)."""
     monkeypatch.setattr(cache, "free_bytes", lambda: free)
+    usage = DiskUsage(total, exclusive, None if exclusive is None else total - exclusive)
+    monkeypatch.setattr(cache, "cache_usage", lambda: usage)
 
 
 def test_cache_check_reports_the_size_in_mib(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1043,6 +1048,43 @@ def test_cache_check_warns_below_two_gib_free(monkeypatch: pytest.MonkeyPatch) -
 def test_exactly_two_gib_free_is_not_low(monkeypatch: pytest.MonkeyPatch) -> None:
     _disk(monkeypatch, total=MIB, free=2 * GIB)
     assert doctor.check_cache().level == "info"
+
+
+def test_cache_check_reports_the_exclusive_size_when_it_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disk(monkeypatch, total=3000 * MIB, free=50 * GIB, exclusive=300 * MIB)
+    assert doctor.check_cache() == doctor.Check(
+        "cache", "info", "300 MiB on disk in the install and tool caches"
+    )
+
+
+def test_a_cache_that_is_all_shared_is_zero_mib_on_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    _disk(monkeypatch, total=300 * MIB, free=50 * GIB, exclusive=0)
+    assert doctor.check_cache().detail == "0 MiB on disk in the install and tool caches"
+
+
+def test_low_disk_warning_names_the_exclusive_bytes_a_prune_frees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disk(monkeypatch, total=3000 * MIB, free=GIB, exclusive=300 * MIB)
+    assert doctor.check_cache() == doctor.Check(
+        "cache",
+        "warn",
+        "low disk space: 1024 MiB free; wt cache prune frees 300 MiB",
+        "wt cache prune --all",
+    )
+
+
+def test_cache_check_keeps_the_apparent_wording_when_exclusive_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disk(monkeypatch, total=3000 * MIB, free=GIB, exclusive=None)
+    assert doctor.check_cache().detail == (
+        "low disk space: 1024 MiB free; wt cache prune frees 3000 MiB"
+    )
+    _disk(monkeypatch, total=3000 * MIB, free=50 * GIB, exclusive=None)
+    assert doctor.check_cache().detail == "3000 MiB in the install and tool caches"
 
 
 def test_cache_check_runs_without_docker_and_without_a_catalog(

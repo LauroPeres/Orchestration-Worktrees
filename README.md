@@ -203,10 +203,15 @@ does not pay for the install again.
   supports it) and `setup` is skipped; a changed lock file is a new key and runs `setup`.
 - `uv`: a virtualenv cannot be copied (its scripts hold the folder they were created in), so wt
   shares uv's own download and build cache instead: `UV_CACHE_DIR` points at `~/.wt/cache/uv` for
-  `setup` and `run`. `setup` still runs, but it is fast with a warm cache.
+  `setup` and `run`, with `UV_LINK_MODE=clone` so packages land in `.venv` as copy-on-write clones.
+  `setup` still runs, but it is fast with a warm cache.
+
+Disk tools (`du`, Filelight) add up file sizes, so a reflinked copy looks as big as the original.
+On btrfs, `wt du` shows what each wt folder really uses on its own (exclusive) and what it shares.
 
 ```bash
-wt cache ls              # install entries (key, preset, size, last used) and the uv/npm cache sizes
+wt cache ls              # install entries (key, preset, size, last used) and the uv/npm cache sizes, plus what is on disk (btrfs)
+wt du                    # each wt folder's apparent, exclusive and shared bytes (btrfs); --json
 wt cache prune           # drops entries not used for 30 days (--older-than DAYS)
 wt cache prune --all     # everything, including the uv and npm caches (asks first; --yes)
 ```

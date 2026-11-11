@@ -39,6 +39,7 @@ from wt import (
     cache,
     compose,
     dbeaver,
+    disk,
     git,
     health,
     host,
@@ -53,12 +54,15 @@ from wt import (
     tls,
 )
 from wt.catalog import load_project
+from wt.disk import DiskUsage
 from wt.errors import WtError
 from wt.orchestrator import (
+    DuReport,
     Orchestrator,
     PruneItem,
     RemoteResult,
     ServiceReport,
+    du_totals,
     prune_all,
 )
 from wt.providers import postgres
@@ -4247,8 +4251,9 @@ class FakeInstallCache:
         return self.store_ok
 
     def tool_env(self, preset: str) -> dict[str, str]:
-        var = "npm_config_cache" if preset == "npm" else "UV_CACHE_DIR"
-        return {var: f"/wt-cache/{preset}"}
+        if preset == "npm":
+            return {"npm_config_cache": "/wt-cache/npm"}
+        return {"UV_CACHE_DIR": "/wt-cache/uv", "UV_LINK_MODE": "clone"}
 
 
 @pytest.fixture
@@ -4486,6 +4491,34 @@ def test_the_service_env_wins_over_the_tool_cache_variable(
     o = _cached_orch(run_orch, tmp_path, preset="uv", env={"UV_CACHE_DIR": "/mine"})
     o.up("feat/x", uses=selection(o))
     assert envs[0]["UV_CACHE_DIR"] == "/mine"
+
+
+def test_the_service_env_wins_over_a_preset_variable_other_than_the_cache_folder(
+    run_orch,
+    tmp_path: Path,
+    install_cache: FakeInstallCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_envs: list[dict[str, str]] = []
+    setup_envs: list[dict[str, str]] = []
+    real_start, real_run = host.start, proc.run
+
+    def start(command: Any, cwd: Any, env: dict[str, str], *args: Any) -> ProcessState:
+        run_envs.append(env)
+        return real_start(command, cwd, env, *args)
+
+    def run(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args[:2]) == ["sh", "-c"]:
+            setup_envs.append(kwargs["env"])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(host, "start", start)
+    monkeypatch.setattr(proc, "run", run)
+    o = _cached_orch(run_orch, tmp_path, preset="uv", env={"UV_LINK_MODE": "copy"})
+    o.up("feat/x", uses=selection(o))
+    for env in (setup_envs[0], run_envs[0]):
+        assert env["UV_LINK_MODE"] == "copy"
+        assert env["UV_CACHE_DIR"] == "/wt-cache/uv"
 
 
 def test_a_service_without_setup_cache_gets_no_tool_variable(
@@ -6090,3 +6123,164 @@ def test_prune_of_a_branch_with_a_slash_keeps_its_files(orch, docker, isolated_h
     o.up("feat/deep/cart", uses=selection(o))
     assert o.prune() == []
     assert (router.dynamic_dir() / "shop--feat-deep-cart.yml").exists()
+
+
+# ---- du (SPEC section 36) --------------------------------------------------------------------
+
+
+def _measured(
+    monkeypatch: pytest.MonkeyPatch, results: dict[Path, DiskUsage | WtError]
+) -> list[Path]:
+    """Fake `disk.usage`: answers (or raises) per path; returns the paths it was asked for."""
+    asked: list[Path] = []
+
+    def usage(path: Path) -> DiskUsage:
+        asked.append(path)
+        result = results.get(path, DiskUsage(0, 0, 0))
+        if isinstance(result, WtError):
+            raise result
+        return result
+
+    monkeypatch.setattr(disk, "usage", usage)
+    return asked
+
+
+def test_du_has_a_row_per_wt_folder_the_cache_and_the_totals(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.up("feat/pay", uses=selection(o))
+    _measured(
+        monkeypatch,
+        {
+            isolated_home / "shop" / "worktrees" / "feat-cart": DiskUsage(300, 100, 200),
+            isolated_home / "shop" / "worktrees" / "feat-pay": DiskUsage(300, 50, 250),
+            isolated_home / "cache": DiskUsage(1000, 900, 100),
+        },
+    )
+    report = o.du()
+    assert [(r.name, r.path) for r in report.worktrees] == [
+        ("feat/cart", isolated_home / "shop" / "worktrees" / "feat-cart"),
+        ("feat/pay", isolated_home / "shop" / "worktrees" / "feat-pay"),
+    ]
+    assert report.worktrees[0].usage == DiskUsage(300, 100, 200)
+    assert report.cache == DiskUsage(1000, 900, 100)
+    assert (report.total_apparent_bytes, report.total_exclusive_bytes) == (1600, 1050)
+
+
+def test_du_total_exclusive_is_unknown_when_one_row_is(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    _measured(
+        monkeypatch,
+        {
+            isolated_home / "shop" / "worktrees" / "feat-cart": DiskUsage(300, None, None),
+            isolated_home / "cache": DiskUsage(1000, 900, 100),
+        },
+    )
+    report = o.du()
+    assert report.total_apparent_bytes == 1300
+    assert report.total_exclusive_bytes is None
+
+
+def test_du_total_exclusive_is_unknown_when_only_the_cache_is(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    _measured(
+        monkeypatch,
+        {
+            isolated_home / "shop" / "worktrees" / "feat-cart": DiskUsage(300, 100, 200),
+            isolated_home / "cache": DiskUsage(1000, None, None),
+        },
+    )
+    assert o.du().total_exclusive_bytes is None
+
+
+def test_du_skips_a_branch_without_a_folder_of_its_own(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("main", uses=selection(o))  # checked out in the repo: wt created no worktree
+    o.up("feat/cart", uses=selection(o))
+    asked = _measured(monkeypatch, {})
+    report = o.du()
+    assert [r.name for r in report.worktrees] == ["feat/cart"]
+    assert asked == [isolated_home / "shop" / "worktrees" / "feat-cart", isolated_home / "cache"]
+
+
+def test_du_gives_a_branch_spread_over_two_folders_a_row_per_folder(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    moved = isolated_home / "elsewhere"
+    moved.mkdir()  # a folder that does not exist is skipped, as one that vanished
+    with o.store.edit() as state:
+        repos = state.branches["feat/cart"].repos
+        repos["web"] = repos["api"].model_copy(update={"path": str(moved / "web")})
+    _measured(monkeypatch, {})
+    folders = [r.path for r in o.du().worktrees]
+    assert folders == [isolated_home / "shop" / "worktrees" / "feat-cart", moved]
+
+
+def test_du_skips_a_folder_that_vanishes_while_measured(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.up("feat/pay", uses=selection(o))
+    gone = isolated_home / "shop" / "worktrees" / "feat-cart"
+    shutil.rmtree(gone)
+    _measured(monkeypatch, {gone: WtError("cannot measure disk use, not a folder")})
+    assert [r.name for r in o.du().worktrees] == ["feat/pay"]
+
+
+def test_du_skips_a_folder_removed_while_the_measure_ran(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.up("feat/pay", uses=selection(o))
+    vanishing = isolated_home / "shop" / "worktrees" / "feat-cart"
+
+    def usage(path: Path) -> DiskUsage:
+        if path == vanishing:
+            shutil.rmtree(path)  # gone after the is_dir check, before the answer comes back
+        return DiskUsage(1, 1, 0)
+
+    monkeypatch.setattr(disk, "usage", usage)
+    assert [r.name for r in o.du().worktrees] == ["feat/pay"]
+
+
+def test_du_propagates_a_failure_on_a_folder_that_still_exists(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    folder = isolated_home / "shop" / "worktrees" / "feat-cart"
+    _measured(monkeypatch, {folder: WtError("boom")})
+    with pytest.raises(WtError, match="boom"):
+        o.du()
+
+
+def test_du_of_a_missing_cache_folder_is_a_row_of_zeros(orch, docker) -> None:
+    o = orch()
+    report = o.du()  # the real disk.usage: nothing was ever cached
+    assert report.worktrees == ()
+    assert report.cache == DiskUsage(0, 0, 0)
+    assert (report.total_apparent_bytes, report.total_exclusive_bytes) == (0, 0)
+
+
+def test_du_totals_sum_the_apparent_bytes_and_the_known_exclusive_bytes() -> None:
+    assert du_totals([DiskUsage(10, 4, 6), DiskUsage(5, 5, 0)]) == (15, 9)
+    assert du_totals([DiskUsage(10, 4, 6), DiskUsage(5, None, None)]) == (15, None)
+    assert du_totals([]) == (0, 0)
+
+
+def test_du_report_is_what_the_interface_gets(orch, docker) -> None:
+    assert isinstance(orch().du(), DuReport)
