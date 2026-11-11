@@ -13,7 +13,19 @@ from typer.testing import CliRunner
 
 from tests.conftest import COMPOSE, SHARED, SHOP_CATALOG, FakeDocker
 from tests.test_catalog_edit import EDIT_CATALOG
-from wt import __version__, cache, catalog_edit, cli, compose, dbeaver, doctor, host, proc
+from wt import (
+    __version__,
+    cache,
+    catalog_edit,
+    cli,
+    compose,
+    dbeaver,
+    disk,
+    doctor,
+    host,
+    paths,
+    proc,
+)
 from wt.catalog import load_project
 from wt.claudegen import ClaudeSyncResult
 from wt.claudemerge import Conflict
@@ -21,6 +33,8 @@ from wt.cli import app
 from wt.errors import WtError
 from wt.orchestrator import (
     BranchStatus,
+    DuReport,
+    DuRow,
     MoveResult,
     Orchestrator,
     PruneItem,
@@ -2170,6 +2184,15 @@ def fake_cache(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return calls
 
 
+KNOWN_CACHE_USAGE = disk.DiskUsage(52 * MIB, 30 * MIB, 22 * MIB)
+UNKNOWN_CACHE_USAGE = disk.DiskUsage(52 * MIB, None, None)
+
+
+@pytest.fixture
+def fake_cache_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "cache_usage", lambda: KNOWN_CACHE_USAGE)
+
+
 @pytest.mark.parametrize(
     ("size", "text"),
     [
@@ -2203,6 +2226,24 @@ def test_cache_ls_prints_a_table_the_tool_caches_and_the_total(fake_cache: dict[
     assert "total: 52 MiB" in result.output
 
 
+def test_cache_ls_total_line_shows_what_is_on_disk(
+    fake_cache: dict[str, Any], fake_cache_usage: None
+) -> None:
+    result = runner.invoke(app, ["cache", "ls"])
+    assert result.exit_code == 0, result.output
+    assert "total: 52 MiB (30 MiB on disk, 22 MiB shared)" in result.output
+
+
+def test_cache_ls_total_line_is_unchanged_when_exclusive_is_unknown(
+    fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
+    result = runner.invoke(app, ["cache", "ls"])
+    assert result.exit_code == 0, result.output
+    assert "total: 52 MiB\n" in result.output
+    assert "on disk" not in result.output
+
+
 def test_cache_ls_says_when_nothing_is_cached(fake_cache: dict[str, Any]) -> None:
     fake_cache["entries"] = []
     fake_cache["tools"] = {"uv": 0, "npm": 0}
@@ -2220,7 +2261,7 @@ def test_cache_ls_lists_tool_caches_even_without_entries(fake_cache: dict[str, A
     assert "empty" not in result.output
 
 
-def test_cache_ls_json(fake_cache: dict[str, Any]) -> None:
+def test_cache_ls_json(fake_cache: dict[str, Any], fake_cache_usage: None) -> None:
     result = runner.invoke(app, ["cache", "ls", "--json"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
@@ -2236,10 +2277,23 @@ def test_cache_ls_json(fake_cache: dict[str, Any]) -> None:
         ],
         "tools": {"uv": 12 * MIB, "npm": 0},
         "total_bytes": 52 * MIB,
+        "exclusive_bytes": 30 * MIB,
+        "shared_bytes": 22 * MIB,
     }
 
 
-def test_cache_ls_json_when_empty_is_still_a_document(fake_cache: dict[str, Any]) -> None:
+def test_cache_ls_json_exclusive_and_shared_are_null_when_unknown(
+    fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
+    document = json.loads(runner.invoke(app, ["cache", "ls", "--json"]).stdout)
+    assert document["total_bytes"] == 52 * MIB
+    assert document["exclusive_bytes"] is None and document["shared_bytes"] is None
+
+
+def test_cache_ls_json_when_empty_is_still_a_document(
+    fake_cache: dict[str, Any], fake_cache_usage: None
+) -> None:
     fake_cache["entries"] = []
     fake_cache["tools"] = {"uv": 0, "npm": 0}
     document = json.loads(runner.invoke(app, ["cache", "ls", "--json"]).stdout)
@@ -2248,6 +2302,8 @@ def test_cache_ls_json_when_empty_is_still_a_document(fake_cache: dict[str, Any]
         "entries": [],
         "tools": {"uv": 0, "npm": 0},
         "total_bytes": 0,
+        "exclusive_bytes": 30 * MIB,
+        "shared_bytes": 22 * MIB,
     }
 
 
@@ -2735,3 +2791,115 @@ def test_prune_outside_a_project_prunes_every_known_project(
     result = runner.invoke(app, ["prune", "--yes"])
     assert result.exit_code == 0, result.output
     assert fake_prune["calls"] == [("all", False)]
+
+
+# --- wt du (SPEC §36) ----------------------------------------------------------------------------
+# What is measured is tested in test_disk.py and test_orchestrator.py: here the core is faked and
+# only the printed text and the JSON document are checked.
+
+KNOWN_ROW = DuRow("feat/cart", Path("/wt/feat-cart"), disk.DiskUsage(3 * GIB, 200 * MIB, 2 * GIB))
+UNKNOWN_ROW = DuRow("feat/blog", Path("/wt/feat-blog"), disk.DiskUsage(MIB, None, None))
+
+
+def _fake_du(monkeypatch: pytest.MonkeyPatch, report: DuReport) -> None:
+    monkeypatch.setattr(Orchestrator, "du", lambda self: report)
+
+
+def _report(*rows: DuRow, cache_usage: disk.DiskUsage = KNOWN_CACHE_USAGE) -> DuReport:
+    usages = [*(row.usage for row in rows), cache_usage]
+    exclusives = [usage.exclusive_bytes for usage in usages]
+    return DuReport(
+        worktrees=rows,
+        cache=cache_usage,
+        total_apparent_bytes=sum(usage.apparent_bytes for usage in usages),
+        total_exclusive_bytes=None if None in exclusives else sum(e or 0 for e in exclusives),
+    )
+
+
+def test_du_prints_a_row_per_wt_folder_the_cache_and_the_total(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_du(monkeypatch, _report(KNOWN_ROW))
+    result = runner.invoke(app, ["du"])
+    assert result.exit_code == 0, result.output
+    for column in ("NAME", "PATH", "APPARENT", "EXCLUSIVE", "SHARED"):
+        assert column in result.output
+    [row] = [line for line in result.output.splitlines() if "feat/cart" in line]
+    assert "/wt/feat-cart" in row and "3 GiB" in row and "200 MiB" in row and "2 GiB" in row
+    [cache_row] = [line for line in result.output.splitlines() if line.startswith("cache")]
+    assert str(paths.cache_dir()) in result.output.replace("\n", "")
+    assert "52 MiB" in cache_row and "30 MiB" in cache_row and "22 MiB" in cache_row
+    [total_row] = [line for line in result.output.splitlines() if line.startswith("total")]
+    assert "3.1 GiB" in total_row and "230 MiB" in total_row
+
+
+def test_du_shows_a_dash_for_what_cannot_be_measured(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_du(monkeypatch, _report(UNKNOWN_ROW, cache_usage=UNKNOWN_CACHE_USAGE))
+    result = runner.invoke(app, ["du"])
+    assert result.exit_code == 0, result.output
+    [row] = [line for line in result.output.splitlines() if "feat/blog" in line]
+    assert row.count("\u2014") == 2 and "1 MiB" in row
+    [total_row] = [line for line in result.output.splitlines() if line.startswith("total")]
+    assert "\u2014" in total_row and "53 MiB" in total_row
+
+
+def test_du_without_worktrees_still_lists_the_cache_and_the_total(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_du(monkeypatch, _report())
+    result = runner.invoke(app, ["du"])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert any(line.startswith("cache") for line in lines)
+    assert any(line.startswith("total") for line in lines)
+
+
+def test_du_json(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_du(monkeypatch, _report(KNOWN_ROW))
+    result = runner.invoke(app, ["du", "--json"])
+    assert result.exit_code == 0, result.output
+    assert _document(result) == {
+        "schema": 1,
+        "worktrees": [
+            {
+                "name": "feat/cart",
+                "path": "/wt/feat-cart",
+                "apparent_bytes": 3 * GIB,
+                "exclusive_bytes": 200 * MIB,
+                "shared_bytes": 2 * GIB,
+            }
+        ],
+        "cache": {
+            "apparent_bytes": 52 * MIB,
+            "exclusive_bytes": 30 * MIB,
+            "shared_bytes": 22 * MIB,
+        },
+        "total": {"apparent_bytes": 3 * GIB + 52 * MIB, "exclusive_bytes": 230 * MIB},
+    }
+
+
+def test_du_json_unknown_values_are_null(shop, monkeypatch: pytest.MonkeyPatch) -> None:
+    shop()
+    _fake_du(monkeypatch, _report(UNKNOWN_ROW, cache_usage=UNKNOWN_CACHE_USAGE))
+    document = _document(runner.invoke(app, ["du", "--json"]))
+    assert document["worktrees"][0]["exclusive_bytes"] is None
+    assert document["worktrees"][0]["shared_bytes"] is None
+    assert document["cache"]["exclusive_bytes"] is None
+    assert document["total"] == {"apparent_bytes": 53 * MIB, "exclusive_bytes": None}
+
+
+def test_du_json_without_worktrees_has_an_empty_list_and_the_cache(
+    shop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shop()
+    _fake_du(monkeypatch, _report())
+    result = runner.invoke(app, ["du", "--json"])
+    assert result.exit_code == 0, result.output
+    document = _document(result)
+    assert document["worktrees"] == []
+    assert document["cache"]["exclusive_bytes"] == 30 * MIB
+    assert document["total"] == {"apparent_bytes": 52 * MIB, "exclusive_bytes": 30 * MIB}
