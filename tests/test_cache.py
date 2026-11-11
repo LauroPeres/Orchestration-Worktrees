@@ -144,7 +144,10 @@ def test_restorable_and_cached_path() -> None:
 
 
 def test_tool_env_points_at_the_tool_cache_and_creates_nothing() -> None:
-    assert cache.tool_env("uv") == {"UV_CACHE_DIR": str(tool_cache_dir("uv"))}
+    assert cache.tool_env("uv") == {
+        "UV_CACHE_DIR": str(tool_cache_dir("uv")),
+        "UV_LINK_MODE": "clone",
+    }
     assert cache.tool_env("npm") == {"npm_config_cache": str(tool_cache_dir("npm"))}
     assert not cache_dir().exists()
 

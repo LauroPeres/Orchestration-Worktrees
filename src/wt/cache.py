@@ -2,7 +2,8 @@
 
 An entry lives in `$WT_HOME/cache/installs/<key>/` as `node_modules/` plus `meta.json`. Entries are
 copied in and out, so pruning the store never breaks a worktree. The uv and npm tool caches are
-plain folders that the tools themselves manage; wt only points them there and measures them.
+plain folders that the tools themselves manage; wt points them there (uv also installs by
+copy-on-write clone, SPEC section 36) and measures them.
 """
 
 import contextlib
@@ -18,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from wt import proc
+from wt import disk, proc
 from wt.errors import WtError
 from wt.paths import installs_dir, tool_cache_dir, wt_home
 from wt.state import atomic_write, file_lock, now
@@ -37,7 +38,8 @@ class _PresetSpec:
     lock_files: tuple[str, ...]
     required: tuple[str, ...]
     cached_path: str | None  # what an entry stores; None = the preset shares only the tool cache
-    env_var: str
+    env: Mapping[str, str]  # fixed variables the preset sets next to the cache folder
+    cache_env_var: str  # the variable that carries the tool cache folder
 
 
 _PRESETS: dict[Preset, _PresetSpec] = {
@@ -45,13 +47,15 @@ _PRESETS: dict[Preset, _PresetSpec] = {
         lock_files=("package-lock.json", ".nvmrc", ".node-version"),
         required=("package-lock.json",),
         cached_path="node_modules",
-        env_var="npm_config_cache",
+        env={},
+        cache_env_var="npm_config_cache",
     ),
     "uv": _PresetSpec(
         lock_files=("uv.lock", ".python-version", "pyproject.toml"),
         required=(),
         cached_path=None,
-        env_var="UV_CACHE_DIR",
+        env={"UV_LINK_MODE": "clone"},  # installs into .venv become copy-on-write clones
+        cache_env_var="UV_CACHE_DIR",
     ),
 }
 
@@ -124,8 +128,9 @@ def cached_path(preset: Preset) -> str:
 
 
 def tool_env(preset: Preset) -> dict[str, str]:
-    """The variable that points the tool at wt's shared cache folder (nothing is created)."""
-    return {_PRESETS[preset].env_var: str(tool_cache_dir(preset))}
+    """The tool's cache folder variable (nothing is created) plus the preset's fixed variables."""
+    spec = _PRESETS[preset]
+    return {spec.cache_env_var: str(tool_cache_dir(preset)), **spec.env}
 
 
 # --- the store ---------------------------------------------------------------------------------
@@ -133,18 +138,6 @@ def tool_env(preset: Preset) -> dict[str, str]:
 
 def _entry_dir(key: str) -> Path | None:
     return installs_dir() / key if _KEY_PATTERN.fullmatch(key) else None
-
-
-def _tree_bytes(path: Path) -> int:
-    """Bytes under `path`; symlinks count as links, never followed."""
-    total = 0
-    for root, _dirs, files in os.walk(path):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(root, name)).st_size
-            except OSError:
-                continue  # vanished while walking: a concurrent prune or install
-    return total
 
 
 def _read_meta(entry_dir: Path) -> dict[str, object]:
@@ -170,7 +163,7 @@ def _read_entry(entry_dir: Path) -> Entry:
         service=_text(meta, "service"),
         bytes=size
         if isinstance(size, int) and not isinstance(size, bool)
-        else _tree_bytes(entry_dir),
+        else disk.apparent_bytes(entry_dir),
         last_used=_text(meta, "last_used"),
     )
 
@@ -284,7 +277,7 @@ def _write_staging(staging: Path, source: Path, preset: Preset, service: str, se
         "setup": setup,
         "created_at": stamp,
         "last_used": stamp,
-        "bytes": _tree_bytes(copied),
+        "bytes": disk.apparent_bytes(copied),
     }
     atomic_write(staging / META_FILE, json.dumps(meta, indent=2))
 
@@ -293,7 +286,7 @@ def _write_staging(staging: Path, source: Path, preset: Preset, service: str, se
 
 
 def tool_sizes() -> dict[str, int]:
-    return {tool: _tree_bytes(tool_cache_dir(tool)) for tool in TOOLS}
+    return {tool: disk.apparent_bytes(tool_cache_dir(tool)) for tool in TOOLS}
 
 
 def total_bytes() -> int:
@@ -336,7 +329,7 @@ def prune(
         for tool in TOOLS:
             folder = tool_cache_dir(tool)
             if folder.is_dir():
-                size = _tree_bytes(folder)
+                size = disk.apparent_bytes(folder)
                 _remove(folder)
                 removed.append(tool)
                 freed += size
