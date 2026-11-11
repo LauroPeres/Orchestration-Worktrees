@@ -44,7 +44,7 @@ def test_usage_parses_btrfs_du_and_sums_apparent_bytes(
     args, kwargs = calls[0]
     assert list(args) == ["btrfs", "filesystem", "du", "-s", "--raw", str(tmp_path)]
     assert kwargs["check"] is False
-    assert isinstance(kwargs["timeout"], float) and kwargs["timeout"] >= 60
+    assert kwargs["timeout"] == disk.BTRFS_DU_TIMEOUT_SECONDS
 
 
 def test_usage_parses_a_path_with_spaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -87,6 +87,7 @@ def test_a_non_zero_exit_gives_unknown(tmp_path: Path, monkeypatch: pytest.Monke
         HEADER + " 10 x 30  /some/path\n",
         HEADER + " 10 20\n",  # a row without columns for the name
         HEADER + " -10 20 30  /some/path\n",
+        HEADER + " \u00b2 2 3  /p\n",  # a superscript is str.isdigit() but not an int
     ],
 )
 def test_unparsable_output_gives_unknown(
@@ -143,3 +144,15 @@ def test_an_empty_folder_is_zero_bytes(tmp_path: Path, monkeypatch: pytest.Monke
     fake_btrfs(monkeypatch, WtError("no btrfs"))
 
     assert disk.usage(tmp_path).apparent_bytes == 0
+
+
+def test_apparent_bytes_adds_up_the_files_of_the_whole_tree(tmp_path: Path) -> None:
+    (tmp_path / "a.bin").write_bytes(b"x" * 100)
+    (tmp_path / "sub" / "deeper").mkdir(parents=True)
+    (tmp_path / "sub" / "deeper" / "b.bin").write_bytes(b"y" * 23)
+
+    assert disk.apparent_bytes(tmp_path) == 123
+
+
+def test_apparent_bytes_of_a_missing_path_is_zero(tmp_path: Path) -> None:
+    assert disk.apparent_bytes(tmp_path / "gone") == 0

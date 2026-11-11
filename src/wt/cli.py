@@ -44,7 +44,6 @@ from wt.orchestrator import (
     RemoteResult,
     RemoveResult,
     ServiceReport,
-    cache_usage,
     prune_all,
 )
 from wt.paths import cache_dir
@@ -1390,7 +1389,7 @@ def cache_ls(json_output: JsonOption = False) -> None:
     """List the cached installs and the uv/npm caches with their sizes."""
     with _json_errors(json_output):
         entries, tools, total = cache.entries(), cache.tool_sizes(), cache.total_bytes()
-        usage = cache_usage()
+        usage = cache.cache_usage()
         if json_output:
             _emit(
                 {

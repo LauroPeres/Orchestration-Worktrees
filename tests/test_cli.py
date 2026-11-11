@@ -2190,7 +2190,7 @@ UNKNOWN_CACHE_USAGE = disk.DiskUsage(52 * MIB, None, None)
 
 @pytest.fixture
 def fake_cache_usage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cli, "cache_usage", lambda: KNOWN_CACHE_USAGE)
+    monkeypatch.setattr(cache, "cache_usage", lambda: KNOWN_CACHE_USAGE)
 
 
 @pytest.mark.parametrize(
@@ -2237,7 +2237,7 @@ def test_cache_ls_total_line_shows_what_is_on_disk(
 def test_cache_ls_total_line_is_unchanged_when_exclusive_is_unknown(
     fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
+    monkeypatch.setattr(cache, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
     result = runner.invoke(app, ["cache", "ls"])
     assert result.exit_code == 0, result.output
     assert "total: 52 MiB\n" in result.output
@@ -2285,7 +2285,7 @@ def test_cache_ls_json(fake_cache: dict[str, Any], fake_cache_usage: None) -> No
 def test_cache_ls_json_exclusive_and_shared_are_null_when_unknown(
     fake_cache: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
+    monkeypatch.setattr(cache, "cache_usage", lambda: UNKNOWN_CACHE_USAGE)
     document = json.loads(runner.invoke(app, ["cache", "ls", "--json"]).stdout)
     assert document["total_bytes"] == 52 * MIB
     assert document["exclusive_bytes"] is None and document["shared_bytes"] is None

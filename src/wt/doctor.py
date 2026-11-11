@@ -11,7 +11,6 @@ from wt import cache, compose, host, proc, router, tls
 from wt.catalog import load_catalog
 from wt.config import BUILTIN_INFRA, LoadedConfig, Postgres, Shared
 from wt.errors import WtError
-from wt.orchestrator import cache_usage
 from wt.providers import kafka, keycloak, plugin_problems, postgres, redis
 from wt.state import StateStore, file_lock
 
@@ -162,9 +161,11 @@ def check_cache() -> Check:
     Reflinked installs share blocks, so the bytes they hold alone are the real size; when they
     cannot be measured (not btrfs) the apparent total is all there is.
     """
-    exclusive = cache_usage().exclusive_bytes
+    # The btrfs measure may take long on a huge cache; accepted, doctor is explicit.
+    usage = cache.cache_usage()
+    exclusive = usage.exclusive_bytes
     on_disk = exclusive is not None
-    used = exclusive if exclusive is not None else cache.total_bytes()
+    used = usage.apparent_bytes if exclusive is None else exclusive
     free = cache.free_bytes()
     if free < LOW_DISK_BYTES:
         return Check(

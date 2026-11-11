@@ -35,7 +35,7 @@ from wt.config import LoadedConfig, Service, find_cycle
 from wt.errors import WtError
 from wt.messages import no_services_message
 from wt.naming import Names
-from wt.paths import cache_dir, instance, project_dir
+from wt.paths import instance, project_dir
 from wt.projects import known_projects, scan_projects
 from wt.providers import postgres
 from wt.providers.base import BranchContext, Kind, Provider
@@ -1769,7 +1769,7 @@ class Orchestrator:
                 measured = _measure(folder)
                 if measured is not None:
                     rows.append(DuRow(bs.branch, folder, measured))
-        shared_cache = cache_usage()
+        shared_cache = cache.cache_usage()
         apparent, exclusive = du_totals([row.usage for row in rows] + [shared_cache])
         return DuReport(tuple(rows), shared_cache, apparent, exclusive)
 
@@ -2080,11 +2080,6 @@ def _consumers(services: dict[str, CatalogService], name: str) -> tuple[str, ...
     return tuple(other for other, svc in services.items() if name in svc.consumes)
 
 
-def cache_usage() -> disk.DiskUsage:
-    """Real disk use of `$WT_HOME/cache`; a cache that was never created is a row of zeros."""
-    return _measure(cache_dir()) or disk.DiskUsage(0, 0, 0)
-
-
 def du_totals(usages: Iterable[disk.DiskUsage]) -> tuple[int, int | None]:
     """(apparent, exclusive) summed; exclusive is None when any of `usages` cannot say."""
     rows = list(usages)
@@ -2098,11 +2093,12 @@ def du_totals(usages: Iterable[disk.DiskUsage]) -> tuple[int, int | None]:
 def _measure(folder: Path) -> disk.DiskUsage | None:
     """`disk.usage(folder)`, or None when the folder is gone; any other failure propagates."""
     try:
-        return disk.usage(folder)
+        measured = disk.usage(folder)
     except WtError:
         if folder.is_dir():
             raise
         return None
+    return measured if folder.is_dir() else None  # removed while the btrfs tool ran
 
 
 def wt_folder(bs: BranchState) -> str | None:

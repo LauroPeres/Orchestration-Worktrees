@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from wt import cache, proc
+from wt import cache, disk, proc
+from wt.disk import DiskUsage
 from wt.errors import WtError
 from wt.paths import cache_dir, installs_dir, tool_cache_dir
 
@@ -548,3 +549,45 @@ def test_free_bytes_uses_the_nearest_existing_parent(isolated_home: Path) -> Non
     assert cache.free_bytes() > 0
     isolated_home.mkdir()
     assert cache.free_bytes() > 0
+
+
+# ---- cache_usage (SPEC section 36) -----------------------------------------------------------
+
+
+def fake_usage(monkeypatch: pytest.MonkeyPatch, result: DiskUsage | WtError) -> list[Path]:
+    """Fake `disk.usage`: answers (or raises) for any path; returns the paths it was asked for."""
+    asked: list[Path] = []
+
+    def usage(path: Path) -> DiskUsage:
+        asked.append(path)
+        if isinstance(result, WtError):
+            raise result
+        return result
+
+    monkeypatch.setattr(disk, "usage", usage)
+    return asked
+
+
+def test_cache_usage_measures_the_cache_folder(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked = fake_usage(monkeypatch, DiskUsage(9, 4, 5))
+
+    assert cache.cache_usage() == DiskUsage(9, 4, 5)
+    assert asked == [isolated_home / "cache"]
+
+
+def test_cache_usage_of_a_cache_never_created_is_zeros(isolated_home: Path) -> None:
+    assert not (isolated_home / "cache").exists()
+
+    assert cache.cache_usage() == DiskUsage(0, 0, 0)
+
+
+def test_cache_usage_propagates_a_failure_on_a_cache_that_exists(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (isolated_home / "cache").mkdir(parents=True)
+    fake_usage(monkeypatch, WtError("boom"))
+
+    with pytest.raises(WtError, match="boom"):
+        cache.cache_usage()

@@ -1018,10 +1018,9 @@ def _disk(
     monkeypatch: pytest.MonkeyPatch, *, total: int, free: int, exclusive: int | None = None
 ) -> None:
     """The cache holds `total` apparent bytes, `exclusive` of them alone (None = unmeasurable)."""
-    monkeypatch.setattr(cache, "total_bytes", lambda: total)
     monkeypatch.setattr(cache, "free_bytes", lambda: free)
     usage = DiskUsage(total, exclusive, None if exclusive is None else total - exclusive)
-    monkeypatch.setattr(doctor, "cache_usage", lambda: usage)
+    monkeypatch.setattr(cache, "cache_usage", lambda: usage)
 
 
 def test_cache_check_reports_the_size_in_mib(monkeypatch: pytest.MonkeyPatch) -> None:

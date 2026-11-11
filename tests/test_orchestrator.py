@@ -4251,8 +4251,9 @@ class FakeInstallCache:
         return self.store_ok
 
     def tool_env(self, preset: str) -> dict[str, str]:
-        var = "npm_config_cache" if preset == "npm" else "UV_CACHE_DIR"
-        return {var: f"/wt-cache/{preset}"}
+        if preset == "npm":
+            return {"npm_config_cache": "/wt-cache/npm"}
+        return {"UV_CACHE_DIR": "/wt-cache/uv", "UV_LINK_MODE": "clone"}
 
 
 @pytest.fixture
@@ -4490,6 +4491,34 @@ def test_the_service_env_wins_over_the_tool_cache_variable(
     o = _cached_orch(run_orch, tmp_path, preset="uv", env={"UV_CACHE_DIR": "/mine"})
     o.up("feat/x", uses=selection(o))
     assert envs[0]["UV_CACHE_DIR"] == "/mine"
+
+
+def test_the_service_env_wins_over_a_preset_variable_other_than_the_cache_folder(
+    run_orch,
+    tmp_path: Path,
+    install_cache: FakeInstallCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_envs: list[dict[str, str]] = []
+    setup_envs: list[dict[str, str]] = []
+    real_start, real_run = host.start, proc.run
+
+    def start(command: Any, cwd: Any, env: dict[str, str], *args: Any) -> ProcessState:
+        run_envs.append(env)
+        return real_start(command, cwd, env, *args)
+
+    def run(args: Any, **kwargs: Any) -> proc.Result:
+        if list(args[:2]) == ["sh", "-c"]:
+            setup_envs.append(kwargs["env"])
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(host, "start", start)
+    monkeypatch.setattr(proc, "run", run)
+    o = _cached_orch(run_orch, tmp_path, preset="uv", env={"UV_LINK_MODE": "copy"})
+    o.up("feat/x", uses=selection(o))
+    for env in (setup_envs[0], run_envs[0]):
+        assert env["UV_LINK_MODE"] == "copy"
+        assert env["UV_CACHE_DIR"] == "/wt-cache/uv"
 
 
 def test_a_service_without_setup_cache_gets_no_tool_variable(
@@ -6190,6 +6219,7 @@ def test_du_gives_a_branch_spread_over_two_folders_a_row_per_folder(
     o = orch()
     o.up("feat/cart", uses=selection(o))
     moved = isolated_home / "elsewhere"
+    moved.mkdir()  # a folder that does not exist is skipped, as one that vanished
     with o.store.edit() as state:
         repos = state.branches["feat/cart"].repos
         repos["web"] = repos["api"].model_copy(update={"path": str(moved / "web")})
@@ -6210,6 +6240,23 @@ def test_du_skips_a_folder_that_vanishes_while_measured(
     assert [r.name for r in o.du().worktrees] == ["feat/pay"]
 
 
+def test_du_skips_a_folder_removed_while_the_measure_ran(
+    orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    o = orch()
+    o.up("feat/cart", uses=selection(o))
+    o.up("feat/pay", uses=selection(o))
+    vanishing = isolated_home / "shop" / "worktrees" / "feat-cart"
+
+    def usage(path: Path) -> DiskUsage:
+        if path == vanishing:
+            shutil.rmtree(path)  # gone after the is_dir check, before the answer comes back
+        return DiskUsage(1, 1, 0)
+
+    monkeypatch.setattr(disk, "usage", usage)
+    assert [r.name for r in o.du().worktrees] == ["feat/pay"]
+
+
 def test_du_propagates_a_failure_on_a_folder_that_still_exists(
     orch, docker, isolated_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6227,23 +6274,6 @@ def test_du_of_a_missing_cache_folder_is_a_row_of_zeros(orch, docker) -> None:
     assert report.worktrees == ()
     assert report.cache == DiskUsage(0, 0, 0)
     assert (report.total_apparent_bytes, report.total_exclusive_bytes) == (0, 0)
-
-
-def test_cache_usage_measures_the_cache_folder(
-    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    asked = _measured(monkeypatch, {isolated_home / "cache": DiskUsage(9, 4, 5)})
-    assert orchestrator.cache_usage() == DiskUsage(9, 4, 5)
-    assert asked == [isolated_home / "cache"]
-
-
-def test_cache_usage_propagates_a_failure_on_a_cache_that_exists(
-    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    (isolated_home / "cache").mkdir(parents=True)
-    _measured(monkeypatch, {isolated_home / "cache": WtError("boom")})
-    with pytest.raises(WtError, match="boom"):
-        orchestrator.cache_usage()
 
 
 def test_du_totals_sum_the_apparent_bytes_and_the_known_exclusive_bytes() -> None:

@@ -21,7 +21,7 @@ from typing import Literal
 
 from wt import disk, proc
 from wt.errors import WtError
-from wt.paths import installs_dir, tool_cache_dir, wt_home
+from wt.paths import cache_dir, installs_dir, tool_cache_dir, wt_home
 from wt.state import atomic_write, file_lock, now
 
 Preset = Literal["uv", "npm"]
@@ -291,6 +291,17 @@ def tool_sizes() -> dict[str, int]:
 
 def total_bytes() -> int:
     return sum(entry.bytes for entry in entries()) + sum(tool_sizes().values())
+
+
+def cache_usage() -> disk.DiskUsage:
+    """Real disk use of `$WT_HOME/cache`; a cache that was never created is a row of zeros."""
+    folder = cache_dir()
+    try:
+        return disk.usage(folder)
+    except WtError:
+        if folder.is_dir():
+            raise
+        return disk.DiskUsage(0, 0, 0)
 
 
 def _last_used(entry: Entry) -> datetime:

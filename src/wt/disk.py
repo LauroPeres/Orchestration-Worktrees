@@ -6,6 +6,7 @@ else, or when the tool fails, those two numbers are unknown (`None`), which is n
 """
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from wt.errors import WtError
 
 BTRFS_DU_TIMEOUT_SECONDS = 600.0  # a tree with hundreds of thousands of files takes minutes
 _DU_COLUMNS = 3  # Total, Exclusive, Set shared
+_ASCII_NUMBER = re.compile(r"[0-9]+")  # str.isdigit() also accepts "²", which int() rejects
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,8 @@ def _parse_du(output: str) -> tuple[int | None, int | None]:
     if len(lines) < 2:  # a header and at least one row
         return None, None
     columns = lines[-1].split(maxsplit=_DU_COLUMNS)
-    if len(columns) <= _DU_COLUMNS or not all(c.isdigit() for c in columns[:_DU_COLUMNS]):
+    if len(columns) <= _DU_COLUMNS or not all(
+        _ASCII_NUMBER.fullmatch(c) for c in columns[:_DU_COLUMNS]
+    ):
         return None, None
     return int(columns[1]), int(columns[2])
