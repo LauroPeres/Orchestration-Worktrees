@@ -11,8 +11,8 @@ Postgres/Kafka/Redis/Keycloak servers. Source of truth for scope and behavior: `
   `examples/`. README numbers come only from `examples/`, with the command that measured them.
 - **SPEC first.** Behavior changes go through the `spec-decision` skill (update `docs/SPEC.md`)
   before code. Scope follows the roadmap (SPEC §10): small working versions.
-- **PRs:** small and focused (one module or concern each). Claude may merge its own PRs when CI is
-  green, with "Create a merge commit", lowest stacked PR first.
+- **PRs:** small and focused (one module or concern each). Claude may merge its own PRs when the
+  checks pass locally, with "Create a merge commit", lowest stacked PR first.
 
 ## Stack
 Python 3.11+ · uv · typer (CLI) · textual (TUI) · pydantic (config) · jinja2 (sandboxed templates)
@@ -23,7 +23,7 @@ Python 3.11+ · uv · typer (CLI) · textual (TUI) · pydantic (config) · jinja
 |---|---|
 | Install | `uv sync` |
 | Run from source | `uv run wt --help` |
-| **All checks** (what CI runs) | `uv run ruff check && uv run ruff format --check && uv run mypy && uv run lint-imports && uv run pytest -q` |
+| **All checks** (run before every PR) | `uv run ruff check && uv run ruff format --check && uv run mypy && uv run lint-imports && uv run pytest -q` |
 | Tests / one file / one test | `uv run pytest -q` · `uv run pytest -q tests/test_naming.py` · `… -k <name>` |
 | Real runs (Docker daemon) | `uv run pytest -m docker` (slow; e2e agent) |
 | Layer contracts | `uv run lint-imports` |
