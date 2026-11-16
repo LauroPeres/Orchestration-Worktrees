@@ -88,7 +88,11 @@ def _demo_variables(home: Path, visitor: Mapping[str, str]) -> dict[str, str]:
 
 @contextmanager
 def demo_environment() -> Iterator[None]:
-    """Apply the demo's `WT_*` variables and hide the visitor's; restore them on any exit."""
+    """Apply the demo's `WT_*` variables and hide the visitor's; restore them on any exit.
+
+    It mutates `os.environ` because paths, router, compose and the providers read `WT_*` on
+    every call: there is no object to hand the demo's settings to.
+    """
     visitor = {k: v for k, v in os.environ.items() if k.startswith(ENV_PREFIX)}
     variables = _demo_variables(demo_home(), visitor)
     try:
@@ -187,7 +191,7 @@ def up(log: Log = print, port_in_use: PortInUse = doctor.port_in_use) -> DemoRes
     """Start the demo (or find it running) and return where to open it.
 
     `log` receives the same progress lines `wt up` prints. A failure after the first thing was
-    created ends with a hint to run `wt demo down`.
+    created, and Ctrl-C after the checks, end with a hint to run `wt demo down`.
     """
     with demo_environment():
         _require_docker()
@@ -196,6 +200,9 @@ def up(log: Log = print, port_in_use: PortInUse = doctor.port_in_use) -> DemoRes
             return _start(demo_home(), log)
         except WtError as exc:
             raise WtError(f"{exc}\n{CLEANUP_HINT}") from exc
+        except KeyboardInterrupt:
+            log(f"interrupted; {CLEANUP_HINT}")
+            raise
 
 
 def _remove_branches(home: Path, log: Log) -> None:
@@ -217,15 +224,19 @@ def _remove_shared_objects() -> None:
         router.container(),
     ):
         compose.down(project)
-    proc.run(["docker", "network", "rm", compose.network_name()], check=False)
+    compose.remove_network(compose.network_name())
 
 
 def down(log: Log = print) -> bool:
-    """Remove the demo: branches, shared servers, Traefik, network, files. False if none existed."""
+    """Remove the demo: branches, shared servers, Traefik, network, files. False if none existed.
+
+    A demo whose home was deleted by hand still has Docker objects: the `wtdemo` network says so.
+    Branches need the catalog in the home, so they are only removed when the home is there.
+    """
     home = demo_home()
-    if not home.exists():
-        return False
     with demo_environment():
+        if not home.exists() and not compose.network_exists(compose.network_name()):
+            return False
         _remove_branches(home, log)
         _remove_shared_objects()
     _delete_folder(home)

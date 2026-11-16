@@ -277,15 +277,30 @@ def logs_command(project: str, service: str, *, follow: bool, tail: int) -> list
     return [*args, service]
 
 
+def network_exists(name: str) -> bool:
+    return proc.run(["docker", "network", "inspect", name], check=False).ok
+
+
 def ensure_network() -> None:
-    inspect = ["docker", "network", "inspect", network_name()]
-    if proc.run(inspect, check=False).ok:
+    if network_exists(network_name()):
         return
     try:
         proc.run(["docker", "network", "create", network_name()])
     except proc.CommandError:
         # Another wt process may have created it between inspect and create.
-        if not proc.run(inspect, check=False).ok:
+        if not network_exists(network_name()):
+            raise
+
+
+def remove_network(name: str) -> None:
+    """Remove the Docker network; nothing to do when it does not exist."""
+    if not network_exists(name):
+        return
+    try:
+        proc.run(["docker", "network", "rm", name])
+    except proc.CommandError:
+        # Another process may have removed it between inspect and rm.
+        if network_exists(name):
             raise
 
 

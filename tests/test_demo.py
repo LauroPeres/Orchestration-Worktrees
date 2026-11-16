@@ -11,6 +11,7 @@ from wt import compose, demo, doctor, paths, proc, router, tls
 from wt.errors import WtError
 from wt.orchestrator import RemoveResult, ServiceReport
 from wt.providers import kafka, keycloak, postgres, redis
+from wt.state import StateStore
 
 DOCKER_OK = [doctor.Check("docker", "ok", "engine 27")]
 HOST_FOR = {"main": "main.shop.localhost", "feat/cart": "feat-cart.shop.localhost"}
@@ -30,6 +31,7 @@ class Harness:
     traefik_running: bool = False
     docker_checks: list[doctor.Check] = field(default_factory=lambda: list(DOCKER_OK))
     network_removals: list[str] = field(default_factory=list)
+    network_present: bool = False  # the `wtdemo` Docker network exists
     compose_downs: list[str] = field(default_factory=list)
 
     @property
@@ -51,9 +53,12 @@ class Harness:
             shop = Path(args[2])
             shop.mkdir(parents=True)
             (shop / "catalog.yaml").write_text("project: shop\n")
+        elif args[:3] == ["docker", "network", "inspect"]:
+            return proc.Result(0 if self.network_present else 1, "", "")
         elif args[:3] == ["docker", "network", "rm"]:
             self.note("network rm")
             self.network_removals.append(args[3])
+            self.network_present = False
         else:
             raise AssertionError(f"unexpected command {args}")
         return proc.Result(0, "", "")
@@ -163,6 +168,38 @@ def test_environment_is_restored_after_an_error_and_ctrl_c(
     with pytest.raises(type(error)), demo.demo_environment():
         raise error
     assert dict(os.environ) == before
+
+
+def test_environment_scope_applies_to_the_modules_that_read_it_and_gives_it_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No mocks: the real modules read the real `os.environ` inside and outside the scope."""
+    visitor_home = tmp_path / "visitor-home"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("WT_HOME", str(visitor_home))
+    monkeypatch.setenv("WT_INSTANCE", "visitor")
+    monkeypatch.setenv("WT_HTTPS_PORT", "8443")
+    monkeypatch.setenv("WT_POSTGRES_PORT", "1111")
+
+    with demo.demo_environment():
+        assert paths.wt_home() == demo.demo_home()
+        assert paths.instance() == "wtdemo"
+        assert router.container() == "wtdemo-traefik"
+        assert compose.network_name() == "wtdemo"
+        assert router.https_port() == 8443  # the visitor's choice survives
+        assert postgres.host_port() == postgres.DEFAULT_PORT + 100
+        assert redis.host_port() == redis.DEFAULT_PORT + 100
+        assert kafka.host_port() == kafka.DEFAULT_PORT + 100
+        assert keycloak.host_port() == keycloak.DEFAULT_PORT + 100
+        assert StateStore("shop").path == demo.demo_home() / "shop" / "state.json"
+
+    assert paths.wt_home() == visitor_home
+    assert paths.instance() == "visitor"
+    assert router.container() == "visitor-traefik"
+    assert compose.network_name() == "visitor"
+    assert router.https_port() == 8443
+    assert postgres.host_port() == 1111
+    assert StateStore("shop").path == visitor_home / "shop" / "state.json"
 
 
 # ---- up ---------------------------------------------------------------------------------
@@ -305,6 +342,29 @@ def test_a_failing_bootstrap_ends_with_the_cleanup_hint(
         run_up(harness)
 
 
+def test_ctrl_c_after_the_checks_prints_the_cleanup_hint_and_propagates(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(self: FakeOrchestrator, branch: str, **_: object) -> list[ServiceReport]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakeOrchestrator, "up", interrupted)
+    lines: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        run_up(harness, lines.append)
+    assert lines[-1] == "interrupted; run `wt demo down` to clean up"
+
+
+def test_ctrl_c_during_the_checks_has_nothing_to_clean_up(harness: Harness) -> None:
+    def interrupted(port: int) -> bool:
+        raise KeyboardInterrupt
+
+    lines: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        demo.up(lines.append, interrupted)
+    assert lines == []
+
+
 def test_an_unhealthy_service_is_a_failure(harness: Harness) -> None:
     harness.reports["main"] = [ServiceReport("api", "fail", "HTTP 502")]
     with pytest.raises(WtError) as caught:
@@ -346,6 +406,7 @@ def test_environment_is_restored_after_a_successful_up(
 def make_demo_home(harness: Harness, *, with_catalog: bool = True) -> None:
     shop = harness.home / "shop"
     shop.mkdir(parents=True)
+    harness.network_present = True
     if with_catalog:
         (shop / "catalog.yaml").write_text("project: shop\n")
 
@@ -371,6 +432,28 @@ def test_down_removes_branches_servers_network_and_the_home_in_order(harness: Ha
     assert harness.network_removals == ["wtdemo"]
     assert not harness.home.exists()
     assert all(env["WT_INSTANCE"] == "wtdemo" for env in harness.envs.values())
+
+
+def test_down_without_a_home_still_tears_down_docker_when_the_network_exists(
+    harness: Harness,
+) -> None:
+    harness.network_present = True
+    assert demo.down(lambda m: None) is True
+    assert harness.events == [
+        "compose down wtdemo-postgres",
+        "compose down wtdemo-redis",
+        "compose down wtdemo-kafka",
+        "compose down wtdemo-keycloak",
+        "compose down wtdemo-traefik",
+        "network rm",
+    ]
+    assert harness.network_removals == ["wtdemo"]
+    assert all(env["WT_INSTANCE"] == "wtdemo" for env in harness.envs.values())
+
+
+def test_down_without_a_home_or_a_network_is_no_demo(harness: Harness) -> None:
+    assert demo.down(lambda m: None) is False
+    assert harness.events == []
 
 
 def test_down_twice_is_safe(harness: Harness) -> None:
