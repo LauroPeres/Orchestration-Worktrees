@@ -1,50 +1,44 @@
-"""Serve one HTML page that shows the branch and lists items fetched from the API."""
+"""Serve one HTML page: the branch, its items and what is isolated for it, all from the API."""
 
 import argparse
 import html
 import json
 import os
+import re
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-PAGE = """<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>shop</title></head>
-<body>
-<h1>shop on <code id="branch"></code></h1>
-%s
-<ul id="items"></ul>
-<form id="form">
-  <input id="name" placeholder="item name" required>
-  <button>Add</button>
-</form>
-<script>
-const cfg = %s;
-document.getElementById("branch").textContent = cfg.branch;
-async function load() {
-  const rows = await (await fetch(cfg.apiUrl + "/items")).json();
-  document.getElementById("items").innerHTML = "";
-  for (const row of rows) {
-    const li = document.createElement("li");
-    li.textContent = row.name + ("quantity" in row ? " x" + row.quantity : "");
-    document.getElementById("items").appendChild(li);
-  }
-}
-document.getElementById("form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  await fetch(cfg.apiUrl + "/items", {
-    method: "POST",
-    headers: {"content-type": "application/json"},
-    body: JSON.stringify({name: document.getElementById("name").value}),
-  });
-  document.getElementById("name").value = "";
-  load();
-});
-load();
-</script>
-</body>
-</html>
-"""
+MAIN_HUE = 215  # `main` always wears this blue
+MIN_HUE_GAP = 40  # other branches stay at least this far from it, so main never looks like a branch
+REFRESH_MS = 2000
+
+# The page is a template next to this file; render_page fills its `__NAME__` placeholders.
+PAGE = (Path(__file__).parent / "page.html").read_text()
+
+
+def accent_color(branch: str) -> str:
+    """The branch's page color: `main` is fixed, the others get a hue from a hash of the name."""
+    if branch == "main":
+        hue = MAIN_HUE
+    else:
+        free_arc = 360 - 2 * MIN_HUE_GAP
+        hue = (MAIN_HUE + MIN_HUE_GAP + zlib.crc32(branch.encode()) % free_arc) % 360
+    return f"hsl({hue} 70% 40%)"
+
+
+def render_page(config: dict[str, str], sign_in: str) -> str:
+    """The page for one branch; `config` reaches the script as JSON that cannot close its tag."""
+    values = {
+        "TITLE": html.escape(config["branch"]),
+        "ACCENT": accent_color(config["branch"]),
+        "SIGN_IN": sign_in,
+        "REFRESH_MS": str(REFRESH_MS),
+        "CONFIG": json.dumps(config).replace("<", "\\u003c"),
+    }
+    # One pass, so a value that looks like a placeholder is never substituted again.
+    return re.sub(r"__([A-Z_]+)__", lambda match: values[match.group(1)], PAGE)
 
 
 def sign_in_link() -> str:
@@ -64,14 +58,14 @@ def sign_in_link() -> str:
         }
     )
     path = f"/realms/{urllib.parse.quote(realm, safe='')}/protocol/openid-connect/auth"
-    return f'<p><a id="sign-in" href="{html.escape(f"{base}{path}?{query}")}">Sign in</a></p>'
+    href = html.escape(f"{base}{path}?{query}")
+    return f'<p id="sign-in-line"><a id="sign-in" href="{href}">Sign in</a></p>'
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         config = {"branch": os.environ.get("BRANCH", ""), "apiUrl": os.environ.get("API_URL", "")}
-        # "<" is escaped so a value can never close the script tag.
-        body = (PAGE % (sign_in_link(), json.dumps(config).replace("<", "\\u003c"))).encode()
+        body = render_page(config, sign_in_link()).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

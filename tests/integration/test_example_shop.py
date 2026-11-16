@@ -220,6 +220,52 @@ def test_shop_branches_are_isolated(shop: Orchestrator, monkeypatch: pytest.Monk
     assert f"worker-{project}.feat-cart" in kafka_list("kafka-consumer-groups.sh")
     assert f"{project}.feat-cart.items" in kafka_list("kafka-topics.sh")
 
+    # /info: each api reports its own slice of every shared server, and what its worker consumed.
+    main_info = request(main_api, "GET", "/info")
+    cart_info = request(cart_api, "GET", "/info")
+    assert main_info == (
+        200,
+        {
+            "branch": "main",
+            "database": "shop__main",
+            "redis_prefix": f"{project}:main:",
+            "kafka_topic": f"{project}.main.items",
+            "kafka_group": f"worker-{project}.main",
+            "events": 1,
+            "recent": ["lamp"],
+        },
+    )
+    assert cart_info == (
+        200,
+        {
+            "branch": "feat/cart",
+            "database": "shop__feat_cart",
+            "redis_prefix": f"{project}:feat-cart:",
+            "kafka_topic": f"{project}.feat-cart.items",
+            "kafka_group": f"worker-{project}.feat-cart",
+            "events": 2,
+            "recent": ["plug", "cable"],  # newest first
+        },
+    )
+    assert redis_cli("LRANGE", f"{project}:feat-cart:recent", "0", "-1").split() == [
+        "plug",
+        "cable",
+    ]
+    # The api listed the worker's group only to name it: it never joined, so the group has the
+    # worker as its one member.
+    members = kafka.tool(
+        "kafka-consumer-groups.sh",
+        "--describe",
+        "--group",
+        f"worker-{project}.feat-cart",
+        "--members",
+    ).stdout
+    assert members.count("rdkafka-") == 1, members
+    page = page_body(f"feat-cart.{domain}")
+    assert "Isolated for this branch" in page
+    assert "setInterval(refreshInfo, 2000)" in page
+    assert page_body(f"main.{domain}") != page  # a different accent color and branch name
+
     # Keycloak: one client per branch, each with its own redirect URI, and a working login page.
     port = router.https_port()
     cart_web = f"https://feat-cart.{domain}:{port}"
