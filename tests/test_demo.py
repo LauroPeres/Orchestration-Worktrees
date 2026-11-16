@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from wt import compose, demo, doctor, paths, proc, router, tls
+from wt import compose, demo, doctor, orchestrator, paths, proc, router, tls
 from wt.errors import WtError
 from wt.orchestrator import RemoveResult, ServiceReport
 from wt.providers import kafka, keycloak, postgres, redis
@@ -33,6 +33,9 @@ class Harness:
     network_removals: list[str] = field(default_factory=list)
     network_present: bool = False  # the `wtdemo` Docker network exists
     compose_downs: list[str] = field(default_factory=list)
+    compose_projects: set[str] = field(default_factory=set)  # compose projects Docker knows
+    project_searches: list[str] = field(default_factory=list)  # prefixes wt_projects was asked
+    orchestrator_out: list[Callable[[str], None] | None] = field(default_factory=list)
 
     @property
     def home(self) -> Path:
@@ -66,8 +69,19 @@ class Harness:
     def compose_down(self, project: str) -> None:
         self.note(f"compose down {project}")
         self.compose_downs.append(project)
+        self.compose_projects.discard(project)
 
-    def make_orchestrator(self, loaded: object, log: Callable[[str], None]) -> "FakeOrchestrator":
+    def wt_projects(self, prefix: str) -> set[str]:
+        self.project_searches.append(prefix)
+        return {name for name in self.compose_projects if name.startswith(prefix)}
+
+    def make_orchestrator(
+        self,
+        loaded: object,
+        log: Callable[[str], None],
+        out: Callable[[str], None] | None = None,
+    ) -> "FakeOrchestrator":
+        self.orchestrator_out.append(out)
         return FakeOrchestrator(self, log)
 
 
@@ -101,6 +115,7 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     h = Harness(state)
     monkeypatch.setattr(proc, "run", h.run)
     monkeypatch.setattr(compose, "down", h.compose_down)
+    monkeypatch.setattr(compose, "wt_projects", h.wt_projects)
     monkeypatch.setattr(doctor, "check_docker", lambda: h.docker_checks)
     monkeypatch.setattr(router, "is_running", lambda: h.traefik_running)
     monkeypatch.setattr(tls, "available", lambda: True)
@@ -235,6 +250,75 @@ def test_up_streams_the_orchestrators_progress(harness: Harness) -> None:
     run_up(harness, lines.append)
     assert "up main" in lines
     assert "up feat/cart" in lines
+
+
+def test_up_sends_the_raw_compose_output_to_a_sink_not_the_terminal(harness: Harness) -> None:
+    # With no sink compose output goes straight to the terminal; with one, proc captures it
+    # and a failing command's error carries it (test_proc: on_line streams merged output).
+    lines: list[str] = []
+    run_up(harness, lines.append)
+    sinks = [sink for sink in harness.orchestrator_out if sink is not None]
+    assert sinks and len(sinks) == len(harness.orchestrator_out)
+    shown = list(lines)
+    for sink in sinks:
+        sink("#1 [internal] load build definition from Dockerfile")
+    assert lines == shown
+
+
+def test_up_hides_the_claude_merge_and_the_wt_up_interrupt_hint(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def chatty(self: FakeOrchestrator, branch: str, **_: object) -> list[ServiceReport]:
+        self.log(f"repo 'web': {branch!r} is already checked out at /x; using it")
+        self.log("Claude: merged .claude + CLAUDE.md in /x (0 agents, 0 skills); conflicts: none")
+        self.log(f"interrupted: wt up {branch} again, or wt down {branch}")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakeOrchestrator, "up", chatty)
+    lines: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        run_up(harness, lines.append)
+    assert lines[1:] == [
+        "repo 'web': 'main' is already checked out at /x; using it",
+        "interrupted; run `wt demo down` to clean up",
+    ]
+
+
+def test_the_hidden_lines_are_the_orchestrators_own() -> None:
+    assert demo.HIDDEN_LINE_PREFIXES == (
+        orchestrator.CLAUDE_MERGED_PREFIX,
+        orchestrator.UP_INTERRUPTED_PREFIX,
+    )
+
+
+def test_first_run_notice_comes_after_the_checks_and_before_the_bootstrap(
+    harness: Harness,
+) -> None:
+    def notice() -> None:
+        harness.note("first run notice")
+
+    demo.up(lambda m: None, harness.probe, notice)
+    assert harness.events[:2] == ["first run notice", "bootstrap"]
+    assert harness.probed == [80, 443]
+
+
+def test_no_first_run_notice_on_a_second_run(harness: Harness) -> None:
+    run_up(harness)
+    notices: list[str] = []
+    demo.up(lambda m: None, harness.probe, lambda: notices.append("notice"))
+    assert notices == []
+
+
+@pytest.mark.parametrize("failing_check", ["docker", "port"])
+def test_no_first_run_notice_when_a_check_fails(harness: Harness, failing_check: str) -> None:
+    if failing_check == "docker":
+        harness.docker_checks = [doctor.Check("docker", "fail", "not running", "start it")]
+    else:
+        harness.busy_ports = {443}
+    notices: list[str] = []
+    with pytest.raises(WtError):
+        demo.up(lambda m: None, harness.probe, lambda: notices.append("notice"))
+    assert notices == []
 
 
 def test_up_says_when_the_certificate_is_self_signed(
@@ -449,6 +533,42 @@ def test_down_without_a_home_still_tears_down_docker_when_the_network_exists(
     ]
     assert harness.network_removals == ["wtdemo"]
     assert all(env["WT_INSTANCE"] == "wtdemo" for env in harness.envs.values())
+
+
+def test_down_without_a_home_removes_the_branches_app_projects_before_the_network(
+    harness: Harness,
+) -> None:
+    harness.network_present = True
+    harness.compose_projects = {
+        "wtdemo-shop-main-api",
+        "wtdemo-shop-feat-cart-api",
+        "wtdemo-postgres",
+        "wtdemo-traefik",
+        "wt-shop-main-api",  # the visitor's own wt: never touched
+    }
+    assert demo.down(lambda m: None) is True
+    assert harness.project_searches == ["wtdemo-"]
+    assert harness.events == [
+        "compose down wtdemo-shop-feat-cart-api",
+        "compose down wtdemo-shop-main-api",
+        "compose down wtdemo-postgres",
+        "compose down wtdemo-redis",
+        "compose down wtdemo-kafka",
+        "compose down wtdemo-keycloak",
+        "compose down wtdemo-traefik",
+        "network rm",
+    ]
+    assert harness.compose_projects == {"wt-shop-main-api"}
+
+
+def test_down_with_a_home_also_sweeps_app_projects_left_after_the_branch_removals(
+    harness: Harness,
+) -> None:
+    make_demo_home(harness)
+    harness.compose_projects = {"wtdemo-shop-main-api"}  # e.g. not in the branch's state
+    assert demo.down(lambda m: None) is True
+    assert harness.events.index("compose down wtdemo-shop-main-api") == 2  # after both removes
+    assert harness.events[-1] == "network rm"
 
 
 def test_down_without_a_home_or_a_network_is_no_demo(harness: Harness) -> None:

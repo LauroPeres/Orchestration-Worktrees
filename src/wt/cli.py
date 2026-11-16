@@ -1633,9 +1633,10 @@ def demo_command(ctx: typer.Context, json_output: JsonOption = False) -> None:
     if ctx.invoked_subcommand is not None:
         return
     with _json_errors(json_output):
-        if demo.is_first_run():
-            (err if json_output else console).print(DEMO_FIRST_RUN)
-        result = demo.up(log=_progress(json_output))
+        result = demo.up(
+            log=_progress(json_output),
+            on_first_run=lambda: (err if json_output else console).print(DEMO_FIRST_RUN),
+        )
         if json_output:
             _emit(_demo_json(result))
         else:

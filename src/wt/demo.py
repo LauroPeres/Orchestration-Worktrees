@@ -15,11 +15,17 @@ from pathlib import Path
 from wt import compose, doctor, paths, proc, router, tls
 from wt.catalog import load_project
 from wt.errors import WtError
-from wt.orchestrator import Orchestrator, ServiceReport
+from wt.orchestrator import (
+    CLAUDE_MERGED_PREFIX,
+    UP_INTERRUPTED_PREFIX,
+    Orchestrator,
+    ServiceReport,
+)
 from wt.providers import kafka, keycloak, postgres, redis
 
 Log = Callable[[str], None]
 PortInUse = Callable[[int], bool]
+Notice = Callable[[], None]
 
 INSTANCE = "wtdemo"
 STATE_DIR_NAME = "wt-demo"
@@ -44,6 +50,9 @@ DEFAULT_HTTPS_PORT = "443"
 HTTP_RETRY = ("WT_HTTP_PORT", 8080)
 HTTPS_RETRY = ("WT_HTTPS_PORT", 8443)
 CLEANUP_HINT = "run `wt demo down` to clean up"
+# `wt up` lines a visitor has no use for (SPEC §37): the `.claude` merge, and the Ctrl-C hint
+# naming `wt up`/`wt down <branch>` (the demo prints its own).
+HIDDEN_LINE_PREFIXES = (CLAUDE_MERGED_PREFIX, UP_INTERRUPTED_PREFIX)
 
 
 @dataclass(frozen=True)
@@ -175,9 +184,26 @@ def _demo_branch(orch: Orchestrator, branch: str) -> DemoBranch:
     )
 
 
+def _discard_output(line: str) -> None:
+    """Sink for raw `docker compose` output: hidden from the visitor, yet still captured, so a
+    failing command's error carries it."""
+
+
+def _visitor_log(log: Log) -> Log:
+    """`log` without the lines in `HIDDEN_LINE_PREFIXES`."""
+
+    def shown(message: str) -> None:
+        if not message.startswith(HIDDEN_LINE_PREFIXES):
+            log(message)
+
+    return shown
+
+
 def _start(home: Path, log: Log) -> DemoResult:
     _bootstrap(home, log)
-    orch = Orchestrator(load_project(_catalog_file(home)), log=log)
+    orch = Orchestrator(
+        load_project(_catalog_file(home)), log=_visitor_log(log), out=_discard_output
+    )
     for branch in BRANCHES:
         failure = _unhealthy(branch, orch.up(branch, uses=USES))
         if failure:
@@ -187,15 +213,27 @@ def _start(home: Path, log: Log) -> DemoResult:
     )
 
 
-def up(log: Log = print, port_in_use: PortInUse = doctor.port_in_use) -> DemoResult:
+def _no_notice() -> None:
+    """Default `on_first_run`: say nothing."""
+
+
+def up(
+    log: Log = print,
+    port_in_use: PortInUse = doctor.port_in_use,
+    on_first_run: Notice = _no_notice,
+) -> DemoResult:
     """Start the demo (or find it running) and return where to open it.
 
-    `log` receives the same progress lines `wt up` prints. A failure after the first thing was
-    created, and Ctrl-C after the checks, end with a hint to run `wt demo down`.
+    `log` receives wt's progress lines (not the raw `docker compose` output). `on_first_run` is
+    called once the checks passed and before anything is downloaded, when the demo never ran.
+    A failure after the first thing was created, and Ctrl-C after the checks, end with a hint
+    to run `wt demo down`.
     """
     with demo_environment():
         _require_docker()
         _require_free_ports(port_in_use)
+        if is_first_run():
+            on_first_run()
         try:
             return _start(demo_home(), log)
         except WtError as exc:
@@ -214,15 +252,22 @@ def _remove_branches(home: Path, log: Log) -> None:
         orch.remove(branch, force=True)  # the home is deleted next: nothing to protect
 
 
-def _remove_shared_objects() -> None:
-    """Every Docker object the demo instance owns: its servers, Traefik and the network."""
-    for project in (
+def _remove_docker_objects() -> None:
+    """Every Docker object the demo instance owns: app projects, servers, Traefik, the network.
+
+    The branches' app projects are found by name, not state: without a home nothing else
+    knows them, and their containers keep the network in use. After `_remove_branches` the
+    search finds none of them; it is a cheap safety net.
+    """
+    shared = [
         postgres.container(),
         redis.container(),
         kafka.container(),
         keycloak.container(),
         router.container(),
-    ):
+    ]
+    apps = sorted(compose.wt_projects(f"{INSTANCE}-") - set(shared))
+    for project in [*apps, *shared]:  # consumers before the servers they use
         compose.down(project)
     compose.remove_network(compose.network_name())
 
@@ -231,13 +276,14 @@ def down(log: Log = print) -> bool:
     """Remove the demo: branches, shared servers, Traefik, network, files. False if none existed.
 
     A demo whose home was deleted by hand still has Docker objects: the `wtdemo` network says so.
-    Branches need the catalog in the home, so they are only removed when the home is there.
+    Branches need the catalog in the home, so they are only removed when the home is there;
+    without it their host processes (state holds their pids) cannot be found and keep running.
     """
     home = demo_home()
     with demo_environment():
         if not home.exists() and not compose.network_exists(compose.network_name()):
             return False
         _remove_branches(home, log)
-        _remove_shared_objects()
+        _remove_docker_objects()
     _delete_folder(home)
     return True

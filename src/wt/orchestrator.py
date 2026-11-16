@@ -63,6 +63,9 @@ ROUTE_WAIT_SECONDS = 5  # the default wait of router.wait_unrouted
 FOLDER_LISTED_ENTRIES = 5  # entries named in the "kept <folder>: not empty" warning
 NOT_MERGED_REASON = "not merged into {base}"  # base: origin's default branch, e.g. origin/main
 NO_ORIGIN_REASON = "no origin"
+# Starts of progress lines a caller may hide; `wt demo` shows neither (SPEC §37).
+CLAUDE_MERGED_PREFIX = "Claude: merged"
+UP_INTERRUPTED_PREFIX = "interrupted: wt up"
 
 Log = Callable[[str], None]
 Outcome = Literal["ok", "fail", "skipped"]
@@ -552,7 +555,7 @@ class Orchestrator:
             except KeyboardInterrupt:
                 # What was started stays in state, so `down` stops it.
                 self._record(branch, lambda bs: setattr(bs, "status", "failed"))
-                self.log(f"interrupted: wt up {branch} again, or wt down {branch}")
+                self.log(f"{UP_INTERRUPTED_PREFIX} {branch} again, or wt down {branch}")
                 raise
 
     def _up_certificate(self, branch: str, names: Names) -> tuple[Path, Path] | None:
@@ -1352,7 +1355,7 @@ class Orchestrator:
         if result.changed:
             conflicts = ", ".join(c.key for c in result.conflicts) or "none"
             self.log(
-                f"Claude: merged .claude + CLAUDE.md in {result.folder} "
+                f"{CLAUDE_MERGED_PREFIX} .claude + CLAUDE.md in {result.folder} "
                 f"({len(result.agents)} agents, {len(result.skills)} skills); "
                 f"conflicts: {conflicts}"
             )

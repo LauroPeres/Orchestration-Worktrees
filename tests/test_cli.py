@@ -2939,8 +2939,10 @@ def fake_demo(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "calls": [],
     }
 
-    def up(log, **_: Any) -> demo.DemoResult:
+    def up(log, on_first_run, **_: Any) -> demo.DemoResult:
         state["calls"].append("up")
+        if state["first_run"]:
+            on_first_run()
         log(state["progress"])
         if state["error"]:
             raise state["error"]
@@ -2953,7 +2955,6 @@ def fake_demo(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             raise state["error"]
         return bool(state["removed"])
 
-    monkeypatch.setattr(demo, "is_first_run", lambda: state["first_run"])
     monkeypatch.setattr(demo, "up", up)
     monkeypatch.setattr(demo, "down", down)
     return state
