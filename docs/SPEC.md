@@ -1616,8 +1616,8 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   (`<branch>  https://<slug>.shop.localhost[:PORT]  api: https://api.<slug>.shop.localhost[:PORT]/items`; `:PORT` only
   when the HTTPS port is not 443), `Add an item on one branch: it appears only there.`, the self-signed certificate
   note when mkcert is missing, `Remove everything: wt demo down`. `--json`: `{"branches": [{"branch", "web", "api"}],
-  "home": str}`; `down --json`: `{"removed": bool}`. Before a first run (no demo home yet) it prints
-  `First run downloads the images (~1–2 GB, a few minutes).`
+  "home": str}`; `down --json`: `{"removed": bool}`; `down` text: `Demo removed.` or `no demo to remove`. Before a first run (no
+  demo home yet) it prints `First run downloads the images (~1–2 GB, a few minutes).` (to stderr under `--json`).
 - **Demo environment (`wt.demo`, core).** The demo runs the existing use cases unchanged (doctor checks, `up`,
   `remove`) inside an environment applied for the command only and restored afterwards, also on error or Ctrl-C:
   `WT_INSTANCE=wtdemo`; `WT_HOME=<state dir>/wt-demo` (`$XDG_STATE_HOME/wt-demo`, else `~/.local/state/wt-demo`;
@@ -1625,16 +1625,17 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   `WT_KEYCLOAK_PORT` = their default + 100; `WT_HTTP_PORT`/`WT_HTTPS_PORT` = the visitor's value when set, else
   80/443; `WT_NO_FETCH=1`. Any other `WT_*` variable of the visitor is ignored for the duration (removed, then
   restored). The demo never reads or writes `~/.wt`, the visitor's catalog or any `wt-*` Docker object.
-- **`wt demo` steps, in order.** (1) Docker answers, else the same message as doctor's Docker check. (2) The HTTP and
+- **`wt demo` steps, in order.** (1) Docker answers, else the first failing doctor Docker check as `<check>: <detail>; <hint>`. (2) The HTTP and
   HTTPS ports are free on `127.0.0.1`, or `wtdemo-traefik` is the one running; otherwise, before anything is
   created, `WtError("port <n> is in use (another Traefik?). Set WT_HTTPS_PORT, e.g. WT_HTTPS_PORT=8443 wt demo")`
   (`WT_HTTP_PORT` and `8080` for the HTTP port). (3) Bootstrap: when `$WT_HOME/shop/catalog.yaml` is missing,
   delete a leftover `$WT_HOME/shop` and run the packaged `bootstrap.sh` with `bash` through `proc.run`; when it
   exists, reuse it (a second `wt demo` prints the same URLs). (4) `up main --uses web,worker`, then
-  `up feat/cart --uses web,worker`. (5) Print the output above. A failing step raises its own `WtError` with
+  `up feat/cart --uses web,worker`; a service reported unhealthy stops the demo with
+  `<branch> is up but not healthy (<service>: <detail>)` and `feat/cart` is not started after a failed `main`. (5) Print the output above. A failing step raises its own `WtError` with
   `run \`wt demo down\` to clean up` appended.
 - **`wt demo down` steps.** No demo home → print `no demo to remove`, exit 0 (`{"removed": false}`). Else, under
-  the demo environment: `remove main` and `remove feat/cart` (no prompt), then `docker compose down -v` for every
+  the demo environment: `remove main` and `remove feat/cart` (no prompt, forced: the demo's worktrees are deleted with its home anyway), then `docker compose down -v` for every
   shared server and for Traefik of the `wtdemo` instance, `docker network rm wtdemo` (missing objects are not
   errors), then delete the demo home. Safe after a half-created or interrupted `wt demo`, and twice in a row.
 - **Packaged example.** The wheel carries `examples/shop/` at `wt/_examples/shop/`
@@ -1647,7 +1648,7 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   (`LRANGE {prefix}recent 0 4`, newest first)}`; Redis unreachable → `events: 0, recent: []`, still 200. The
   worker also runs `LPUSH {prefix}recent <item>` and `LTRIM {prefix}recent 0 4`. Catalog: `api` gains
   `infra.redis: {}`, `kafka.groups: [worker]` (it only names the worker's group for `WORKER_KAFKA_GROUP`; the api
-  never joins it) and env `REDIS_URL`, `REDIS_PREFIX`, `WORKER_KAFKA_GROUP`. The web page shows the branch name
+  never joins it) and env `REDIS_URL`, `REDIS_PREFIX`, `WORKER_KAFKA_GROUP` (the same three in `legacy/worktree.yaml`). The web page shows the branch name
   large, an accent color per branch (`main` fixed, others from a hash of the name), the items list and form, and
   a panel with database, Redis prefix, Kafka topic and group, the events counter and the last 5 consumed items,
   refreshed every 2 s.

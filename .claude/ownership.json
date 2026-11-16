@@ -24,7 +24,7 @@
     "src/wt/config.py", "src/wt/catalog.py", "src/wt/naming.py", "src/wt/templating.py",
     "src/wt/paths.py", "src/wt/errors.py", "src/wt/__init__.py", "src/wt/claudemerge.py",
     "tests/test_config.py", "tests/test_catalog.py", "tests/test_naming.py",
-    "tests/test_templating.py", "tests/test_claudemerge.py"
+    "tests/test_templating.py", "tests/test_claudemerge.py", "tests/test_paths.py"
   ],
   "e2e": ["tests/integration/*", "tests/test_example_*", "examples/*"],
   "fixer": ["src/wt/*", "tests/*", "examples/*"],
