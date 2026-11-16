@@ -15,7 +15,7 @@ from rich.console import Console, ConsoleDimensions
 from rich.markup import escape
 from rich.table import Table
 
-from wt import __version__, cache, catalog_edit, disk, doctor
+from wt import __version__, cache, catalog_edit, demo, disk, doctor
 from wt.catalog import (
     LEGACY_NAME,
     Catalog,
@@ -1572,6 +1572,85 @@ def dbeaver_sync(ctx: typer.Context, json_output: JsonOption = False) -> None:
                     console.print(f"DBeaver: {verb} {escape(', '.join(names))}")
             console.print(escape(str(change.file)))
         console.print(DBEAVER_REFRESH_HINT)
+
+
+# ---- wt demo | wt demo down (SPEC section 37) -------------------------------------------------
+# The demo builds its own orchestrator under its own environment (wt.demo): these commands never
+# read the root --catalog, so they do not touch `ctx.obj`.
+
+demo_app = typer.Typer(
+    help="Try wt with no setup: the shop example, main and feat/cart side by side.",
+    invoke_without_command=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(demo_app, name="demo")
+
+DEMO_FIRST_RUN = "First run downloads the images (~1\u20132 GB, a few minutes)."
+DEMO_UP = "Demo is up. Open these in two windows, side by side:"
+DEMO_TRY_IT = "Add an item on one branch: it appears only there."
+DEMO_SELF_SIGNED = (
+    "Without mkcert your browser warns about the certificate (self-signed); that is expected."
+)
+DEMO_REMOVE_HINT = "Remove everything: wt demo down"
+DEMO_REMOVED = "Demo removed."
+DEMO_NOTHING_TO_REMOVE = "no demo to remove"
+DEMO_COLUMN_GAP = "  "
+
+
+def _demo_lines(result: demo.DemoResult) -> list[str]:
+    """The URL table: branch and web columns padded to the longest value, the api URL last."""
+    branch_width = max(len(row.branch) for row in result.branches)
+    web_width = max(len(row.web) for row in result.branches)
+    return [
+        DEMO_COLUMN_GAP.join(
+            ("", row.branch.ljust(branch_width), row.web.ljust(web_width), f"api: {row.api}")
+        )
+        for row in result.branches
+    ]
+
+
+def _print_demo(result: demo.DemoResult) -> None:
+    console.print(f"[green]{DEMO_UP}[/]")
+    for line in _demo_lines(result):
+        console.print(escape(line))
+    console.print(DEMO_TRY_IT)
+    if result.self_signed:
+        console.print(DEMO_SELF_SIGNED)
+    console.print(DEMO_REMOVE_HINT)
+
+
+def _demo_json(result: demo.DemoResult) -> JsonDocument:
+    return {
+        "branches": [{"branch": b.branch, "web": b.web, "api": b.api} for b in result.branches],
+        "home": str(result.home),
+    }
+
+
+@demo_app.callback()
+def demo_command(ctx: typer.Context, json_output: JsonOption = False) -> None:
+    """Start the shop demo: main and feat/cart side by side (`wt demo down` removes it)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    with _json_errors(json_output):
+        if demo.is_first_run():
+            (err if json_output else console).print(DEMO_FIRST_RUN)
+        result = demo.up(log=_progress(json_output))
+        if json_output:
+            _emit(_demo_json(result))
+        else:
+            _print_demo(result)
+
+
+@demo_app.command("down")
+def demo_down(json_output: JsonOption = False) -> None:
+    """Remove everything the demo created: branches, shared servers, Traefik, files."""
+    with _json_errors(json_output):
+        removed = demo.down(log=_progress(json_output))
+        if json_output:
+            _emit({"removed": removed})
+        else:
+            console.print(DEMO_REMOVED if removed else DEMO_NOTHING_TO_REMOVE)
 
 
 def main() -> None:
