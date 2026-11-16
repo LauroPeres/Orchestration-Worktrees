@@ -178,6 +178,7 @@ Used for the README demo (two branches side by side) and for the benchmarks.
 | v0.14.2 ✔ (§34) | Merged `.claude` fixes: path and command rules scoped to their repo, skills with unique names |
 | v0.15.0 ✔ (§35) | `remove` cleans everything (merged remote branch, images, a non-empty wt folder warning) and `wt prune` cleans orphans, also run by every `remove` |
 | v0.16.0 ✔ (§36) | Shared installs and real disk use: uv installs clone from the cache (`UV_LINK_MODE=clone`), `wt du`, `cache ls` and doctor report exclusive bytes |
+| v0.17.0 (§37) | `wt demo`: the shop example, `main` and `feat/cart`, in one command with no clone, isolated from the visitor's own wt; `wt demo down` |
 | v0.8.0 ✔ (§24) | Install caches for uv and npm (`setup_cache`), `wt cache ls|prune`, doctor `cache` check |
 
 ## 11. Clean-room rules
@@ -1602,3 +1603,52 @@ rewritten (no deduplication).
   other keys are unchanged. The doctor `cache` check says `<n> MiB on disk in the install and tool caches` (or
   the apparent number with today's wording), and its low-disk warning names the exclusive bytes as what a prune frees.
 - Out of scope: reclaiming space in existing worktrees, symlinked dependencies, pnpm, sizes in the TUI.
+
+## 37. v0.17.0: `wt demo`
+
+Decided 2026-11-16 with the user (task recruiter-demo). A visitor should see wt working with one command and no
+clone (`uvx --from git+https://github.com/LauroPeres/Orchestration-Worktrees wt demo`), without writing a catalog
+and without touching a wt they already run. The demo is the `examples/shop` stack, `main` and `feat/cart`.
+
+- **Commands.** `wt demo [--json]` starts the demo; `wt demo down [--json]` removes it. Exit 0 on success, 1 on a
+  `WtError` (message, no traceback). Text output of `wt demo`, last lines:
+  `Demo is up. Open these in two windows, side by side:`, one line per branch
+  (`<branch>  https://<slug>.shop.localhost[:PORT]  api: https://api.<slug>.shop.localhost[:PORT]/items`; `:PORT` only
+  when the HTTPS port is not 443), `Add an item on one branch: it appears only there.`, the self-signed certificate
+  note when mkcert is missing, `Remove everything: wt demo down`. `--json`: `{"branches": [{"branch", "web", "api"}],
+  "home": str}`; `down --json`: `{"removed": bool}`. Before a first run (no demo home yet) it prints
+  `First run downloads the images (~1–2 GB, a few minutes).`
+- **Demo environment (`wt.demo`, core).** The demo runs the existing use cases unchanged (doctor checks, `up`,
+  `remove`) inside an environment applied for the command only and restored afterwards, also on error or Ctrl-C:
+  `WT_INSTANCE=wtdemo`; `WT_HOME=<state dir>/wt-demo` (`$XDG_STATE_HOME/wt-demo`, else `~/.local/state/wt-demo`;
+  never `~/.wt`); `WT_CATALOG=$WT_HOME/shop/catalog.yaml`; `WT_POSTGRES_PORT`, `WT_REDIS_PORT`, `WT_KAFKA_PORT`,
+  `WT_KEYCLOAK_PORT` = their default + 100; `WT_HTTP_PORT`/`WT_HTTPS_PORT` = the visitor's value when set, else
+  80/443; `WT_NO_FETCH=1`. Any other `WT_*` variable of the visitor is ignored for the duration (removed, then
+  restored). The demo never reads or writes `~/.wt`, the visitor's catalog or any `wt-*` Docker object.
+- **`wt demo` steps, in order.** (1) Docker answers, else the same message as doctor's Docker check. (2) The HTTP and
+  HTTPS ports are free on `127.0.0.1`, or `wtdemo-traefik` is the one running; otherwise, before anything is
+  created, `WtError("port <n> is in use (another Traefik?). Set WT_HTTPS_PORT, e.g. WT_HTTPS_PORT=8443 wt demo")`
+  (`WT_HTTP_PORT` and `8080` for the HTTP port). (3) Bootstrap: when `$WT_HOME/shop/catalog.yaml` is missing,
+  delete a leftover `$WT_HOME/shop` and run the packaged `bootstrap.sh` with `bash` through `proc.run`; when it
+  exists, reuse it (a second `wt demo` prints the same URLs). (4) `up main --uses web,worker`, then
+  `up feat/cart --uses web,worker`. (5) Print the output above. A failing step raises its own `WtError` with
+  `run \`wt demo down\` to clean up` appended.
+- **`wt demo down` steps.** No demo home → print `no demo to remove`, exit 0 (`{"removed": false}`). Else, under
+  the demo environment: `remove main` and `remove feat/cart` (no prompt), then `docker compose down -v` for every
+  shared server and for Traefik of the `wtdemo` instance, `docker network rm wtdemo` (missing objects are not
+  errors), then delete the demo home. Safe after a half-created or interrupted `wt demo`, and twice in a row.
+- **Packaged example.** The wheel carries `examples/shop/` at `wt/_examples/shop/`
+  (`[tool.hatch.build.targets.wheel.force-include]`). `wt.paths.example_dir("shop")` returns
+  `importlib.resources.files("wt") / "_examples" / "shop"` when it exists, else the repo's `examples/shop` (run
+  from source); neither present → `WtError`. The example is not copied into `src/`.
+- **Shop example: an "isolated for this branch" page.** `GET /info` on the api (both `api/app.py` and
+  `feat-cart/app.py`) returns `{"branch", "database" (current_database()), "redis_prefix", "kafka_topic",
+  "kafka_group" (the worker's group), "events" (Redis `GET {prefix}events`, 0 if missing), "recent"
+  (`LRANGE {prefix}recent 0 4`, newest first)}`; Redis unreachable → `events: 0, recent: []`, still 200. The
+  worker also runs `LPUSH {prefix}recent <item>` and `LTRIM {prefix}recent 0 4`. Catalog: `api` gains
+  `infra.redis: {}`, `kafka.groups: [worker]` (it only names the worker's group for `WORKER_KAFKA_GROUP`; the api
+  never joins it) and env `REDIS_URL`, `REDIS_PREFIX`, `WORKER_KAFKA_GROUP`. The web page shows the branch name
+  large, an accent color per branch (`main` fixed, others from a hash of the name), the items list and form, and
+  a panel with database, Redis prefix, Kafka topic and group, the events counter and the last 5 consumed items,
+  refreshed every 2 s.
+- Out of scope: publishing to PyPI, a demo of the `notes` example, choosing other branches or services.

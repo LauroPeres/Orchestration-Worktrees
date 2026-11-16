@@ -9,7 +9,7 @@ description: wt's architecture — the five layers (interface, core, providers, 
 ```
 interface   cli, tui, __main__                      parse input, call the core, render
    ↓
-core        orchestrator, doctor                    use cases: sequence, lock, record, roll back
+core        orchestrator, doctor (demo above them)  use cases: sequence, lock, record, roll back
    ↓
 providers   providers/ (base = Provider protocol)   shared servers, one slice per branch
    ↓

@@ -37,6 +37,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/wt"]
 
+[tool.hatch.build.targets.wheel.force-include]
+# `wt demo` runs the shop example from the installed wheel (docs/SPEC.md §37).
+"examples/shop" = "wt/_examples/shop"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not docker'"

@@ -5,8 +5,8 @@
     "tests/test_cli.py", "tests/test_tui.py", "tests/test_catalog_edit.py", "tests/test_terminal.py"
   ],
   "core-coder": [
-    "src/wt/orchestrator.py", "src/wt/doctor.py",
-    "tests/test_orchestrator.py", "tests/test_doctor.py", "tests/conftest.py", "tests/serve.py"
+    "src/wt/orchestrator.py", "src/wt/doctor.py", "src/wt/demo.py",
+    "tests/test_orchestrator.py", "tests/test_doctor.py", "tests/test_demo.py", "tests/conftest.py", "tests/serve.py"
   ],
   "providers-coder": [
     "src/wt/providers/*",
