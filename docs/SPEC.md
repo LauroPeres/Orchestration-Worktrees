@@ -1618,6 +1618,9 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   note when mkcert is missing, `Remove everything: wt demo down`. `--json`: `{"branches": [{"branch", "web", "api"}],
   "home": str}`; `down --json`: `{"removed": bool}`; `down` text: `Demo removed.` or `no demo to remove`. Before a first run (no
   demo home yet) it prints `First run downloads the images (~1–2 GB, a few minutes).` (to stderr under `--json`).
+- **Quiet output.** A visitor sees wt's own progress lines and the final block only: no raw `docker compose`
+  build or pull logs, no `.claude` merge line, and on Ctrl-C only the `wt demo down` hint (not the `wt up`/`wt down
+  <branch>` hint of a normal `up`). Errors still carry the failing command's output.
 - **Demo environment (`wt.demo`, core).** The demo runs the existing use cases unchanged (doctor checks, `up`,
   `remove`) inside an environment applied for the command only and restored afterwards, also on error or Ctrl-C:
   `WT_INSTANCE=wtdemo`; `WT_HOME=<state dir>/wt-demo` (`$XDG_STATE_HOME/wt-demo`, else `~/.local/state/wt-demo`;
@@ -1636,7 +1639,8 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   prints its own message with `run \`wt demo down\` to clean up` appended.
 - **`wt demo down` steps.** No demo home and no `wtdemo` Docker network → print `no demo to remove`, exit 0
   (`{"removed": false}`). A `wtdemo` network without a home (the home deleted by hand) still gets the Docker teardown
-  below. Otherwise, under the demo environment: `remove main` and `remove feat/cart` (no prompt, forced: the demo's worktrees are deleted with its home anyway), then `docker compose down -v` for every
+  below, which then also runs `docker compose down -v` for every compose project named `wtdemo-*` (the branches' app
+  containers and their networks) before the network is removed. Otherwise, under the demo environment: `remove main` and `remove feat/cart` (no prompt, forced: the demo's worktrees are deleted with its home anyway), then `docker compose down -v` for every
   shared server and for Traefik of the `wtdemo` instance, `docker network rm wtdemo` (missing objects are not
   errors), then delete the demo home. Safe after a half-created or interrupted `wt demo`, and twice in a row.
 - **Packaged example.** The wheel carries `examples/shop/` at `wt/_examples/shop/`
