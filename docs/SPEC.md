@@ -1632,10 +1632,11 @@ and without touching a wt they already run. The demo is the `examples/shop` stac
   delete a leftover `$WT_HOME/shop` and run the packaged `bootstrap.sh` with `bash` through `proc.run`; when it
   exists, reuse it (a second `wt demo` prints the same URLs). (4) `up main --uses web,worker`, then
   `up feat/cart --uses web,worker`; a service reported unhealthy stops the demo with
-  `<branch> is up but not healthy (<service>: <detail>)` and `feat/cart` is not started after a failed `main`. (5) Print the output above. A failing step raises its own `WtError` with
-  `run \`wt demo down\` to clean up` appended.
-- **`wt demo down` steps.** No demo home → print `no demo to remove`, exit 0 (`{"removed": false}`). Else, under
-  the demo environment: `remove main` and `remove feat/cart` (no prompt, forced: the demo's worktrees are deleted with its home anyway), then `docker compose down -v` for every
+  `<branch> is up but not healthy (<service>: <detail>)` and `feat/cart` is not started after a failed `main`. (5) Print the output above. A failing step, or Ctrl-C after the checks, raises or
+  prints its own message with `run \`wt demo down\` to clean up` appended.
+- **`wt demo down` steps.** No demo home and no `wtdemo` Docker network → print `no demo to remove`, exit 0
+  (`{"removed": false}`). A `wtdemo` network without a home (the home deleted by hand) still gets the Docker teardown
+  below. Otherwise, under the demo environment: `remove main` and `remove feat/cart` (no prompt, forced: the demo's worktrees are deleted with its home anyway), then `docker compose down -v` for every
   shared server and for Traefik of the `wtdemo` instance, `docker network rm wtdemo` (missing objects are not
   errors), then delete the demo home. Safe after a half-created or interrupted `wt demo`, and twice in a row.
 - **Packaged example.** The wheel carries `examples/shop/` at `wt/_examples/shop/`
