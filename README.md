@@ -14,7 +14,8 @@ After `wt up feat/cart`, `https://api.feat-cart.shop.localhost` serves that bran
 `https://api.main.shop.localhost` keeps serving `main`.
 
 wt ships no services of its own: you describe your stack (any repos, any languages) in
-one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap.
+one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap, and
+[docs/pitfalls.md](docs/pitfalls.md) for the bugs that threw no error.
 
 > **Status: v0.14.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
