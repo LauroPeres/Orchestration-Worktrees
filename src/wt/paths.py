@@ -1,6 +1,7 @@
 """Where wt keeps its own files. Override with the WT_HOME environment variable."""
 
 import os
+from importlib import resources
 from pathlib import Path
 
 from wt.errors import WtError
@@ -50,3 +51,16 @@ def installs_dir() -> Path:
 def tool_cache_dir(name: str) -> Path:
     """The shared download cache of one tool: `uv` or `npm`."""
     return cache_dir() / name
+
+
+def example_dir(name: str) -> Path:
+    """Folder of the bundled example `name`: the wheel's copy, else the repo's (run from source)."""
+    packaged = Path(str(resources.files("wt") / "_examples" / name))
+    from_source = Path(__file__).resolve().parents[2] / "examples" / name
+    for candidate in (packaged, from_source):
+        if candidate.is_dir():
+            return candidate
+    raise WtError(
+        f"example {name!r} not found: looked in {packaged} (installed package) "
+        f"and {from_source} (source tree). Reinstall wt or run from a repo checkout."
+    )

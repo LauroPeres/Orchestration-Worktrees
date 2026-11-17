@@ -253,6 +253,60 @@ def test_ensure_network_reraises(monkeypatch: pytest.MonkeyPatch) -> None:
         compose.ensure_network()
 
 
+def _network_commands(monkeypatch: pytest.MonkeyPatch, results: list[int]) -> list[list[str]]:
+    """Fake `docker network` calls answering `results` in order (`rm` failing raises)."""
+    calls: list[list[str]] = []
+    codes = iter(results)
+
+    def fake(args: list[str], **kwargs: object) -> proc.Result:
+        calls.append(list(args))
+        res = proc.Result(next(codes), "", "no such network")
+        if args[2] == "rm" and res.returncode != 0 and kwargs.get("check", True):
+            raise proc.CommandError(args, res)
+        return res
+
+    monkeypatch.setattr(proc, "run", fake)
+    return calls
+
+
+def test_remove_network_removes_an_existing_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _network_commands(monkeypatch, [0, 0])
+    compose.remove_network("wtdemo")
+    assert calls == [
+        ["docker", "network", "inspect", "wtdemo"],
+        ["docker", "network", "rm", "wtdemo"],
+    ]
+
+
+def test_remove_network_does_nothing_when_it_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _network_commands(monkeypatch, [1])
+    compose.remove_network("wtdemo")
+    assert [c[2] for c in calls] == ["inspect"]
+
+
+def test_remove_network_accepts_a_concurrent_removal(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _network_commands(monkeypatch, [0, 1, 1])
+    compose.remove_network("wtdemo")
+    assert [c[2] for c in calls] == ["inspect", "rm", "inspect"]
+
+
+def test_remove_network_reraises_when_the_network_stays(monkeypatch: pytest.MonkeyPatch) -> None:
+    _network_commands(monkeypatch, [0, 1, 0])  # e.g. "active endpoints": still there
+    with pytest.raises(proc.CommandError):
+        compose.remove_network("wtdemo")
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_network_exists_follows_docker_network_inspect(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    calls = _network_commands(monkeypatch, [code])
+    assert compose.network_exists("wtdemo") is (code == 0)
+    assert calls == [["docker", "network", "inspect", "wtdemo"]]
+
+
 def test_override_network_without_alias_joins_the_shared_network() -> None:
     doc = compose.build_override(["db"], {"db": compose.ServicePatch(network=True)})
     assert doc["services"]["db"]["networks"] == {"default": {}, "wt": {}}

@@ -14,13 +14,17 @@ KAFKA_GROUP = os.environ["KAFKA_GROUP"]
 KAFKA_TOPIC = os.environ["KAFKA_TOPIC"]
 REDIS_URL = os.environ["REDIS_URL"]
 REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "")
+RECENT_ITEMS = 5  # the api's /info shows this many
 HEARTBEAT = Path("/tmp/worker-heartbeat")
 
 
 def handle(r: redis.Redis, value: bytes) -> None:
     event = json.loads(value)
+    item = str(event.get("item", ""))
     r.incr(f"{REDIS_PREFIX}events")
-    r.set(f"{REDIS_PREFIX}last", str(event.get("item", "")))
+    r.set(f"{REDIS_PREFIX}last", item)
+    r.lpush(f"{REDIS_PREFIX}recent", item)
+    r.ltrim(f"{REDIS_PREFIX}recent", 0, RECENT_ITEMS - 1)
 
 
 def run() -> None:

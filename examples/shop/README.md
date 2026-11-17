@@ -33,9 +33,10 @@ export WT_CATALOG=/tmp/shop/catalog.yaml   # or pass --catalog /tmp/shop/catalog
 wt catalog --check
 ```
 
-The catalog lists three services. Each says what it needs in `infra` (the `api` Postgres and Kafka,
-the `worker` Kafka and Redis, the `web` Keycloak), and `web` consumes `api`, so selecting `web`
-brings `api` along.
+The catalog lists three services. Each says what it needs in `infra` (the `api` Postgres, Kafka and
+Redis, the `worker` Kafka and Redis, the `web` Keycloak), and `web` consumes `api`, so selecting `web`
+brings `api` along. The `api` lists Kafka's `worker` group and Redis only to read them for its `/info`
+endpoint (step 4): it never joins the group.
 
 ## 2. Start the stack
 
@@ -59,10 +60,16 @@ a branch may briefly drop the connections of the base branch's app during the cl
 
 | URL | What you should see |
 |---|---|
-| `https://main.shop.localhost` | "shop on main" and three items: keyboard, mouse, monitor |
-| `https://feat-cart.shop.localhost` | "shop on feat/cart" and the same items, each with `x 1` |
+| `https://main.shop.localhost` | the branch name `main` in blue, three items (keyboard, mouse, monitor) and an "Isolated for this branch" panel |
+| `https://feat-cart.shop.localhost` | `feat/cart` in its own color, the same items each with `x 1`, and its own panel |
 | `https://api.main.shop.localhost/items` | JSON rows with `id` and `name` only |
 | `https://api.feat-cart.shop.localhost/items` | JSON rows with `id`, `name` and `quantity` |
+| `https://api.main.shop.localhost/info` | JSON: this branch's `database`, `redis_prefix`, `kafka_topic`, `kafka_group`, `events` and `recent` |
+
+The page colors itself per branch (`main` is always the same blue; every other branch gets a color
+from a hash of its name), so you can tell the tabs apart. The panel shows what `wt up` created for
+that branch (its database, Redis key prefix, Kafka topic and consumer group), an "Events received"
+counter and the last 5 items the worker consumed. It reads `/info` of the branch's own API every 2 s.
 
 The web page runs as a host process bound to `0.0.0.0`, so Traefik in Docker can reach it. That
 also means it listens on every network interface of your machine, not only on localhost.
@@ -73,6 +80,9 @@ also means it listens on every network interface of your machine, not only on lo
 2. Reload `https://main.shop.localhost`. `cable` is not there.
 3. `https://api.feat-cart.shop.localhost/items` lists `cable` with `quantity` 1. The
    `https://api.main.shop.localhost/items` response has no `quantity` key.
+4. Watch the panel of `https://feat-cart.shop.localhost`: within a few seconds "Events received" goes up
+   and `cable` appears in the last items. The panel of `https://main.shop.localhost` does not change:
+   its counter and list belong to `main`'s own Redis prefix.
 
 ## 5. List and stop a branch
 
@@ -95,6 +105,7 @@ joins the consumer group `worker-<project>.<slug>` and, for each event, does two
 
 - `INCR <project>:<slug>:events`, the counter
 - `SET <project>:<slug>:last`, the name of the last item
+- `LPUSH <project>:<slug>:recent` with the name, then `LTRIM` to keep the last 5 (the page's list)
 
 Add an item on each branch (add `-k` to `curl` if you use the self-signed certificate):
 
@@ -111,7 +122,16 @@ docker exec wt-redis redis-cli GET shop:feat-cart:events
 docker exec wt-redis redis-cli GET shop:feat-cart:last
 ```
 
-A key prints nothing until its first event.
+A key prints nothing until its first event. The same numbers are what the page shows; the api also
+serves them as JSON (`-k` again for the self-signed certificate):
+
+```bash
+curl https://api.feat-cart.shop.localhost/info
+# {"branch":"feat/cart","database":"shop__feat_cart","redis_prefix":"shop:feat-cart:",
+#  "kafka_topic":"shop.feat-cart.items","kafka_group":"worker-shop.feat-cart","events":1,"recent":["lamp"]}
+```
+
+If Redis is down, `/info` still answers (200) with `events` 0 and an empty `recent`.
 
 `wt down feat/cart` removes only the `shop:feat-cart:` Redis keys, the `worker-shop.feat-cart`
 consumer group and the `shop.feat-cart.*` topics. The `main` keys, group and topics stay, and so

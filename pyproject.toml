@@ -1,6 +1,6 @@
 [project]
 name = "orchestration-worktrees"
-version = "0.16.0"
+version = "0.17.0"
 description = "Run an isolated copy of your dev stack for every git branch, side by side."
 readme = "README.md"
 license = "MIT"
@@ -36,6 +36,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wt"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# `wt demo` runs the shop example from the installed wheel (docs/SPEC.md §37).
+"examples/shop" = "wt/_examples/shop"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -84,6 +88,7 @@ name = "Layers: interface -> core -> providers -> runtime -> model"
 type = "layers"
 layers = [
     "wt.cli : wt.tui : wt.catalog_edit : wt.terminal : wt.__main__",
+    "wt.demo",
     "wt.orchestrator : wt.doctor",
     "wt.providers",
     "wt.proc : wt.git : wt.compose : wt.host : wt.router : wt.tls : wt.health : wt.state : wt.projects : wt.cache : wt.disk : wt.dbeaver : wt.pgpass : wt.claudegen",

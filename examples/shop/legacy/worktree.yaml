@@ -14,6 +14,9 @@ services:
       WEB_ORIGIN: "{{ services.web.url }}"   # for CORS
       KAFKA_BOOTSTRAP: "{{ kafka.bootstrap }}"
       KAFKA_TOPIC: "{{ kafka.topic('items') }}"
+      WORKER_KAFKA_GROUP: "{{ kafka.group('worker') }}"   # shown on the page
+      REDIS_URL: "{{ redis.url }}"
+      REDIS_PREFIX: "{{ redis.prefix }}"
   worker:
     repo: api
     compose: docker-compose.yml

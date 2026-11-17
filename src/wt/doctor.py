@@ -37,7 +37,7 @@ def is_wsl() -> bool:
     return "microsoft" in platform.release().lower()
 
 
-def _port_in_use(port: int) -> bool:
+def port_in_use(port: int) -> bool:
     with socket.socket() as sock:
         sock.settimeout(0.5)
         return sock.connect_ex(("127.0.0.1", port)) == 0
@@ -196,7 +196,7 @@ def check_routing(fix: bool) -> list[Check]:
         )
     )
     running = router.is_running()
-    ports_taken = _port_in_use(router.http_port()) or _port_in_use(router.https_port())
+    ports_taken = port_in_use(router.http_port()) or port_in_use(router.https_port())
     if not running and fix and not ports_taken:
         with file_lock("traefik"):
             router.ensure_running(force_recreate=True)  # an Exited one may hold a stale mount
@@ -234,7 +234,7 @@ def check_routing(fix: bool) -> list[Check]:
     ]:
         if running and f":{port}" in mapped:
             checks.append(Check(label, "ok", f"{port} served by {router.container()}"))
-        elif _port_in_use(port):
+        elif port_in_use(port):
             checks.append(
                 Check(
                     label,

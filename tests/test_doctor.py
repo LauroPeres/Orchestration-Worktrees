@@ -88,7 +88,7 @@ def test_resolver_warns_with_scoped_hint(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_port_taken_fails_with_env_hint(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(1, "", ""))
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: port == router.http_port())
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: port == router.http_port())
     checks = {c.name: c for c in doctor.check_routing(fix=False)}
     assert checks["http port"].level == "fail"
     assert "WT_HTTP_PORT" in checks["http port"].hint
@@ -100,7 +100,7 @@ def test_fix_does_not_start_traefik_when_ports_taken(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(proc, "run", lambda args, **kw: proc.Result(1, "", ""))
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr(router, "ensure_running", lambda *a, **k: started.append(True))
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: True)
     checks = {c.name: c for c in doctor.check_routing(fix=True)}
     assert started == []
     assert checks["http port"].level == "fail"
@@ -119,7 +119,7 @@ def test_fix_starts_traefik_when_ports_free(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(compose, "ensure_network", lambda: None)
     monkeypatch.setattr(router, "is_running", lambda: state["running"])
     monkeypatch.setattr(router, "ensure_running", start)
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: False)
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: False)
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
     monkeypatch.setattr(router, "has_host_gateway", lambda: True)
     checks = {c.name: c for c in doctor.check_routing(fix=True)}
@@ -137,7 +137,7 @@ def _stale_traefik(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     monkeypatch.setattr(router, "is_running", lambda: True)
     monkeypatch.setattr(router, "has_host_gateway", lambda: state["gateway"])
     monkeypatch.setattr(router, "ensure_running", recreate)
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: True)
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
     return state
 
@@ -717,7 +717,7 @@ def _mounts(monkeypatch: pytest.MonkeyPatch, after_restart: list[str]) -> list[s
     monkeypatch.setattr(router, "has_host_gateway", lambda: True)
     monkeypatch.setattr(router, "missing_in_container", lambda: missing["now"])
     monkeypatch.setattr(router, "restart", restart)
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: True)
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
     return restarts
 
@@ -781,7 +781,7 @@ def test_mounts_fix_passes_force_recreate_to_compose(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(router, "is_running", lambda: True)
     monkeypatch.setattr(router, "has_host_gateway", lambda: True)
     monkeypatch.setattr(router, "missing_in_container", lambda: state["missing"])
-    monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+    monkeypatch.setattr(doctor, "port_in_use", lambda port: True)
     monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
     assert _by_name(doctor.check_routing(fix=True))["traefik mounts"].level == "ok"
     assert any("--force-recreate" in c for c in calls)
@@ -809,7 +809,7 @@ class TraefikFake:
         monkeypatch.setattr(router, "has_host_gateway", lambda: True)
         monkeypatch.setattr(router, "missing_in_container", lambda: [])
         monkeypatch.setattr(router, "ensure_running", recreate)
-        monkeypatch.setattr(doctor, "_port_in_use", lambda port: True)
+        monkeypatch.setattr(doctor, "port_in_use", lambda port: True)
         monkeypatch.setattr(doctor, "_traefik_ports", lambda: "")
 
 

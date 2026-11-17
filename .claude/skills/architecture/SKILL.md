@@ -9,6 +9,8 @@ description: wt's architecture — the five layers (interface, core, providers, 
 ```
 interface   cli, tui, __main__                      parse input, call the core, render
    ↓
+demo        demo                                    `wt demo`: an env scope around the use cases
+   ↓
 core        orchestrator, doctor                    use cases: sequence, lock, record, roll back
    ↓
 providers   providers/ (base = Provider protocol)   shared servers, one slice per branch
@@ -22,6 +24,7 @@ model       config, catalog, naming, templating,    pure rules: schema, names, p
 | Layer | Must never |
 |---|---|
 | interface | decide what happens (loops over branches, state reads, retries) — that's a core method |
+| demo | do what a use case or adapter already does — it sets the demo env, calls them, and deletes its own home |
 | core | run subprocesses, write files or know a provider's internals — it calls the layer that does |
 | providers | import another provider (shared code → `base.py`/`server.py`) or the core |
 | runtime | make use-case decisions; call `subprocess` outside `proc`/`host` |

@@ -32,6 +32,7 @@ Python 3.11+ · uv · typer (CLI) · textual (TUI) · pydantic (config) · jinja
 | Layer | Modules in `src/wt/` | Owner |
 |---|---|---|
 | interface | `cli`, `tui`, `__main__` | `interface-coder` |
+| demo | `demo` (`wt demo`, above core) | `core-coder` |
 | core | `orchestrator`, `doctor` | `core-coder` (+ `tests/conftest.py`) |
 | providers | `providers/` (`base` = the `Provider` protocol) | `providers-coder` |
 | runtime | `proc`, `git`, `compose`, `host`, `router`, `tls`, `health`, `state`, `projects` | `runtime-coder` |

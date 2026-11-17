@@ -20,6 +20,7 @@ from wt import (
     cli,
     compose,
     dbeaver,
+    demo,
     disk,
     doctor,
     host,
@@ -2903,3 +2904,167 @@ def test_du_json_without_worktrees_has_an_empty_list_and_the_cache(
     assert document["worktrees"] == []
     assert document["cache"]["exclusive_bytes"] == 30 * MIB
     assert document["total"] == {"apparent_bytes": 52 * MIB, "exclusive_bytes": 30 * MIB}
+
+
+# ---- wt demo | wt demo down (SPEC section 37) -------------------------------------------------
+
+DEMO_HOME = Path("/state/wt-demo")
+DEMO_BRANCHES = (
+    demo.DemoBranch(
+        "main",
+        "https://main.shop.localhost:8443",
+        "https://api.main.shop.localhost:8443/items",
+    ),
+    demo.DemoBranch(
+        "feat/cart",
+        "https://feat-cart.shop.localhost:8443",
+        "https://api.feat-cart.shop.localhost:8443/items",
+    ),
+)
+DEMO_FIRST_RUN_LINE = "First run downloads the images (~1\u20132 GB, a few minutes)."
+DEMO_SELF_SIGNED_LINE = (
+    "Without mkcert your browser warns about the certificate (self-signed); that is expected."
+)
+
+
+@pytest.fixture
+def fake_demo(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`wt.demo` without Docker: what it returns is set per test, what it was asked is recorded."""
+    state: dict[str, Any] = {
+        "first_run": False,
+        "self_signed": False,
+        "removed": True,
+        "error": None,
+        "progress": "pulling images",
+        "calls": [],
+    }
+
+    def up(log, on_first_run, **_: Any) -> demo.DemoResult:
+        state["calls"].append("up")
+        if state["first_run"]:
+            on_first_run()
+        log(state["progress"])
+        if state["error"]:
+            raise state["error"]
+        return demo.DemoResult(DEMO_BRANCHES, DEMO_HOME, state["self_signed"])
+
+    def down(log) -> bool:
+        state["calls"].append("down")
+        log(state["progress"])
+        if state["error"]:
+            raise state["error"]
+        return bool(state["removed"])
+
+    monkeypatch.setattr(demo, "up", up)
+    monkeypatch.setattr(demo, "down", down)
+    return state
+
+
+def test_demo_prints_the_urls_in_aligned_columns_and_the_next_steps(fake_demo) -> None:
+    result = runner.invoke(app, ["demo"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines() == [
+        "> pulling images",
+        "Demo is up. Open these in two windows, side by side:",
+        "  main       https://main.shop.localhost:8443       "
+        "api: https://api.main.shop.localhost:8443/items",
+        "  feat/cart  https://feat-cart.shop.localhost:8443  "
+        "api: https://api.feat-cart.shop.localhost:8443/items",
+        "Add an item on one branch: it appears only there.",
+        "Remove everything: wt demo down",
+    ]
+
+
+def test_demo_says_the_certificate_is_self_signed_only_without_mkcert(fake_demo) -> None:
+    with_mkcert = runner.invoke(app, ["demo"])
+    fake_demo["self_signed"] = True
+    without_mkcert = runner.invoke(app, ["demo"])
+    assert DEMO_SELF_SIGNED_LINE not in with_mkcert.stdout
+    lines = without_mkcert.stdout.splitlines()
+    assert lines[-3:] == [
+        "Add an item on one branch: it appears only there.",
+        DEMO_SELF_SIGNED_LINE,
+        "Remove everything: wt demo down",
+    ]
+
+
+def test_demo_warns_about_the_download_only_on_a_first_run(fake_demo) -> None:
+    again = runner.invoke(app, ["demo"])
+    fake_demo["first_run"] = True
+    first = runner.invoke(app, ["demo"])
+    assert DEMO_FIRST_RUN_LINE not in again.stdout
+    assert first.stdout.splitlines()[:2] == [DEMO_FIRST_RUN_LINE, "> pulling images"]
+
+
+def test_demo_json_is_the_only_thing_on_stdout(fake_demo) -> None:
+    fake_demo["first_run"] = True
+    result = runner.invoke(app, ["demo", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "branches": [{"branch": b.branch, "web": b.web, "api": b.api} for b in DEMO_BRANCHES],
+        "home": str(DEMO_HOME),
+    }
+    assert "pulling images" in result.stderr
+    assert DEMO_FIRST_RUN_LINE in result.stderr
+
+
+def test_demo_does_not_read_the_root_catalog_option(fake_demo, tmp_path: Path) -> None:
+    missing = tmp_path / "missing.yaml"
+    result = runner.invoke(app, ["--catalog", str(missing), "demo"])
+    assert result.exit_code == 0, result.output
+    assert fake_demo["calls"] == ["up"]
+
+
+def test_demo_failure_prints_the_message_without_a_traceback(
+    fake_demo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    message = (
+        "port 443 is in use (another Traefik?). Set WT_HTTPS_PORT, e.g. WT_HTTPS_PORT=8443 wt demo"
+    )
+    fake_demo["error"] = WtError(message)
+    monkeypatch.setattr(sys, "argv", ["wt", "demo"])
+    with pytest.raises(SystemExit) as stop:
+        cli.main()
+    assert stop.value.code == 1
+    assert capsys.readouterr().err.startswith(f"error: {message}")
+
+
+def test_demo_json_failure_is_the_error_document(fake_demo) -> None:
+    fake_demo["error"] = WtError("docker is not running")
+    result = runner.invoke(app, ["demo", "--json"])
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {"schema": 1, "error": "docker is not running"}
+
+
+def test_demo_down_says_what_it_did(fake_demo) -> None:
+    removed = runner.invoke(app, ["demo", "down"])
+    fake_demo["removed"] = False
+    nothing = runner.invoke(app, ["demo", "down"])
+    assert removed.exit_code == 0, removed.output
+    assert removed.stdout.splitlines()[-1] == "Demo removed."
+    assert nothing.exit_code == 0, nothing.output
+    assert nothing.stdout.splitlines()[-1] == "no demo to remove"
+
+
+@pytest.mark.parametrize("removed", [True, False])
+def test_demo_down_json(fake_demo, removed: bool) -> None:
+    fake_demo["removed"] = removed
+    result = runner.invoke(app, ["demo", "down", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"removed": removed}
+    assert "pulling images" in result.stderr
+
+
+def test_demo_down_failure_is_exit_1(fake_demo) -> None:
+    fake_demo["error"] = WtError("cannot delete /state/wt-demo: busy")
+    result = runner.invoke(app, ["demo", "down"])
+    assert result.exit_code == 1
+    assert str(result.exception) == "cannot delete /state/wt-demo: busy"
+
+
+def test_demo_help_lists_down() -> None:
+    result = runner.invoke(app, ["demo", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "down" in result.stdout
+    assert "--json" in result.stdout
+    assert "demo" in runner.invoke(app, ["--help"]).stdout
