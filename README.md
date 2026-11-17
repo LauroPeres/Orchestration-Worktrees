@@ -3,6 +3,45 @@
 Run a full, isolated copy of your dev stack for every git branch, side by side on one machine,
 each on its own HTTPS subdomain.
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+![Two branches of the same app running side by side, each with its own database, Redis prefix and Kafka group](docs/img/demo-branches.png)
+
+## Why
+
+AI coding agents (and people) can work on several branches at once, but a local stack usually
+runs one branch at a time: reviewing a PR means tearing down what you were running. wt gives every
+branch its own containers, URL, database, Redis prefix, Kafka consumer group and login client, so
+they all run together and none of them can touch another's data.
+
+## Try it in one command
+
+Needs Docker and [uv](https://docs.astral.sh/uv/). No clone, no config:
+
+```bash
+uvx --from git+https://github.com/LauroPeres/Orchestration-Worktrees wt demo
+```
+
+It starts the example shop on two branches, `main` and `feat/cart`, and prints their URLs. Open
+both, add an item on one: it shows up only there, and only that branch's worker receives the
+event. The first run downloads the images (~1–2 GB, a few minutes). Remove everything with:
+
+```bash
+uvx --from git+https://github.com/LauroPeres/Orchestration-Worktrees wt demo down
+```
+
+The demo runs apart from anything else on your machine (its own containers, folder and ports)
+and never touches a wt setup you already have. If ports 80/443 are taken, run it with
+`WT_HTTPS_PORT=8443 WT_HTTP_PORT=8080`.
+
+![wt ls: both branches up, each with its own URLs, health and database](docs/img/demo-ls.png)
+
+Adding a second branch while `main` is running takes about 12 s on a laptop
+([benchmarks](#benchmarks)).
+
+## How it works
+
 ```bash
 wt up feat/cart     # git worktree + containers + route + TLS, then a health check
 wt up main          # a second copy, running next to the first
@@ -17,10 +56,10 @@ wt ships no services of its own: you describe your stack (any repos, any languag
 one global `catalog.yaml`. See [docs/SPEC.md](docs/SPEC.md) for the full design and roadmap, and
 [docs/pitfalls.md](docs/pitfalls.md) for the bugs that threw no error.
 
-> **Status: v0.14.2.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
+> **Status: v0.17.0.** Git worktrees, Docker Compose services, host processes (`run:`), Traefik
 > routes and local TLS, Postgres, Redis, Kafka and Keycloak providers that give every branch its
-> own database, key prefix, consumer group and login client, a user catalog (`uses:`), and a
-> terminal UI (`wt tui`). A complete two-branch
+> own database, key prefix, consumer group and login client, a user catalog (`uses:`), a
+> terminal UI (`wt tui`) and a one-command demo (`wt demo`). A complete two-branch
 > example is in [examples/shop](examples/shop/README.md), and a two-repo one in
 > [examples/notes](examples/notes/README.md).
 

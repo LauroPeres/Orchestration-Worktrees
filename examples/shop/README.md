@@ -4,6 +4,11 @@ Two branches of a small shop stack, each running in its own isolated copy: `main
 `feat/cart` adds a `quantity` column to items. Everything here is fictional and exists only to show
 how wt works.
 
+Just want to see it run? `wt demo` starts this example on both branches in one command, without
+cloning or editing anything, and `wt demo down` removes it (see
+[Try it in one command](../../README.md#try-it-in-one-command)). The steps below do the same by hand
+and show every command along the way.
+
 ## Prerequisites
 
 - git and Docker with Compose 2.24+. See the [requirements in the top-level README](../../README.md#requirements).
